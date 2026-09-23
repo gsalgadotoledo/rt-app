@@ -1,0 +1,62 @@
+{
+  "name": "@gsalgadotoledo/rt-app-users",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./admin": "./ui/index.tsx"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@gsalgadotoledo/rt-app-contracts": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-admin-ui": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-nosql": "0.1.0-alpha.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.0.0"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app/packages/users"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "files": [
+    "dist",
+    "src",
+    "ui",
+    "backend",
+    "bin",
+    "templates",
+    "scripts",
+    "infra",
+    "*.mjs",
+    "*.js",
+    "*.cjs",
+    "*.d.ts",
+    "*.json",
+    "*.css",
+    "*.html",
+    "AGENTS.md",
+    "README.md"
+  ]
+}

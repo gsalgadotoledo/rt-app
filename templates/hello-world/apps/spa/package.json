@@ -1,0 +1,25 @@
+{
+  "name": "@gsalgadotoledo/rt-app-spa",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@gsalgadotoledo/rt-app-auth": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-config": "0.1.0-alpha.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.18.4",
+    "@gsalgadotoledo/rt-app-observer": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-subscriptions": "0.1.0-alpha.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^7.0.0"
+  }
+}

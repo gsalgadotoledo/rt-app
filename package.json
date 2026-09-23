@@ -1,0 +1,28 @@
+{
+  "name": "rt-app-monorepo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "rt-app",
+    "rt-app/packages/*",
+    "rt-app/admin",
+    "rt-app/cli",
+    "rt-app/installer",
+    "rt-app/core-ts"
+  ],
+  "scripts": {
+    "build": "node rt-app/scripts/workspaces.mjs build && tsc -p templates/hello-world/apps/lambda-ts/tsconfig.json",
+    "test": "npm test --workspaces --if-present",
+    "check:architecture": "node rt-app/scripts/workspaces.mjs check",
+    "prepare:templates": "node rt-app/packages/create/scripts/prepare.mjs",
+    "release:pack": "node scripts/release.mjs pack",
+    "release:verify": "node scripts/release.mjs verify",
+    "release:publish": "node scripts/release.mjs publish"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "overrides": {
+    "postcss": "8.5.28"
+  }
+}

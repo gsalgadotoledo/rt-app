@@ -1,0 +1,55 @@
+{
+  "name": "@gsalgadotoledo/rt-app-idempotency",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "ui",
+    "backend",
+    "bin",
+    "templates",
+    "scripts",
+    "infra",
+    "*.mjs",
+    "*.js",
+    "*.cjs",
+    "*.d.ts",
+    "*.json",
+    "*.css",
+    "*.html",
+    "AGENTS.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "npm run build && tsc --noEmit --strict --skipLibCheck --module NodeNext --moduleResolution NodeNext test/types.ts && node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@gsalgadotoledo/rt-app-core": "0.1.0-alpha.0"
+  },
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app/packages/idempotency"
+  },
+  "engines": {
+    "node": ">=22.14"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "name": "@gsalgadotoledo/rt-app-subscriptions",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./admin": "./ui/admin.tsx",
+    "./profile": "./ui/profile.tsx",
+    "./plan-id": {
+      "types": "./dist/plan-id.d.ts",
+      "default": "./dist/plan-id.js"
+    },
+    "./currency": {
+      "types": "./dist/currency.d.ts",
+      "default": "./dist/currency.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@gsalgadotoledo/rt-app-contracts": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-nosql": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-admin-ui": "0.1.0-alpha.0",
+    "react": "^19.0.0",
+    "@stripe/react-stripe-js": "^3.0.0",
+    "@stripe/stripe-js": "^7.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.0.0"
+  },
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app/packages/subscriptions"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "files": [
+    "dist",
+    "src",
+    "ui",
+    "backend",
+    "bin",
+    "templates",
+    "scripts",
+    "infra",
+    "*.mjs",
+    "*.js",
+    "*.cjs",
+    "*.d.ts",
+    "*.json",
+    "*.css",
+    "*.html",
+    "AGENTS.md",
+    "README.md"
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "name": "@gsalgadotoledo/rt-app-create",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "description": "RT-App project templates and generator",
+  "bin": {
+    "create-rt-app": "bin/create.mjs"
+  },
+  "exports": {
+    ".": "./index.mjs",
+    "./runtime": "./runtime.mjs"
+  },
+  "files": [
+    "dist",
+    "src",
+    "ui",
+    "backend",
+    "bin",
+    "templates",
+    "scripts",
+    "infra",
+    "*.mjs",
+    "*.js",
+    "*.cjs",
+    "*.d.ts",
+    "*.json",
+    "*.css",
+    "*.html",
+    "AGENTS.md",
+    "README.md",
+    "starter"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "dependencies": {
+    "giget": "^2.0.0"
+  },
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app/packages/create"
+  }
+}

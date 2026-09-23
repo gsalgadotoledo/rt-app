@@ -1,0 +1,41 @@
+stages: [deploy]
+deploy:
+  stage: deploy
+  image: node:22-bookworm
+  resource_group: aws-$CI_COMMIT_REF_SLUG
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: sts.amazonaws.com
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$RT_APP_MULTI_ENVIRONMENT == "true" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "stage")'
+  script:
+    - |
+      set -eu
+      apt-get update && apt-get install -y curl unzip
+      curl --fail --silent --show-error -O https://releases.hashicorp.com/terraform/1.11.4/terraform_1.11.4_linux_amd64.zip
+      curl --fail --silent --show-error -O https://releases.hashicorp.com/terraform/1.11.4/terraform_1.11.4_SHA256SUMS
+      grep 'terraform_1.11.4_linux_amd64.zip$' terraform_1.11.4_SHA256SUMS | sha256sum -c -
+      unzip -o terraform_1.11.4_linux_amd64.zip -d /usr/local/bin
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      export PATH="$HOME/.cargo/bin:$PATH"
+      export TF_IN_AUTOMATION=1 TF_VAR_region="$AWS_REGION" TF_VAR_app="$RT_APP_NAME" TF_VAR_mail_from="$MAIL_FROM" TF_VAR_revision="$CI_COMMIT_SHA"
+      case "$CI_COMMIT_BRANCH" in
+        main) export TF_VAR_environment=prod AWS_ROLE_ARN="$AWS_ROLE_PROD" ;;
+        develop) export TF_VAR_environment=develop AWS_ROLE_ARN="$AWS_ROLE_DEVELOP" ;;
+        stage) export TF_VAR_environment=stage AWS_ROLE_ARN="$AWS_ROLE_STAGE" ;;
+        *) exit 1 ;;
+      esac
+      test -n "$AWS_ROLE_ARN" && test -n "$TF_STATE_BUCKET" && test -n "$MAIL_FROM"
+      export AWS_WEB_IDENTITY_TOKEN_FILE="$CI_PROJECT_DIR/.aws-oidc-token"
+      umask 077
+      printf '%s' "$AWS_ID_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+      trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE"' EXIT
+      npm ci
+      npm test
+      npm run lambda:build
+      terraform -chdir=infra/aws init -input=false -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="key=$TF_VAR_environment/terraform.tfstate" -backend-config="region=$AWS_REGION" -backend-config="encrypt=true" -backend-config="use_lockfile=true"
+      terraform -chdir=infra/aws plan -input=false -out="$CI_PROJECT_DIR/deploy.tfplan"
+      terraform -chdir=infra/aws apply -input=false "$CI_PROJECT_DIR/deploy.tfplan"
+      terraform -chdir=infra/aws output -json deployment > "$CI_PROJECT_DIR/deployment.json"
+      node rt-app/cli/deploy.mjs "$CI_PROJECT_DIR/deployment.json"

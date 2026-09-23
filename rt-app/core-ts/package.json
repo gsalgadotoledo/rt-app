@@ -1,0 +1,39 @@
+{
+  "name": "@gsalgadotoledo/rt-app-core",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "rt-app.module.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "test": "npm run build && tsc --noEmit --strict --skipLibCheck --module NodeNext --moduleResolution NodeNext test/types.ts && node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  },
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app/core-ts"
+  },
+  "engines": {
+    "node": ">=22.14"
+  }
+}

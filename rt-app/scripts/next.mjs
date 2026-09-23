@@ -1,0 +1,11 @@
+import {spawn} from 'node:child_process';
+import {createRequire} from 'node:module';
+import {resolve} from 'node:path';
+import {publicConfig} from '@gsalgadotoledo/rt-app-config';
+const require=createRequire(resolve('package.json'));
+const command=process.argv[2];
+if(!['dev','start'].includes(command))throw new Error('Expected dev or start');
+const child=spawn(process.execPath,[require.resolve('next/dist/bin/next'),command,'--hostname','127.0.0.1','--port',new URL(publicConfig().urls.ssr).port],{stdio:'inherit'});
+for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>child.kill(signal));
+child.once('error',error=>{console.error(error.message);process.exitCode=1;});
+child.once('exit',code=>{process.exitCode=code??0;});

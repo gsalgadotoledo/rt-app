@@ -1,0 +1,1 @@
+export const themes = [["white","Paper","White background, graphite text"],["gray","Graphite","Soft gray background, dark text"],["violet","Midnight","Violet, warm gold and pink accents"],["system","System","Dark blue and cyan console"]] as const;

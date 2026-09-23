@@ -1,0 +1,118 @@
+name: Deploy AWS
+on:
+  push:
+    branches: [main, develop, stage]
+permissions:
+  contents: read
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:3.3.0
+        ports: ['8000:8000']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm test
+      - run: npm run lambda:build
+      - run: npm run test:dynamo
+        env:
+          DYNAMODB_TEST_ENDPOINT: http://127.0.0.1:8000
+          AWS_ACCESS_KEY_ID: localtest
+          AWS_SECRET_ACCESS_KEY: localtest
+          AWS_REGION: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+      - run: |
+          terraform fmt -check -recursive infra rt-app/infra rt-app/admin/infra rt-app/packages/auth-cognito/infra
+          terraform -chdir=rt-app/infra/aws/bootstrap init -backend=false -input=false
+          terraform -chdir=rt-app/infra/aws/bootstrap validate
+          terraform -chdir=rt-app/infra/aws/bootstrap test
+          terraform -chdir=infra/aws init -backend=false -input=false
+          terraform -chdir=infra/aws validate
+          terraform -chdir=infra/aws test
+          terraform -chdir=rt-app/infra/aws/ssr init -backend=false -input=false
+          terraform -chdir=rt-app/infra/aws/ssr test
+          terraform -chdir=rt-app/packages/auth-cognito/infra init -backend=false -input=false
+          terraform -chdir=rt-app/packages/auth-cognito/infra test
+  deploy:
+    needs: checks
+    if: github.ref_name == 'main' || vars.RT_APP_MULTI_ENVIRONMENT == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    env:
+      TF_IN_AUTOMATION: '1'
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_app: ${{ vars.RT_APP_NAME }}
+      TF_VAR_mail_from: ${{ vars.MAIL_FROM }}
+      TF_VAR_environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+      TF_VAR_revision: ${{ github.sha }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check bootstrap configuration
+        run: |
+          test -n "$AWS_REGION"
+          test -n "$TF_VAR_app"
+          test -n "$TF_VAR_mail_from"
+          test -n "$TF_STATE_BUCKET"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+      # No GitHub 'environment' field here: OIDC trust is pinned to refs/heads/main, develop or stage.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.ref_name == 'main' && vars.AWS_ROLE_PROD || (github.ref_name == 'develop' && vars.AWS_ROLE_DEVELOP || vars.AWS_ROLE_STAGE) }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: rt-app-${{ github.run_id }}
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lambda:build
+      - name: Terraform plan
+        run: |
+          terraform -chdir=infra/aws init -input=false             -backend-config="bucket=$TF_STATE_BUCKET"             -backend-config="key=$TF_VAR_environment/terraform.tfstate"             -backend-config="region=$AWS_REGION"             -backend-config="encrypt=true"             -backend-config="use_lockfile=true"
+          terraform -chdir=infra/aws plan -input=false -out="$RUNNER_TEMP/deploy.tfplan"
+      - name: Apply saved plan
+        run: terraform -chdir=infra/aws apply -input=false "$RUNNER_TEMP/deploy.tfplan"
+      - name: Migrate and publish admin, SPA and SSR
+        run: |
+          terraform -chdir=infra/aws output -json deployment > "$RUNNER_TEMP/outputs.json"
+          node rt-app/cli/deploy.mjs "$RUNNER_TEMP/outputs.json"
+      - name: Release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$TF_VAR_environment-$GITHUB_SHA"
+          tar -czf "$RUNNER_TEMP/rt-app-release.tgz" rt-app/admin/dist/web apps/spa/dist apps/lambda-ts/bundle .rt-app/release.json
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            if [ "$TF_VAR_environment" != prod ]; then
+              gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes "Automated development deployment." --prerelease
+            else
+              gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes "Automated production deployment."
+            fi
+          fi
+          gh release upload "$tag" "$RUNNER_TEMP/rt-app-release.tgz" --clobber

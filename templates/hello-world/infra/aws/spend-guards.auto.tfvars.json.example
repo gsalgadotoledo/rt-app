@@ -1,0 +1,10 @@
+{
+  "spend_guards": {
+    "lambda-alert": {
+      "service": "AWS Lambda",
+      "monthly_usd": 10,
+      "emails": ["admin@example.com"],
+      "action": "notify"
+    }
+  }
+}

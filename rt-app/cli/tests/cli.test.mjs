@@ -1,0 +1,26 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {spawnSync} from 'node:child_process';
+import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
+const cli=fileURLToPath(new URL('../bin/rta.mjs',import.meta.url));
+test('CLI discovers nested npm workspaces and only runs declared scripts',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'rta-workspaces-'));t.after(()=>rm(root,{recursive:true,force:true}));
+ await mkdir(join(root,'apps/web/packages/ui'),{recursive:true});
+ await writeFile(join(root,'package.json'),JSON.stringify({private:true,workspaces:['apps/*','apps/*/packages/*']}));
+ await writeFile(join(root,'apps/web/package.json'),JSON.stringify({name:'fixture-web',version:'1.0.0'}));
+ await writeFile(join(root,'apps/web/packages/ui/package.json'),JSON.stringify({name:'fixture-ui',version:'1.0.0',scripts:{hello:'node -e "console.log(123)"'}}));
+ const install=spawnSync('npm',['install','--ignore-scripts','--offline','--no-audit','--no-fund'],{cwd:root,encoding:'utf8'});assert.equal(install.status,0,install.stderr);
+ const run=(...args)=>spawnSync(process.execPath,[cli,...args],{cwd:root,encoding:'utf8'});
+ const listed=run('workspaces','--json');assert.equal(listed.status,0,listed.stderr);
+ assert.deepEqual(JSON.parse(listed.stdout).map(w=>w.name).sort(),['fixture-ui','fixture-web']);
+ assert.match(run('run','fixture-ui','hello').stdout,/123/);
+ assert.equal(run('run','fixture-ui','missing').status,1);
+ const urls=JSON.parse(run('urls','--json').stdout);assert.deepEqual(urls.cloud,[]);
+ assert.equal(urls.local.ssr,"http://localhost:5176");assert.equal(urls.local.spa,"http://localhost:5175");assert.equal(urls.local.frontend,undefined);
+ await writeFile(join(root,'rt-app.settings.json'),JSON.stringify({version:1,local:{ports:{ssr:15176}}}));
+ assert.equal(JSON.parse(run('urls','--json').stdout).local.ssr,'http://localhost:15176');
+ assert.equal(JSON.parse(run('tools','--json').stdout).name,'RT-App');
+});

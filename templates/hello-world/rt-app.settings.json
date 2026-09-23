@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "runtime": {
+    "local": {
+      "mode": "json"
+    },
+    "aws": {
+      "mode": "aws"
+    }
+  },
+  "services": {
+    "defaults": true,
+    "extra": []
+  },
+  "local": {
+    "ports": {
+      "api": 4010,
+      "admin": 5174,
+      "spa": 5175,
+      "ssr": 5176
+    }
+  }
+}

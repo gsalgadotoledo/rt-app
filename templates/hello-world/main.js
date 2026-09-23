@@ -1,0 +1,10 @@
+import settings from './rt-app.settings.json' with {type:'json'};
+import {runtimeConfig} from '@gsalgadotoledo/rt-app-config';
+export const runtimeSettings = () => runtimeConfig(settings);
+import { featureFactories } from "./packages/index.js";
+import configuration from "./modules.json" with {type: "json"};
+import * as framework from "@gsalgadotoledo/rt-app-framework";
+export const createApplication = options => framework.createApplication({...options, modules: configuration.modules, featureFactories: [...featureFactories, ...(options.featureFactories ?? [])]});
+export const createProductionApplication = () => framework.createProductionApplication(configuration.modules, featureFactories);
+export const seedDemo = framework.seedDemo;
+export const loadProductionApplication = () => framework.loadProductionApplication(configuration.modules, featureFactories);

@@ -1,0 +1,56 @@
+{
+  "name": "@gsalgadotoledo/rt-app-subscriptions-stripe",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@gsalgadotoledo/rt-app-subscriptions": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-contracts": "0.1.0-alpha.0",
+    "stripe": "^18.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.0.0"
+  },
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app/packages/subscriptions-stripe"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "files": [
+    "dist",
+    "src",
+    "ui",
+    "backend",
+    "bin",
+    "templates",
+    "scripts",
+    "infra",
+    "*.mjs",
+    "*.js",
+    "*.cjs",
+    "*.d.ts",
+    "*.json",
+    "*.css",
+    "*.html",
+    "AGENTS.md",
+    "README.md"
+  ]
+}

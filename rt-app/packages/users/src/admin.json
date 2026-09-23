@@ -1,0 +1,22 @@
+{
+  "id": "users",
+  "title": "Users",
+  "resource": "users.list",
+  "path": "/users",
+  "component": "users",
+  "fields": [
+    "id",
+    "email",
+    "name",
+    "role",
+    "active"
+  ],
+  "actions": [
+    "list",
+    "create",
+    "edit",
+    "delete",
+    "permissions"
+  ],
+  "group": "authentication"
+}

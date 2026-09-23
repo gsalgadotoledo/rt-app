@@ -1,0 +1,6 @@
+[
+  {"name":"dependency-order","modules":{"consumer":{"dependsOn":["provider"]},"provider":{}},"order":["provider","consumer"]},
+  {"name":"transitive-order","modules":{"a":{"dependsOn":["b"]},"b":{"dependsOn":["c"]},"c":{}},"order":["c","b","a"]},
+  {"name":"cycle","modules":{"a":{"dependsOn":["b"]},"b":{"dependsOn":["a"]}},"error":"cycle"},
+  {"name":"missing","modules":{"a":{"dependsOn":["missing"]}},"error":"Unknown module dependency"}
+]

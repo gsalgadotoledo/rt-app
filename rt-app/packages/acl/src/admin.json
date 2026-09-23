@@ -1,0 +1,17 @@
+{
+  "id": "permissions",
+  "title": "Permissions",
+  "resource": "acl.resources",
+  "path": "/acl/resources",
+  "component": "permissions",
+  "fields": [
+    "resource",
+    "method",
+    "path",
+    "access"
+  ],
+  "actions": [
+    "list"
+  ],
+  "group": "authentication"
+}

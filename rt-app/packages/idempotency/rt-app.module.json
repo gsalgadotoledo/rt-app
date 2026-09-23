@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "@gsalgadotoledo/rt-app-idempotency",
+  "version": "0.0.0",
+  "kind": "module",
+  "language": "typescript",
+  "verifiedPlatforms": [
+    "node"
+  ],
+  "provides": [
+    "rt-app.idempotency@1"
+  ],
+  "requires": [
+    "rt-app.idempotency-store@1"
+  ],
+  "entrypoint": ".",
+  "tests": [
+    "npm run test -w @gsalgadotoledo/rt-app-idempotency"
+  ]
+}

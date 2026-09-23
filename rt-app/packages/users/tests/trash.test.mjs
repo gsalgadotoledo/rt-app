@@ -1,0 +1,27 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {MemoryStore} from '@gsalgadotoledo/rt-app-dynamodb';
+import {LocalMailbox} from '@gsalgadotoledo/rt-app-auth';
+import {createApplication} from '@gsalgadotoledo/rt-app-framework';
+test('user trash hides records, records audit, revokes sessions and restores without reviving tokens',async()=>{
+ const store=new MemoryStore(), app=createApplication({store,mailer:new LocalMailbox(),secret:'trash-test-secret'.repeat(4),localAdminAccess:true});
+ await app.migrate();
+ const call=(method,path,body={},query={},token)=>app.handle({method,path,body,query,headers:token?{authorization:'Bearer '+token}:{},ip:'local'});
+ const created=await call('POST','/admin/app/users',{name:'Trash test',email:'trash@example.test',password:'Valid-test-password-2026!'});
+ assert.equal(created.status,200);const id=created.body.id;
+ assert.equal(created.body.createdBy,'rt-app-root');assert.ok(created.body.updatedAt);
+ const login=await call('POST','/auth/login',{email:'trash@example.test',password:'Valid-test-password-2026!'});
+ assert.ok(login.body.token);
+ assert.equal((await call('DELETE','/admin/app/users/'+id)).status,200);
+ assert.equal((await call('GET','/admin/app/users')).body.items.length,0);
+ const trashed=(await call('GET','/admin/app/users',{}, {trash:'true'})).body.items[0];
+ assert.equal(trashed.deletedBy,'rt-app-root');assert.ok(trashed.deletedAt);assert.equal(trashed.passwordHash,undefined);
+ assert.ok(await store.get('USERS',id));
+ assert.equal((await call('GET','/users/me',{}, {},login.body.token)).status,401);
+ assert.equal((await call('PATCH','/admin/app/users/'+id,{name:'Not allowed'})).status,404);
+ assert.equal((await call('POST','/admin/app/users/'+id+'/restore')).status,200);
+ assert.equal((await call('GET','/admin/app/users')).body.items[0].restoredBy,'rt-app-root');
+ assert.equal((await call('GET','/users/me',{}, {},login.body.token)).status,401);
+ assert.equal((await call('POST','/auth/login',{email:'trash@example.test',password:'Valid-test-password-2026!'})).status,200);
+ assert.equal((await call('GET','/admin/app/users',{}, {trash:'invalid'})).status,400);
+});

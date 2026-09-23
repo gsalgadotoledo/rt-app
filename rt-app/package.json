@@ -1,0 +1,76 @@
+{
+  "name": "@gsalgadotoledo/rt-app-framework",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@gsalgadotoledo/rt-app-contracts": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-dynamodb": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-users": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-auth": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-jwt": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-acl": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-tasks": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-content": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-infra": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-aws": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-nosql": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-myadmin": "0.1.0-alpha.0",
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "@gsalgadotoledo/rt-app-auth-cognito": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-observer": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-observer-console": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-observer-email": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-observer-sms": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-observer-cloudwatch": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-subscriptions": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-subscriptions-stripe": "0.1.0-alpha.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.0.0"
+  },
+  "files": [
+    "dist",
+    "src",
+    "ui",
+    "backend",
+    "bin",
+    "templates",
+    "scripts",
+    "infra",
+    "*.mjs",
+    "*.js",
+    "*.cjs",
+    "*.d.ts",
+    "*.json",
+    "*.css",
+    "*.html",
+    "AGENTS.md",
+    "README.md"
+  ],
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app"
+  },
+  "engines": {
+    "node": ">=22.14"
+  }
+}

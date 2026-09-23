@@ -1,0 +1,39 @@
+:root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#171b25;background:#fff;color-scheme:light;font-synthesis:none;text-rendering:optimizeLegibility;line-height:1.6}
+*{box-sizing:border-box}body{margin:0;min-width:320px;background:#fff}button,input,select{font:inherit}a{color:inherit}button{cursor:pointer}button:disabled{opacity:.5;cursor:default}:focus-visible{outline:2px solid #5468f0;outline-offset:4px}
+.site-shell{max-width:1180px;padding:0 48px;margin:auto;min-height:100svh;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:88px;border-bottom:1px solid #eceef2}
+.brand{font-size:18px;font-weight:750;letter-spacing:-.04em;text-decoration:none;white-space:nowrap}.brand span{color:#6574e6;margin:0 3px}.brand small{font-size:11px;font-weight:500;letter-spacing:.02em;color:#737b8c;margin-left:12px}
+button,.account-link{border:1px solid #dfe3eb;border-radius:8px;background:white;color:#252b38;padding:9px 16px;font-size:13px}button:hover,.account-link:hover{background:#f5f6fa;border-color:#b8c0d1}
+.home{display:flex;align-items:center;justify-content:center;text-align:center;padding:105px 0 95px;flex:1}.home-copy{width:100%;max-width:840px}
+.eyebrow{display:inline-block;border:1px solid #e5e8f4;background:#f8f9fe;border-radius:30px;padding:6px 13px;font-size:10px;letter-spacing:.12em;font-weight:600;color:#5e6d9c;margin:0 0 26px}
+h1{font-size:clamp(42px,6.5vw,78px);font-weight:650;line-height:1.08;letter-spacing:-.055em;margin:0;text-wrap:balance;overflow-wrap:anywhere}
+.description{font-size:18px;color:#697386;line-height:1.75;max-width:610px;margin:24px auto 0;white-space:pre-line;overflow-wrap:anywhere}
+.marketing-cta{display:inline-flex;align-items:center;gap:24px;margin-top:32px;padding:13px 20px;border-radius:9px;background:#202a44;color:white;text-decoration:none;font-size:14px;font-weight:550;box-shadow:0 3px 7px #19274412}.marketing-cta:hover{background:#364777}
+.marketing-secondary{display:inline-block;margin:20px;color:#62708b;font-size:13px;text-decoration:none}.marketing-secondary:hover{text-decoration:underline}
+.marketing-features{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:28px;padding:38px 0 58px;border-top:1px solid #eceef2;scroll-margin-top:24px}
+.marketing-features>div{padding:8px 10px}.marketing-features span{font-size:10px;letter-spacing:.1em;color:#687ac2;font-weight:650}.marketing-features h2{font-size:19px;line-height:1.3;letter-spacing:-.025em;font-weight:600;margin:16px 0 10px}.marketing-features p{font-size:14px;line-height:1.8;color:#737d8e;margin:0}
+footer{display:flex;justify-content:space-between;gap:20px;padding:24px 0;border-top:1px solid #eceef2;color:#7c8493;font-size:11px}footer a{text-decoration:none;color:#596a94}
+.account-dialog{width:min(460px,calc(100% - 32px));max-height:calc(100svh - 48px);padding:30px;border:1px solid #e2e6ed;border-radius:16px;background:white;color:#252b38;overflow:auto;box-shadow:0 24px 100px #17233a24}
+.account-dialog::backdrop{background:#17233a55;backdrop-filter:blur(4px)}
+.dialog-toolbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:28px;color:#737d8e;font-size:10px;letter-spacing:.08em}.dialog-toolbar button{border:0;font-size:24px;line-height:1;padding:4px 8px;background:transparent}
+.account-dialog h2{font-size:25px;line-height:1.3;font-weight:600;margin:0 0 12px;letter-spacing:-.03em}.account-dialog p{color:#697386;overflow-wrap:anywhere}.account-dialog .eyebrow{display:none}
+label{display:block;text-align:left;margin:18px 0;font-size:13px}input,select{display:block;width:100%;margin-top:6px;padding:11px 12px;background:#fafbfc;color:#252b38;border:1px solid #d9deea;border-radius:7px}
+.primary{color:white;background:#202a44;border-color:#202a44}.primary:hover{background:#364777}.wide{width:100%}
+.login-links{display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:18px}.login-links button{background:none;border:0;padding:3px 0;color:#5266a3;font-size:13px}
+.error,[role=alert],.account-dialog [role=alert]{color:#b42338}.account-dialog .notice{color:#267047}details{margin:24px 0}summary{cursor:pointer}.sign-out{margin-top:24px}body:has(dialog[open]){overflow:hidden}
+@media(max-width:700px){.site-shell{padding:0 22px}.topbar{min-height:76px}.home{padding:70px 0 55px}.description{font-size:16px}.marketing-features{grid-template-columns:1fr;gap:24px;padding:28px 0 40px}.marketing-features>div{padding:0}.marketing-secondary{display:block;margin:20px 0 0}.account-dialog{padding:22px}footer{flex-wrap:wrap}}
+
+.site-navigation,.site-navigation>nav{display:flex;align-items:center;gap:24px}
+.site-navigation>nav a{font-size:13px;color:#596579;text-decoration:none}
+.site-navigation>nav a:hover{color:#202a44;text-decoration:underline}
+@media(max-width:480px){.site-navigation,.site-navigation>nav{gap:12px}.topbar{flex-wrap:wrap;padding:16px 0;gap:12px}}
+
+.site-navigation>nav a[aria-current="page"]{color:#202a44;font-weight:650;text-decoration:underline;text-underline-offset:6px}
+
+.site-shell>*{min-width:0}.topbar .brand{white-space:normal;overflow-wrap:anywhere;min-width:0}
+.site-navigation,.site-navigation>nav{flex-wrap:wrap}.site-navigation{justify-content:flex-end}
+.marketing-features>*{min-width:0;overflow-wrap:anywhere}
+.account-dialog *{min-width:0;max-width:100%}.account-dialog input[type=checkbox]{display:inline-block;width:auto;margin-right:8px}
+.account-dialog pre{overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:760px){.topbar{flex-wrap:wrap;gap:12px;padding:16px 0}.site-navigation{gap:12px}.site-navigation>nav{gap:14px}.site-shell{padding-inline:20px}.brand small{display:none}}
+@media(max-width:420px){.topbar{align-items:flex-start}.site-navigation{width:100%;justify-content:space-between}.home{padding:48px 0}.home h1{font-size:38px}.account-dialog{padding:18px;width:calc(100% - 24px)}footer{overflow-wrap:anywhere}}

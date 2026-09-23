@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rt-app-core"
+version = "0.1.0"
+description = "Application-owned singleton providers for RT-App Python"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rt_app_core = ["py.typed"]

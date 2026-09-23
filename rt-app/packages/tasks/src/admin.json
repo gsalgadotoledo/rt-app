@@ -1,0 +1,9 @@
+{
+  "id": "tasks",
+  "title": "Tasks",
+  "resource": "tasks.list",
+  "path": "/tasks/admin",
+  "component": "tasks",
+  "fields": ["id", "title", "done", "ownerId"],
+  "actions": ["list", "create", "edit", "delete"]
+}

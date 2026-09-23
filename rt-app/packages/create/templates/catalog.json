@@ -1,0 +1,7 @@
+[
+ {"id":"fullstack","name":"Full stack","description":"The Hello World starter: React SPA, Next.js SSR, local API, admin and AWS infrastructure.","requirements":["node"],"kind":"fullstack"},
+ {"id":"shopping-cart","name":"Shopping cart","description":"Full stack starter with editable products and cart-item CRUD modules. Payments are not included.","requirements":["node"],"kind":"fullstack","crud":[{"name":"products","title":"Products","fields":[{"name":"name","type":"string"},{"name":"price","type":"number"}]},{"name":"cart-items","title":"Cart items","fields":[{"name":"productId","type":"string"},{"name":"quantity","type":"number"}]}]},
+ {"id":"admin-crm","name":"Admin CRM","description":"Full stack starter with contacts and opportunities in the admin. Access is denied until permissions are granted.","requirements":["node"],"kind":"fullstack","crud":[{"name":"contacts","title":"Contacts","fields":[{"name":"name","type":"string"},{"name":"email","type":"string"}]},{"name":"opportunities","title":"Opportunities","fields":[{"name":"title","type":"string"},{"name":"value","type":"number"},{"name":"stage","type":"string"}]}]},
+ {"id":"electron","name":"Electron desktop","description":"React SPA and local backend, with an isolated Electron window. Desktop packaging remains app-specific.","requirements":["node"],"kind":"electron"},
+ {"id":"mobile","name":"Mobile · Expo","description":"React Native screen with an editable API URL. Runs in Expo Go; native builds require platform SDKs.","requirements":["node"],"kind":"mobile"}
+]

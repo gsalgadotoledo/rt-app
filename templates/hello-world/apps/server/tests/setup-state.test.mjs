@@ -1,0 +1,21 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {installationStatus} from '../dist/setup.js';
+test('only persisted successful installation enables login; incomplete and corrupt states cannot bypass setup',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'rt-app-setup-'));
+ t.after(()=>rm(root,{recursive:true,force:true}));
+ assert.deepEqual(await installationStatus(root),{installed:false});
+ await mkdir(join(root,'.rt-app'));
+ const file=join(root,'.rt-app/installation.json');
+ await writeFile(file,JSON.stringify({status:'failed',adminUrl:'https://admin.example.com'}));
+ assert.deepEqual(await installationStatus(root),{installed:false});
+ await writeFile(file,JSON.stringify({status:'ready',adminUrl:'https://admin.example.com'}));
+ assert.deepEqual(await installationStatus(root),{installed:true,loginUrl:'https://admin.example.com/'});
+ await writeFile(file,'broken');
+ await assert.rejects(installationStatus(root));
+ await writeFile(file,JSON.stringify({status:'ready',adminUrl:'javascript:alert(1)'}));
+ await assert.rejects(installationStatus(root));
+});

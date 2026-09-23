@@ -1,0 +1,9 @@
+{
+  "modules": [
+    "content",
+    "infra",
+    "users",
+    "auth",
+    "acl"
+  ]
+}

@@ -1,0 +1,48 @@
+node_modules
+dist
+*.tsbuildinfo
+.DS_Store
+.env
+.env.local
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Python reference runtime
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Generated Lambda artifact
+apps/lambda-ts/bundle/
+
+# Local installation outputs (never credentials)
+.rt-app/
+
+# Local Terraform plans and bundle
+*.plan
+*.tfplan
+apps/lambda-ts/bundle.zip
+
+# Next.js output and generated hosting configuration
+.next/
+.next-dev/
+.env.production
+
+# Native supervisor builds and desktop packages
+**/native/target/
+rt-app/packages/service-manager/release/
+
+# Generated, sanitized project-template snapshot
+rt-app/packages/create/starter/
+
+artifacts/
+**/target/
+*.tgz
+*.zip
+
+**/apps/lambda-ts/bundle/

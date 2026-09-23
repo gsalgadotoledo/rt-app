@@ -1,0 +1,52 @@
+{
+  "name": "@gsalgadotoledo/rt-app-admin-ui",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.tsx",
+    "./themes": "./src/themes.ts",
+    "./themes.css": "./themes.css"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.2"
+  },
+  "scripts": {
+    "build": "tsc --noEmit"
+  },
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "next"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app/packages/admin-ui"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "files": [
+    "dist",
+    "src",
+    "ui",
+    "backend",
+    "bin",
+    "templates",
+    "scripts",
+    "infra",
+    "*.mjs",
+    "*.js",
+    "*.cjs",
+    "*.d.ts",
+    "*.json",
+    "*.css",
+    "*.html",
+    "AGENTS.md",
+    "README.md"
+  ]
+}

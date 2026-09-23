@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import {projectReadme,claudeGuide} from '../project-docs.mjs';
+test('starter readmes stay short and describe real backend deployment support',()=>{for(const backendId of ['node-ts','go','python','java']){const text=projectReadme({name:'demo',templateName:'Full stack',backendId});assert.ok(text.split('\n').length<25);assert.match(text,/npm run dev/);assert.doesNotMatch(text,/"Statement"|iam:CreateUser/);if(backendId==='node-ts')assert.match(text,/npm run cloud/);else {assert.doesNotMatch(text,/npm run cloud/);assert.match(text,/not available/);}assert.match(claudeGuide({backendId}),new RegExp(`backend ${backendId}`));}});

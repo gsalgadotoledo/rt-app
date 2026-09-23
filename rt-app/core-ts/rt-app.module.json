@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "@gsalgadotoledo/rt-app-core",
+  "version": "0.0.0",
+  "kind": "runtime",
+  "language": "typescript",
+  "verifiedPlatforms": [
+    "node"
+  ],
+  "provides": [
+    "rt-app.registry@1",
+    "rt-app.bindings@1"
+  ],
+  "requires": [],
+  "entrypoint": ".",
+  "tests": [
+    "npm run test -w @gsalgadotoledo/rt-app-core"
+  ]
+}

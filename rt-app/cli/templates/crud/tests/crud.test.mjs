@@ -1,0 +1,32 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {MemoryStore} from '@gsalgadotoledo/rt-app-dynamodb';
+import feature from '../src/index.js';
+import schema from '../src/schema.json' with {type:'json'};
+
+test('CRUD validation, persistence and optimistic concurrency',async()=>{
+  const module=feature(new MemoryStore());
+  const find=action=>module.endpoints.find(e=>e.resource===schema.name+'.'+action);
+  const input=Object.fromEntries(schema.fields.map(f=>[f.name,f.type==='string'?'Example':f.type==='number'?10:true]));
+  const context=body=>({request:{body,query:{}},params:{},actor:{id:'test'}});
+  assert.ok(module.endpoints.every(e=>e.access==='permission'&&e.explicitGrant));
+  const item=await find('create').handle(context(input));
+  const c=context({...input,version:item.version});c.params.id=item.id;
+  assert.equal((await find('read').handle(c)).id,item.id);
+  const edited=await find('edit').handle(c);assert.equal(edited.version,2);
+  await assert.rejects(find('edit').handle(c),e=>e.status===409);
+  await assert.rejects(find('create').handle(context({...input,unexpected:true})),e=>e.status===400);
+  c.request.body={version:edited.version};await find('delete').handle(c);
+  await assert.rejects(find('read').handle(c),e=>e.status===404);
+  assert.equal((await find('list').handle(context({}))).items.length,0);
+  c.request.query={trash:'true'};
+  const deleted=await find('read').handle(c);
+  assert.equal(deleted.deletedBy,'test');assert.ok(deleted.deletedAt);
+  c.request.body={version:edited.version};
+  await assert.rejects(find('restore').handle(c),e=>e.status===409);
+  c.request.body={version:deleted.version};
+  const restored=await find('restore').handle(c);
+  assert.equal(restored.deletedAt,null);assert.equal(restored.restoredBy,'test');
+  assert.equal(restored.createdBy,'test');
+  assert.equal((await find('list').handle(context({}))).items.length,1);
+});

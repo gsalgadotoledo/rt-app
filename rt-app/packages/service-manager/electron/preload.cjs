@@ -1,0 +1,19 @@
+const {contextBridge,ipcRenderer,webUtils}=require('electron');
+contextBridge.exposeInMainWorld('rtAppServices',{
+ dropFolder:file=>ipcRenderer.invoke('projects:drop-folder',webUtils.getPathForFile(file)),
+ openProjectLocation:(target,path)=>ipcRenderer.invoke('projects:open-location',target,path),
+ copyText:text=>ipcRenderer.invoke('services:copy-text',text),
+ projectStatus:(id,backendId)=>ipcRenderer.invoke('projects:status',id,backendId),
+ chooseWorkspace:()=>ipcRenderer.invoke('projects:workspace'),
+ installTools:ids=>ipcRenderer.invoke('projects:install-tools',ids),
+ createProject:spec=>ipcRenderer.invoke('projects:create',spec),
+ selectProject:path=>ipcRenderer.invoke('services:select-project',path),
+ setPorts:(scope,ports)=>ipcRenderer.invoke('services:ports',scope,ports),
+ catalogAction:(action,id)=>ipcRenderer.invoke('services:catalog',action,id),
+ discover:()=>ipcRenderer.invoke('services:discover'),
+ addDiscovered:id=>ipcRenderer.invoke('services:add-discovered',id),
+ snapshot:()=>ipcRenderer.invoke('services:status'),
+ action:(action,id)=>ipcRenderer.invoke('services:action',action,id),
+ logs:id=>ipcRenderer.invoke('services:logs',id),
+ openUrl:id=>ipcRenderer.invoke('services:open-url',id),
+});

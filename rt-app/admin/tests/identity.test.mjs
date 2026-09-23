@@ -1,0 +1,48 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createApplication,seedDemo} from '@gsalgadotoledo/rt-app-framework';
+import {AdminIdentity,passwordVerifier} from '@gsalgadotoledo/rt-app-myadmin/backend';
+import {MemoryStore} from '@gsalgadotoledo/rt-app-dynamodb';
+import {LocalMailbox} from '@gsalgadotoledo/rt-app-auth';
+const password='Root-Password-Test-2026!';
+test('password-only admin has no database, isolates tokens and manages application users',async()=>{
+ const store=new MemoryStore(),verifier=await passwordVerifier(password);
+ const app=createApplication({store,mailer:new LocalMailbox(),secret:'signing-secret-'.repeat(4),adminPasswordVerifier:verifier});
+ await app.migrate();await seedDemo(app,'Public-Password-2026!');
+ let ip=0;
+ const call=(method,path,body={},token)=>app.handle({method,path,body,query:{},headers:{authorization:token?'Bearer '+token:undefined},ip:String(ip++)});
+ assert.equal((await call('POST','/admin/identity/auth/login',{password:'wrong'})).status,401);
+ const root=await call('POST','/admin/identity/auth/login',{password});
+ assert.equal(root.status,200);assert.equal(root.body.user.id,'rt-app-root');
+ const token=root.body.token;
+ assert.equal((await call('GET','/users/me',{},token)).status,401);
+ const user=(await call('POST','/auth/login',{email:'owner@example.test',password:'Public-Password-2026!'})).body;
+ assert.equal((await call('GET','/admin/modules',{},user.token)).status,401);
+ assert.equal((await call('GET','/admin/app/users',{},token)).status,200);
+ assert.equal((await call('GET','/admin/identity/users',{},token)).status,404);
+ assert.equal((await call('POST','/admin/identity/auth/reset/request',{email:'root@example.test'})).status,404);
+ assert.equal((await store.list('ADMIN#USERS')).items.length,0);
+ const menus=await call('GET','/admin/modules',{},token);
+ assert.ok(menus.body.every(m=>!m.id.startsWith('admin-')));
+ const rotated=new AdminIdentity(await passwordVerifier('Rotated-Password-Test-2026!'),'signing-secret-'.repeat(4));
+ await assert.rejects(rotated.auth.actor('Bearer '+token),e=>e.status===401);
+});
+test('admin fails closed without configuration and throttles invalid password attempts',async()=>{
+ await assert.rejects(passwordVerifier('short'));
+ const disabled=new AdminIdentity(undefined,'disabled-secret-'.repeat(4));
+ await assert.rejects(disabled.login(password,'ip'),e=>e.status===503);
+ const admin=new AdminIdentity(await passwordVerifier(password),'another-secret-'.repeat(4));
+ for(let i=0;i<5;i++)await assert.rejects(admin.login('wrong','ip'),e=>e.status===401);
+ await assert.rejects(admin.login(password,'ip'),e=>e.status===429);
+ assert.ok((await admin.login(password,'other-ip')).token);
+});
+test('explicit local admin access needs no password and does not authenticate public users', async()=>{
+ const app=createApplication({store:new MemoryStore(),mailer:new LocalMailbox(),secret:'local-test-secret-'.repeat(4),localAdminAccess:true});
+ await app.migrate();
+ const call=path=>app.handle({method:'GET',path,body:{},query:{},headers:{},ip:'127.0.0.1'});
+ assert.equal((await call('/admin/modules')).status,200);
+ assert.equal((await call('/admin/app/users')).status,200);
+ assert.equal((await call('/users/me')).status,401);
+ const secured=createApplication({store:new MemoryStore(),mailer:new LocalMailbox(),secret:'remote-test-secret-'.repeat(4)});
+ assert.equal((await secured.handle({method:'GET',path:'/admin/modules',body:{},query:{},headers:{},ip:'127.0.0.1'})).status,401);
+});
