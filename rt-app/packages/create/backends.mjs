@@ -18,7 +18,7 @@ export async function generateBackend(target,id,packageRoot){
   await writeFile(join(directory,'run.mjs'),`import {spawn} from 'node:child_process';\nimport {ensurePython} from './setup.mjs';\nconst python=await ensurePython();\nconst child=spawn(python,['main.py'],{stdio:'inherit',env:process.env});\nfor(const signal of ['SIGTERM','SIGINT'])process.on(signal,()=>child.kill(signal));\nchild.on('error',error=>{console.error(error.message);process.exitCode=1});\nchild.on('exit',code=>process.exitCode=code??0);\n`);
  }
  // Refuse to silently publish only the TS core while omitting the selected application API.
- await mkdir(join(target,'rt-app/scripts'),{recursive:true});await writeFile(join(target,'rt-app/scripts/native-deploy-pending.mjs'),`throw new Error(${JSON.stringify('AWS deployment for '+id+' is not implemented. The selected backend currently supports local development only.')});\n`);
+ if(['go','python'].includes(id))await cp(join(packageRoot,'languages','core-'+id),join(target,'packages','core-'+id),{recursive:true});
  for(const path of ['.github/workflows/deploy.yml','.gitlab-ci.yml'])await rm(join(target,path),{force:true});
  await writeFile(join(directory,'README.md'),`# ${selected.name} API\n\nRun from the project root:\n\n\`\`\`sh\nnpm run dev\n\`\`\`\n\nAWS deployment pending. Existing admin/auth/CRUD routes use the Node core.\n`);
 }

@@ -6,6 +6,11 @@
     ".": {
       "types": "./index.d.ts",
       "default": "./index.js"
+    },
+    "./package.json": "./package.json",
+    "./paths": {
+      "types": "./paths.d.ts",
+      "default": "./paths.js"
     }
   },
   "scripts": {
@@ -41,6 +46,7 @@
     "*.css",
     "*.html",
     "AGENTS.md",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }

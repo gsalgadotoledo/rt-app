@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import {ServiceHub} from './hub.mjs';
 import {fileURLToPath} from 'node:url';
 import {spawn} from 'node:child_process';
@@ -19,8 +20,9 @@ export async function servicesCommand(root,args){
  console.log(JSON.stringify(result,null,2));
 }
 export async function desktopCommand(root){
- await ensureNative();await run('npm',['run','build','--workspace','@gsalgadotoledo/rt-app-service-manager'],{cwd:root});
- const electron=(await import('electron')).default;
+ await ensureNative();
+ let electron;
+ try { electron=createRequire(join(root,'package.json'))('electron'); } catch { throw new Error('Install Electron in this project: npm install --save-dev electron@44.4.4'); }
  const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
  await run(electron,[packageRoot,'--project',root],{env});
 }

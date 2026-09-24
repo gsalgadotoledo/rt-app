@@ -11,7 +11,9 @@
     },
     "./admin": "./ui/index.tsx",
     "./settings": "./ui/settings.tsx",
-    "./security": "./ui/security.tsx"
+    "./security": "./ui/security.tsx",
+    "./package.json": "./package.json",
+    "./totp": "./dist/totp.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -63,6 +65,7 @@
     "*.css",
     "*.html",
     "AGENTS.md",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }

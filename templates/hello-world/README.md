@@ -1,5 +1,5 @@
 # Hello World RT-App
-Full stack · node-ts. Requires Node 22.12+ and Rust/Cargo for the local CLI; AWS setup also requires Terraform.
+Full stack · node-ts. Requires Node 22.14+ and Rust/Cargo for the local CLI; AWS setup also requires Terraform.
 
 ```sh
 # Install

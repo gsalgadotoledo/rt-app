@@ -77,26 +77,26 @@ resource "aws_dynamodb_table" "application" {
   }
 }
 module "authentication" {
-  source    = "../../rt-app/packages/auth-cognito/infra"
+  source    = "../../node_modules/@gsalgadotoledo/rt-app-auth-cognito/infra"
   name      = local.name
   region    = var.region
   mail_from = var.mail_from
 }
 # Admin resources belong to the reusable core; only composition lives here.
 module "admin" {
-  source     = "../../rt-app/admin/infra/aws"
+  source     = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/admin"
   name       = local.name
   account_id = data.aws_caller_identity.current.account_id
 }
 module "public" {
-  source     = "../../rt-app/infra/aws/site"
+  source     = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/site"
   name       = local.name
   site       = "public"
   account_id = data.aws_caller_identity.current.account_id
 }
 # One API serves both local server and Lambda entrypoints; no containers or ALB.
 module "ssr" {
-  source      = "../../rt-app/infra/aws/ssr"
+  source      = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/ssr"
   name        = local.name
   environment = var.environment
   region      = var.region
@@ -107,7 +107,7 @@ module "ssr" {
 }
 module "api" {
   stripe_enabled         = var.stripe_enabled
-  source                 = "../../rt-app/infra/aws/runtime"
+  source                 = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/runtime"
   cognito_user_pool_id   = module.authentication.pool_id
   cognito_user_pool_arn  = module.authentication.pool_arn
   cognito_client_id      = module.authentication.client_id

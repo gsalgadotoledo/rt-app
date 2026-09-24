@@ -16,7 +16,8 @@
     "./currency": {
       "types": "./dist/currency.d.ts",
       "default": "./dist/currency.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -64,6 +65,7 @@
     "*.css",
     "*.html",
     "AGENTS.md",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }

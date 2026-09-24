@@ -1,3 +1,4 @@
+import { packageFile } from '@gsalgadotoledo/rt-app-config/paths';
 import {mkdir,writeFile,readFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {spawnSync} from 'node:child_process';
@@ -16,8 +17,8 @@ if(args.includes('--apply')){
  const sts=new STSClient({region,maxAttempts:1});try{const identity=await sts.send(new GetCallerIdentityCommand({}));if(identity.Arn?.endsWith(':root'))throw new Error('Root credentials are not accepted. Use an administrative SSO session or IAM role.');if(identity.Account!==principal.split(':')[4])throw new Error('Principal must belong to the current account');}finally{sts.destroy();}
  const env={...process.env,TF_DATA_DIR:resolve('.rt-app/terraform-bootstrap')},plan=resolve('.rt-app/aws-access.plan'),state=resolve('.rt-app/bootstrap.tfstate');
  function run(command,argv,capture=false){const r=spawnSync(command,argv,{env,encoding:'utf8',stdio:capture?'pipe':'inherit'});if(r.error||r.status!==0)throw new Error(`${command} failed`);return r.stdout;}
- run('terraform',['-chdir=rt-app/infra/aws/bootstrap','init','-input=false']);run('terraform',['-chdir=rt-app/infra/aws/bootstrap','plan','-input=false','-state='+state,'-var-file='+file,'-out='+plan]);run('terraform',['-chdir=rt-app/infra/aws/bootstrap','apply','-input=false',plan]);
- const output=JSON.parse(run('terraform',['-chdir=rt-app/infra/aws/bootstrap','output','-state='+state,'-json'],true));await writeFile(resolve('.rt-app/aws-access.outputs.json'),JSON.stringify(output,null,2)+'\n',{mode:0o600});
+ run('terraform',['-chdir='+packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/bootstrap'),'init','-input=false']);run('terraform',['-chdir='+packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/bootstrap'),'plan','-input=false','-state='+state,'-var-file='+file,'-out='+plan]);run('terraform',['-chdir='+packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/bootstrap'),'apply','-input=false',plan]);
+ const output=JSON.parse(run('terraform',['-chdir='+packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/bootstrap'),'output','-state='+state,'-json'],true));await writeFile(resolve('.rt-app/aws-access.outputs.json'),JSON.stringify(output,null,2)+'\n',{mode:0o600});
  if(args.includes('--configure-github')){const b=output.bootstrap.value;for(const [name,value] of Object.entries({AWS_REGION:region,RT_APP_NAME:app,TF_STATE_BUCKET:b.StateBucket,AWS_ROLE_PROD:b.ProdRole,...(config.multi_environment?{AWS_ROLE_DEVELOP:b.DevelopRole,AWS_ROLE_STAGE:b.StageRole}:{}),RT_APP_MULTI_ENVIRONMENT:String(config.multi_environment)}))run('gh',['variable','set',name,'--repo',repository,'--body',String(value)]);}
  console.log('Roles and policies created. Outputs: .rt-app/aws-access.outputs.json. No long-term AWS access keys were created.');
 }else console.log('No AWS changes made. Add --apply using an administrative non-root session to create the roles and branch-scoped OIDC policies.');

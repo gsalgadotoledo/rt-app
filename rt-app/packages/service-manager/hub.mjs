@@ -1,3 +1,4 @@
+import { packageFile } from '@gsalgadotoledo/rt-app-config/paths';
 import {runtimeLabel} from './runtime-label.mjs';
 import {Toolchains} from '@gsalgadotoledo/rt-app-create/runtime';
 import {catalog,installTool,toolService} from './catalog.mjs';
@@ -49,7 +50,7 @@ export class ServiceHub {
   }
   this.root=root;
   // The command belongs to the framework, but its cache/database belong to the global directory.
-  this.global.mailCommand??=['node',join(root,'rt-app/cli/bin/rta.mjs'),'mail'];
+  this.global.mailCommand??=['node',packageFile('@gsalgadotoledo/rt-app-cli','bin/rta.mjs',root),'mail'];
   await save(join(this.home,'settings.json'),this.global);
   const globalConfig=this.globalManifest();const globalDaemon=await ensureDaemon(this.home,{binary:this.options.binary,config:globalConfig});
   if(!globalDaemon.started&&JSON.stringify(await read(join(this.home,'.rt-app/services.json')))!==JSON.stringify(globalConfig))await apply(this.home,globalConfig);

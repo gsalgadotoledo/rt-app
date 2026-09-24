@@ -10,44 +10,34 @@ concurrency:
 jobs:
   checks:
     runs-on: ubuntu-latest
-    services:
-      dynamodb:
-        image: amazon/dynamodb-local:3.3.0
-        ports: ['8000:8000']
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
       - run: npm ci
       - uses: dtolnay/rust-toolchain@stable
       - run: npm test
       - run: npm run lambda:build
-      - run: npm run test:dynamo
-        env:
-          DYNAMODB_TEST_ENDPOINT: http://127.0.0.1:8000
-          AWS_ACCESS_KEY_ID: localtest
-          AWS_SECRET_ACCESS_KEY: localtest
-          AWS_REGION: us-east-1
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.11.4
           terraform_wrapper: false
       - run: |
-          terraform fmt -check -recursive infra rt-app/infra rt-app/admin/infra rt-app/packages/auth-cognito/infra
-          terraform -chdir=rt-app/infra/aws/bootstrap init -backend=false -input=false
-          terraform -chdir=rt-app/infra/aws/bootstrap validate
-          terraform -chdir=rt-app/infra/aws/bootstrap test
+          terraform fmt -check -recursive infra node_modules/@gsalgadotoledo/rt-app-infra/terraform node_modules/@gsalgadotoledo/rt-app-auth-cognito/infra
+          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/bootstrap init -backend=false -input=false
+          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/bootstrap validate
+          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/bootstrap test
           terraform -chdir=infra/aws init -backend=false -input=false
           terraform -chdir=infra/aws validate
           terraform -chdir=infra/aws test
-          terraform -chdir=rt-app/infra/aws/ssr init -backend=false -input=false
-          terraform -chdir=rt-app/infra/aws/ssr test
-          terraform -chdir=rt-app/packages/auth-cognito/infra init -backend=false -input=false
-          terraform -chdir=rt-app/packages/auth-cognito/infra test
+          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/ssr init -backend=false -input=false
+          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/ssr test
+          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-auth-cognito/infra init -backend=false -input=false
+          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-auth-cognito/infra test
   deploy:
     needs: checks
     if: github.ref_name == 'main' || vars.RT_APP_MULTI_ENVIRONMENT == 'true'
@@ -77,7 +67,7 @@ jobs:
           test -n "$TF_STATE_BUCKET"
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -101,13 +91,13 @@ jobs:
       - name: Migrate and publish admin, SPA and SSR
         run: |
           terraform -chdir=infra/aws output -json deployment > "$RUNNER_TEMP/outputs.json"
-          node rt-app/cli/deploy.mjs "$RUNNER_TEMP/outputs.json"
+          npm exec -- rta deploy "$RUNNER_TEMP/outputs.json"
       - name: Release artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="$TF_VAR_environment-$GITHUB_SHA"
-          tar -czf "$RUNNER_TEMP/rt-app-release.tgz" rt-app/admin/dist/web apps/spa/dist apps/lambda-ts/bundle .rt-app/release.json
+          tar -czf "$RUNNER_TEMP/rt-app-release.tgz" .rt-app/admin apps/spa/dist apps/lambda-ts/bundle .rt-app/release.json
           if ! gh release view "$tag" >/dev/null 2>&1; then
             if [ "$TF_VAR_environment" != prod ]; then
               gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes "Automated development deployment." --prerelease

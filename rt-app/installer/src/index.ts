@@ -1,3 +1,4 @@
+import { packageFile } from '@gsalgadotoledo/rt-app-config/paths';
 import {readFile} from "node:fs/promises";
 import {environmentVariables,publicConfig} from '@gsalgadotoledo/rt-app-config';
 import {publishSsr} from './ssr.js';
@@ -349,13 +350,13 @@ export async function install(input: InstallInput, host: InstallHost) {
   };
   await host.run(
     "terraform",
-    ["-chdir=rt-app/infra/aws/bootstrap", "init", "-input=false"],
+    ['-chdir='+packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/bootstrap'), "init", "-input=false"],
     bootstrapEnv,
   );
   await host.run(
     "terraform",
     [
-      "-chdir=rt-app/infra/aws/bootstrap",
+      '-chdir='+packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/bootstrap'),
       "plan",
       "-input=false",
       "-state=" + state,
@@ -365,7 +366,7 @@ export async function install(input: InstallInput, host: InstallHost) {
   );
   await host.run(
     "terraform",
-    ["-chdir=rt-app/infra/aws/bootstrap", "apply", "-input=false", plan],
+    ['-chdir='+packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/bootstrap'), "apply", "-input=false", plan],
     bootstrapEnv,
   );
   const bootstrap = JSON.parse(
@@ -373,7 +374,7 @@ export async function install(input: InstallInput, host: InstallHost) {
       await host.run(
         "terraform",
         [
-          "-chdir=rt-app/infra/aws/bootstrap",
+          '-chdir='+packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/bootstrap'),
           "output",
           "-state=" + state,
           "-json",

@@ -10,7 +10,7 @@ en el framework, pero no forma parte de esta aplicación por defecto.
 
 El correo se simula en local y usa AWS SES en producción. Verifica el remitente en
 la región de instalación; en sandbox SES también deben verificarse los destinatarios.
-El admin usa una contraseña raíz definida en ADMIN_PASSWORD, sin email ni tabla propia.
+El admin local abre sin contraseña; el remoto usa ADMIN_PASSWORD, sin email ni tabla propia.
 Desde allí puedes crear usuarios de la aplicación y editar Home; sus sesiones están aisladas.
 
 ## Infraestructura por responsabilidad
@@ -22,9 +22,9 @@ Un único estado por entorno mantiene las dependencias; separar carpetas no impl
 separar el ciclo de despliegue ni duplicar recursos. `moved.tf` conserva las direcciones
 del estado anterior al extraer los módulos y debe mantenerse para instalaciones existentes.
 
-El core define el hosting privado del admin en `rt-app/admin/infra/aws`.
+El core define el hosting privado del admin en `rt-app/packages/infra/terraform/aws/admin`.
 El bootstrap de estado/OIDC y los componentes Lambda/API y S3/CloudFront viven en
-`rt-app/infra/aws`. Ambos frontends llaman a la misma API; esta puede ejecutarse en
+`rt-app/packages/infra/terraform/aws`. Ambos frontends llaman a la misma API; esta puede ejecutarse en
 Node local o Lambda. El Terraform del starter sigue declarando su composición, pero
 no implementa los recursos internos del admin.
 
@@ -42,7 +42,7 @@ con la versión anterior durante la actualización.
 
 `apps/lambda-ts/build.mjs` genera el bundle desde cualquier directorio; puede ejecutarse
 con `npm run lambda:build` o `npm run bundle -w @gsalgadotoledo/rt-app-lambda-ts`. La publicación CI vive
-en `rt-app/cli/deploy.mjs`. Las herramientas genéricas de workspaces están en el core.
+en el comando `rta deploy`. Las herramientas genéricas de workspaces están en el core.
 
 ## Pruebas junto a su implementación
 
@@ -55,14 +55,11 @@ pertenecen al paquete framework (`rt-app/tests`); las del starter local están e
 solo un grupo después del build:
 
 ```sh
-npm test -w @gsalgadotoledo/rt-app-cli
 npm test -w @gsalgadotoledo/rt-app-lambda-ts
-npm test -w @gsalgadotoledo/rt-app-myadmin
-npm test -w @gsalgadotoledo/rt-app-installer
 ```
 
 `npm run test:dynamo` ejecuta las pruebas de integración del adaptador DynamoDB,
-ubicadas en `rt-app/packages/dynamodb/tests`; requiere DynamoDB Local. CI configura estas variables automáticamente. En local:
+ubicadas en `rt-app/packages/dynamodb/tests`; requiere DynamoDB Local. Estas pruebas se ejecutan desde el repositorio del framework, no desde la aplicación generada. En local:
 
 ```sh
 DYNAMODB_TEST_ENDPOINT=http://127.0.0.1:8000 AWS_ACCESS_KEY_ID=localtest AWS_SECRET_ACCESS_KEY=localtest AWS_REGION=us-east-1 npm run test:dynamo

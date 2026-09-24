@@ -11,6 +11,10 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm run prepare:templates

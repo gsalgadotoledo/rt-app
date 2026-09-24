@@ -10,7 +10,7 @@ variable "spend_guards" {
   default = {}
 }
 module "spend_guards" {
-  source       = "../../rt-app/infra/aws/spend-guards"
+  source       = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/spend-guards"
   name         = local.name
   application  = var.app
   environment  = var.environment

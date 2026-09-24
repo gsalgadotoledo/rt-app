@@ -13,7 +13,7 @@ try{
  await cp(join(root,'electron/assets'),join(staging,'electron/assets'),{recursive:true});
  await run(process.execPath,[join(root,'../create/scripts/prepare.mjs')],{cwd:resolve(root,'../../..')});
  const generator=join(staging,'node_modules/@gsalgadotoledo/rt-app-create');await mkdir(generator,{recursive:true});
- for(const name of ['package.json','runtime.mjs','toolchain.json','templates','starter'])await cp(join(root,'../create',name),join(generator,name),{recursive:true});
+ for(const name of ['package.json','runtime.mjs','toolchain.json','templates','starter','languages','LICENSE'])await cp(join(root,'../create',name),join(generator,name),{recursive:true});
  await build({entryPoints:[join(root,'../create/index.mjs')],outfile:join(generator,'index.mjs'),bundle:true,platform:'node',format:'esm'});
  await cp(join(root,'json-server.mjs'),join(staging,'json-server.mjs'));
  await cp(join(root,'dist'),join(staging,'dist'),{recursive:true});await cp(join(root,'electron/preload.cjs'),join(staging,'electron/preload.cjs'));

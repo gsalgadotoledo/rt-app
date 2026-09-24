@@ -10,7 +10,7 @@ contracts. The admin edits the same Home content for both.
 
 ```sh
 npm ci
-ADMIN_PASSWORD='REPLACE_WITH_YOUR_16_TO_128_CHARACTER_PASSWORD' npm run dev
+npm run dev
 ```
 
 The core CLI starts API `4010`, admin `5174`, SPA `5175`, SSR `5176`, and Mailpit `8025`.
@@ -42,13 +42,13 @@ GitHub tokens or database credentials to this contract. Backend credentials stay
 server environment variables or the existing AWS secret mechanism.
 
 Amplify does not automatically make its build environment available to Next.js SSR.
-`rt-app/scripts/prepare-ssr.mjs` writes **only the allowlisted public values** into an
+`rta prepare-ssr` writes **only the allowlisted public values** into an
 ignored `apps/ssr/.env.production` during the cloud build. No settings file needs to be
 maintained in either app. Deploy again to publish changed cloud configuration.
 
 ## AWS resources and deployment
 
-`infra/aws` composes `rt-app/infra/aws/ssr`: one Amplify `WEB_COMPUTE` app and branch per
+`infra/aws` composes `rt-app/packages/infra/terraform/aws/ssr`: one Amplify `WEB_COMPUTE` app and branch per
 environment, plus a bounded logging service role. Existing Lambda, API Gateway,
 DynamoDB, Cognito and S3/CloudFront resources remain shared with the SPA/admin as before.
 Amplify gets no database credentials: SSR consumes the existing API.

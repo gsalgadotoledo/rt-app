@@ -9,7 +9,7 @@ test('all built-in templates generate independently without credentials, state o
  try{for(const item of await templates()){
   const result=await createProject({workspace,name:'test-'+item.id,templateId:item.id,install:false});const settings=JSON.parse(await readFile(join(result.path,'rt-app.settings.json')));
   const readme=await readFile(join(result.path,'README.md'),'utf8');assert.ok(readme.split('\n').length<25);await access(join(result.path,'CLAUDE.md'));await assert.rejects(access(join(result.path,'PROJECT.md')));await assert.rejects(access(join(result.path,'docs')));assert.equal(settings.project.template,item.id);assert.equal(settings.local,undefined);assert.equal(settings.requirements.node,'24');
-  await assert.rejects(access(join(result.path,'.rt-app')));await assert.rejects(access(join(result.path,'node_modules')));await assert.rejects(access(join(result.path,'apps/ssr/.next')));
+  await assert.rejects(access(join(result.path,'rt-app')));await assert.rejects(access(join(result.path,'package-lock.json')));await assert.rejects(access(join(result.path,'.rt-app')));await assert.rejects(access(join(result.path,'node_modules')));await assert.rejects(access(join(result.path,'apps/ssr/.next')));
   for(const crud of item.crud??[])await access(join(result.path,'packages',crud.name,'src/schema.json'));
   if(item.kind==='electron')await access(join(result.path,'apps/desktop/main.mjs'));
   if(item.kind==='mobile')await access(join(result.path,'apps/mobile/App.js'));

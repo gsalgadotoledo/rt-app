@@ -8,6 +8,7 @@ import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import {mailConfig,mailpitLaunch,ensureMailpit} from '@gsalgadotoledo/rt-app-mail-local/runtime';
 import {publicConfig,localUrls,environmentVariables} from '@gsalgadotoledo/rt-app-config';
+import { packageFile } from '@gsalgadotoledo/rt-app-config/paths';
 const [command='help', ...args] = process.argv.slice(2);
 const json = args.includes('--json');
 const root = process.cwd();
@@ -43,7 +44,24 @@ async function checkPorts(ports) {
   });
 }
 try {
-  if(command==='module') {
+  if (command === 'build' || command === 'check') {
+    run(process.execPath, [packageFile('@gsalgadotoledo/rt-app-framework', 'scripts/workspaces.mjs'), command]);
+    if (command === 'build') {
+      const { runAdmin } = await import('@gsalgadotoledo/rt-app-myadmin/runtime');
+      await runAdmin({projectRoot: root, mode: 'build'});
+    }
+  } else if (command === 'prepare-ssr') {
+    run(process.execPath,[packageFile('@gsalgadotoledo/rt-app-framework','scripts/prepare-ssr.mjs')]);
+  } else if (command === 'next') {
+    run(process.execPath,[packageFile('@gsalgadotoledo/rt-app-framework','scripts/next.mjs'),...args]);
+  } else if (command === 'admin') {
+    const { runAdmin } = await import('@gsalgadotoledo/rt-app-myadmin/runtime');
+    await runAdmin({projectRoot: root});
+  } else if (command === 'deploy' || command === 'setup-terminal') {
+    run(process.execPath,[fileURLToPath(new URL(command === 'deploy' ? '../deploy.mjs' : '../dist/index.js',import.meta.url)),...args]);
+  } else if (command === 'native-deploy-pending') {
+    throw new Error('AWS deployment for this backend is not implemented. Use local development.');
+  } else if(command==='module') {
     const {runModuleCommand}=await import('../module-tools.mjs');
     await runModuleCommand(args);
   } else if(command==='mcp') {
@@ -116,6 +134,6 @@ try {
   } else if(command==='desktop') {
     const {desktopCommand}=await import('@gsalgadotoledo/rt-app-service-manager/cli');
     await desktopCommand(root);
-  } else if(command==='help') console.log('RT-App CLI\n  rta module list\n  rta module <action> [@input.json]\n  rta mcp\n  rta cloud\n  rta aws-bootstrap\n  rta create crud <name> [--fields name:string] [--actions publish] [--spec file] [--dry-run] [--json]\n  rta dev [--no-build] [--no-mail]\n  rta mail [--install-only]\n  rta desktop\n  rta services <status|daemon|start|stop|restart|logs|shutdown> [service|all] [--json]\n  rta install [--multi-environment]\n  rta urls [--json]\n  rta workspaces [--json]\n  rta run <workspace> <script>\n  rta tools --json');
+  } else if(command==='help') console.log('RT-App CLI\n  rta build\n  rta check\n  rta admin\n  rta deploy <outputs.json>\n  rta module list\n  rta module <action> [@input.json]\n  rta mcp\n  rta cloud\n  rta aws-bootstrap\n  rta create crud <name> [--fields name:string] [--actions publish] [--spec file] [--dry-run] [--json]\n  rta dev [--no-build] [--no-mail]\n  rta mail [--install-only]\n  rta desktop\n  rta services <status|daemon|start|stop|restart|logs|shutdown> [service|all] [--json]\n  rta install [--multi-environment]\n  rta urls [--json]\n  rta workspaces [--json]\n  rta run <workspace> <script>\n  rta tools --json');
   else throw new Error(`Unknown command: ${command}`);
 } catch(e){console.error(e.message);process.exitCode=1;}

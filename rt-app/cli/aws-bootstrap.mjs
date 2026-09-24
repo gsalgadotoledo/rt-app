@@ -1,10 +1,11 @@
+import { packageFile } from '@gsalgadotoledo/rt-app-config/paths';
 import {mkdir,open,readFile,lstat,unlink} from 'node:fs/promises';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {IAMClient,CreateUserCommand,PutUserPolicyCommand,CreateAccessKeyCommand,DeleteAccessKeyCommand,DeleteUserPolicyCommand,DeleteUserCommand} from '@aws-sdk/client-iam';
 import {STSClient,GetCallerIdentityCommand} from '@aws-sdk/client-sts';
 
-const policyPath=fileURLToPath(new URL('../infra/aws/data/installer-policy.json',import.meta.url));
+const policyPath=packageFile('@gsalgadotoledo/rt-app-infra','terraform/aws/data/installer-policy.json');
 export const bootstrapKeys=['RT_APP_BOOTSTRAP_ACCESS_KEY_ID','RT_APP_BOOTSTRAP_SECRET_ACCESS_KEY','RT_APP_BOOTSTRAP_SESSION_TOKEN'];
 export function deploymentEnvironment(env,identity){
  const next={...env};

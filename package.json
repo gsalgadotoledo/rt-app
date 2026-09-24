@@ -15,9 +15,10 @@
     "test": "npm test --workspaces --if-present",
     "check:architecture": "node rt-app/scripts/workspaces.mjs check",
     "prepare:templates": "node rt-app/packages/create/scripts/prepare.mjs",
-    "release:pack": "node scripts/release.mjs pack",
-    "release:verify": "node scripts/release.mjs verify",
-    "release:publish": "node scripts/release.mjs publish"
+    "release:pack": "node rt-app/scripts/release.mjs pack",
+    "release:verify": "node rt-app/scripts/release.mjs verify",
+    "release:publish": "node rt-app/scripts/release.mjs publish",
+    "release:check": "npm run check:architecture && npm run build && npm run prepare:templates && npm test && npm run release:pack && npm run release:verify"
   },
   "engines": {
     "node": ">=22.14"

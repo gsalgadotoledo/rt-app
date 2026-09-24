@@ -1,3 +1,4 @@
+import { packageFile } from '@gsalgadotoledo/rt-app-config/paths';
 import {spawn,execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {readFile,writeFile,mkdir,access,open,stat} from 'node:fs/promises';
@@ -38,10 +39,14 @@ export async function manifest(root,{noBuild=false,noMail=false,sharedMail,share
   const {stdout}=await promisify(execFile)('npm',['query','.workspace','--json'],{cwd:root});
   const workspaces=JSON.parse(stdout);
   if(!noBuild)services.push({id:'build',label:'Build workspace',kind:'task',command:['npm','run','build'],cwd:'.',env:shared,ports:[],dependencies:[]});
-  if(!noMail&&!sharedMail)services.push({id:'mail',label:'Mailpit · local email',command:[process.env.RT_APP_NODE_BINARY??'node', 'rt-app/cli/bin/rta.mjs','mail'],cwd:'.',env:shared,ports:[1025,8025],url:'http://127.0.0.1:8025',readyUrl:'http://127.0.0.1:8025/readyz',dependencies:[]});
+  if(!noMail&&!sharedMail)services.push({id:'mail',label:'Mailpit · local email',command:[process.env.RT_APP_NODE_BINARY??'node', packageFile('@gsalgadotoledo/rt-app-cli','bin/rta.mjs',root),'mail'],cwd:'.',env:shared,ports:[1025,8025],url:'http://127.0.0.1:8025',readyUrl:'http://127.0.0.1:8025/readyz',dependencies:[]});
   if(nativeBackend)services.push({id:'core-api',label:'RT-App core · Node',command:['npm','run','dev','--workspace','@gsalgadotoledo/rt-app-server'],cwd:'.',env:{...shared,PORT:String(corePort),RT_APP_MAIL_TRANSPORT:noMail?'memory':'smtp',RT_APP_MAIL_SMTP_PORT:String(sharedMail?.smtp??1025)},inheritEnv:credentials,ports:[corePort],url:`http://localhost:${corePort}`,readyUrl:`http://localhost:${corePort}/`,dependencies:[...(!noBuild?['build']:[]),...(!noMail&&!sharedMail?['mail']:[])]});
   for(const role of ['backend','admin','spa','ssr']){
    const workspace=pkg.rtApp?.[role];if(!workspace)continue;
+   if (role==='admin' && !workspaces.some(w=>w.name===workspace)) {
+    services.push({id:'admin',label:'Admin',command:[process.env.RT_APP_NODE_BINARY??'node',packageFile('@gsalgadotoledo/rt-app-cli','bin/rta.mjs',root),'admin'],cwd:'.',env:shared,ports:[Number(new URL(urls.admin).port)],url:urls.admin,readyUrl:urls.admin+'/',dependencies:[...(!noBuild?['build']:[]),'api']});
+    continue;
+   }
    const entry=workspaces.find(w=>w.name===workspace);if(!entry)throw new Error(`Missing workspace ${workspace}; run npm install`);
    const script=entry.scripts?.dev?'dev':'start';if(!entry.scripts?.[script])throw new Error(`No dev/start script for ${workspace}`);
    const id=role==='backend'?'api':role,url=urls[id];

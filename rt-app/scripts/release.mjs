@@ -14,6 +14,7 @@ for(const name of packages.keys())visit(name);
 const hash=path=>createHash('sha256').update(readFileSync(path)).digest('hex');
 const action=process.argv[2];
 if(action==='pack'){
+ rmSync(join(output,'verified.json'),{force:true});
  mkdirSync(output,{recursive:true});const manifest=[];
  for(const name of order){
   const {path,pkg}=packages.get(name);
@@ -29,6 +30,7 @@ if(action==='pack'){
  }
  writeFileSync(join(output,'manifest.json'),JSON.stringify(manifest,null,2)+'\n');
 }else if(action==='verify'){
+ rmSync(join(output,'verified.json'),{force:true});
  const manifest=JSON.parse(readFileSync(join(output,'manifest.json'))),temp=mkdtempSync(join(tmpdir(),'rt-app-package-test-'));
  try{
   for(const item of manifest)if(hash(join(output,item.file))!==item.sha256)throw Error('Artifact changed: '+item.name);
@@ -36,9 +38,15 @@ if(action==='pack'){
   run('npm',['install','--ignore-scripts','--no-audit','--no-fund',...manifest.map(p=>join(output,p.file))],{cwd:temp});
   run(process.execPath,['--input-type=module','-e',"const {createRTApp}=await import('@gsalgadotoledo/rt-app-core');if(typeof createRTApp!=='function')throw Error('Core export missing');const {createApplication}=await import('@gsalgadotoledo/rt-app-framework');if(typeof createApplication!=='function')throw Error('Framework export missing');"],{cwd:temp});
   run(process.execPath,[join(temp,'node_modules/@gsalgadotoledo/rt-app-cli/bin/rta.mjs'),'help'],{cwd:temp});
-  run(process.execPath,['--input-type=module','-e',"const {createProject}=await import('@gsalgadotoledo/rt-app-create');await createProject({workspace:process.cwd(),name:'smoke-app',install:false});"],{cwd:temp});
-  run('npm',['install','--ignore-scripts','--no-audit','--no-fund'],{cwd:join(temp,'smoke-app')});
+  run(process.execPath,['--input-type=module','-e',"const {createProject}=await import('@gsalgadotoledo/rt-app-create');await createProject({workspace:process.cwd(),name:'smoke-app',templateId:'admin-crm',install:false});"],{cwd:temp});
+  run('npm',['install','--ignore-scripts','--no-audit','--no-fund',...manifest.map(p=>join(output,p.file))],{cwd:join(temp,'smoke-app')});
+  if(existsSync(join(temp,'smoke-app','rt-app')))throw Error('Starter contains a source copy of the framework');
   run('npm',['run','build'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
+  run(process.execPath,[join(root,'rt-app/scripts/smoke-admin.mjs'),join(temp,'smoke-app')],{maxBuffer:20*1024*1024});
+  run('npm',['test','--workspaces','--if-present'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
+  run('npm',['run','lambda:build'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
+  run(process.env.TF_CLI_PATH??'terraform',['-chdir=infra/aws','init','-backend=false','-input=false'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
+  run(process.env.TF_CLI_PATH??'terraform',['-chdir=infra/aws','validate'],{cwd:join(temp,'smoke-app')});
   console.log('Clean installation, core/framework imports, CLI, packaged generation and generated application build passed.');
   writeFileSync(join(output,'verified.json'),JSON.stringify({manifestSha256:hash(join(output,'manifest.json'))})+'\n');
  }finally{rmSync(temp,{recursive:true,force:true});}
@@ -48,5 +56,18 @@ if(action==='pack'){
  if(verified.manifestSha256!==hash(path))throw Error('Run release:verify after packing');
  for(const item of manifest)if(hash(join(output,item.file))!==item.sha256)throw Error('Artifact changed: '+item.name);
  // npm handles the interactive 2FA challenge or GitHub OIDC. Never persist tokens here.
- for(const item of manifest)execFileSync('npm',['publish',join(output,item.file),'--access','public','--tag','next'],{cwd:root,stdio:'inherit'});
+ for (const item of manifest) {
+  let published;
+  try { published = JSON.parse(run('npm', ['view', item.name+'@'+item.version, 'dist.integrity', '--json'])); }
+  catch (error) {
+    if (!String(error.stderr).includes('E404')) throw error;
+  }
+  const integrity = 'sha512-' + createHash('sha512').update(readFileSync(join(output,item.file))).digest('base64');
+  if (published) {
+    if (published !== integrity) throw Error('Version already exists with different contents: '+item.name+'@'+item.version);
+    console.log('Already published: '+item.name);
+    continue;
+  }
+  execFileSync('npm',['publish',join(output,item.file),'--access','public','--tag','next','--ignore-scripts'],{cwd:root,stdio:'inherit'});
+ }
 }else throw Error('Usage: node scripts/release.mjs pack|verify|publish');

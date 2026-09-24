@@ -39,7 +39,7 @@ resource "aws_amplify_app" "ssr" {
     frontend = {
       buildPath = "/",
       phases = {
-        preBuild = { commands = ["nvm use 22", "npm ci", "node rt-app/scripts/prepare-ssr.mjs"] },
+        preBuild = { commands = ["nvm use 24", "npm ci", "npm exec -- rta prepare-ssr"] },
         build    = { commands = ["npm run build -w @gsalgadotoledo/rt-app-ssr"] }
       },
       artifacts = { baseDirectory = "apps/ssr/.next", files = ["**/*"] },

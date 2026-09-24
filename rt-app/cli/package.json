@@ -9,7 +9,9 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./module-tools": "./module-tools.mjs"
+    "./module-tools": "./module-tools.mjs",
+    "./package.json": "./package.json",
+    "./bin": "./bin/rta.mjs"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -28,7 +30,8 @@
     "@gsalgadotoledo/rt-app-mail-local": "0.1.0-alpha.0",
     "@gsalgadotoledo/rt-app-config": "0.1.0-alpha.0",
     "@gsalgadotoledo/rt-app-service-manager": "0.1.0-alpha.0",
-    "@aws-sdk/client-iam": "^3.700.0"
+    "@aws-sdk/client-iam": "^3.700.0",
+    "@gsalgadotoledo/rt-app-create": "0.1.0-alpha.0"
   },
   "devDependencies": {
     "typescript": "^5.7.2",
@@ -71,6 +74,7 @@
     "*.css",
     "*.html",
     "AGENTS.md",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }

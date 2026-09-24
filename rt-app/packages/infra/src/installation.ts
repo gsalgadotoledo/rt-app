@@ -42,7 +42,7 @@ export const awsPermissionGroups = [
   {
     title: "Environment resources",
     detail:
-      "Lambda, API Gateway v2, DynamoDB, Secrets Manager, CloudWatch Logs, S3 and CloudFront: create, update, read, tag and delete for replacements. IAM only for the execution role and PassRole to Lambda. See rt-app/infra/aws/bootstrap/main.tf and docs/installation.md.",
+      "Lambda, API Gateway v2, DynamoDB, Secrets Manager, CloudWatch Logs, S3 and CloudFront: create, update, read, tag and delete for replacements. IAM only for the execution role and PassRole to Lambda. See rt-app/packages/infra/terraform/aws/bootstrap/main.tf and docs/installation.md.",
   },
   {
     title: "Migration and publishing",

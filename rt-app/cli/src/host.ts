@@ -1,3 +1,4 @@
+import { adminAssets } from '@gsalgadotoledo/rt-app-config/paths';
 import {pathToFileURL} from "node:url";
 import {resolve} from "node:path";
 import { spawn } from "node:child_process";
@@ -106,7 +107,7 @@ export const host: InstallHost = {
     );
   },
   async assets(site = "admin") {
-    const directory = site === "admin" ? "rt-app/admin/dist/web/" : "apps/spa/dist/";
+    const directory = site === "admin" ? adminAssets() + "/" : "apps/spa/dist/";
     const result: { path: string; body: Uint8Array; type: string }[] = [];
     async function walk(prefix = "") {
       for (const entry of await readdir(directory + prefix, {

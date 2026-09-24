@@ -8,7 +8,7 @@ function run(command,args){return new Promise((resolve,reject)=>{const child=spa
 export async function ensurePython(){
  if(!existsSync(python))await run('python3',['-m','venv','.venv']);
  const check=spawnSync(python,['-c','import rt_app_core'],{cwd:root,stdio:'ignore'});
- if(check.status!==0)await run(python,['-m','pip','install','--no-deps','-e',join(root,'../../rt-app/core-python')]);
+ if(check.status!==0)await run(python,['-m','pip','install','--no-deps','-e',join(root,'../../packages/core-python')]);
  return python;
 }
 if(process.argv[1]&&pathToFileURL(process.argv[1]).href===import.meta.url)await ensurePython();

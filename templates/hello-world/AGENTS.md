@@ -1,6 +1,6 @@
 # Starter conventions
 
-Read CLAUDE.md for project layout and runtime constraints, and rt-app/AGENTS.md before changing the framework.
+Read CLAUDE.md for project layout and runtime constraints, and node_modules/@gsalgadotoledo/rt-app-framework/AGENTS.md before changing the framework.
 
 - Separate methods and top-level functions with a blank line. Group imports, types, configuration, lifecycle and public operations into readable sections.
 - Give exported functions, classes and configuration contracts short purpose-oriented documentation. Comment non-obvious constraints and side effects, not every statement.

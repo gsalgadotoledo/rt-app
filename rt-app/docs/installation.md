@@ -1,6 +1,6 @@
 # Installation operations
 
-Follow the environment-variable commands and IAM setup in [README](../README.md).
+Follow the environment-variable commands and IAM setup in [starter README](../../templates/hello-world/README.md).
 The wizard reads AWS credentials from the standard SDK credential chain; it never
 accepts access keys, an admin email or a new admin password in its settings forms.
 `ADMIN_PASSWORD` is required to sign in to the local installer and publish the root verifier.
@@ -8,8 +8,8 @@ accepts access keys, an admin email or a new admin password in its settings form
 ## Resources and persistence
 
 `infra/aws/main.tf` defines the application table and composes the API, public site
-and admin hosting. Reusable resource implementations remain in `rt-app/infra/aws`
-and `rt-app/admin/infra/aws`. There is **one DynamoDB table per environment**, for
+and admin hosting. Reusable resource implementations remain in `rt-app/packages/infra/terraform/aws`
+and `rt-app/packages/infra/terraform/aws/admin`. There is **one DynamoDB table per environment**, for
 application data. The admin has no user table, migration or database connection.
 The API uses the application table when the root views or changes application data.
 Cognito owns cloud credentials/MFA; DynamoDB keeps profiles and permissions.
@@ -60,8 +60,8 @@ npm run setup:terminal -- config.json --confirm rt-app-hello
 ## Local and remote access
 
 `rta dev` runs the local backend, admin and application frontend together. The default
-NoSQL adapter persists application data in `.rt-app/local.json`. The root password
-comes from the environment and the admin owns no database. Local never switches to
+NoSQL adapter persists application data in `.rt-app/local.json`. The local admin opens without a password and owns no database. Remote administration
+requires a root password supplied through the environment. Local never switches to
 production automatically. Use the published environment's CloudFront URL to work with
 its remote data. JSON and DynamoDB implement the same storage contract; changing the
 adapter does not transfer existing data.

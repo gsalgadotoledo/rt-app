@@ -1,14 +1,18 @@
 # RT-App
 
-Reusable framework, adapters, admin, CLI and project generator. Initial npm release: `0.1.0-alpha.0` under `@gsalgadotoledo` (not published yet).
+Backend modules, admin, CLI and app templates. npm scope: `@gsalgadotoledo`. Alpha: `0.1.0-alpha.0`. All rights reserved.
 
-```bash
+```sh
 npm ci
-npm run build
-npm run prepare:templates
-npm test
-npm run release:pack
-npm run release:verify
+npm run release:check
+# Authenticated owner only, after verification:
+npm run release:publish
 ```
 
-Framework: `rt-app/`. Editable starter: `templates/hello-world/`. Release instructions: [RELEASING.md](RELEASING.md).
+```text
+rt-app/                 Reusable core: modules, admin, CLI, language libraries, infrastructure and tools
+templates/hello-world/  Application code and application infrastructure
+.github/workflows/      Validation and manual npm publication
+```
+
+New projects install the core from npm; they do not copy its TypeScript sources. See [RELEASING.md](RELEASING.md) for publication and platform requirements.

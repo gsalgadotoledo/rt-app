@@ -25,20 +25,22 @@
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.18.4",
     "@gsalgadotoledo/rt-app-observer": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-subscriptions": "0.1.0-alpha.0"
+    "@gsalgadotoledo/rt-app-subscriptions": "0.1.0-alpha.0",
+    "vite": "^7.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "typescript": "^5.7.2",
-    "vite": "^7.0.0"
+    "typescript": "^5.7.2"
   },
   "exports": {
     ".": "./src/main.tsx",
     "./backend": {
       "types": "./dist/backend/index.d.ts",
       "default": "./dist/backend/index.js"
-    }
+    },
+    "./package.json": "./package.json",
+    "./runtime": "./runtime.mjs"
   },
   "license": "UNLICENSED",
   "publishConfig": {
@@ -70,6 +72,8 @@
     "*.css",
     "*.html",
     "AGENTS.md",
-    "README.md"
+    "README.md",
+    "vite.config.ts",
+    "LICENSE"
   ]
 }

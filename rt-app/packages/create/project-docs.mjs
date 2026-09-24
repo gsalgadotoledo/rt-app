@@ -7,13 +7,13 @@ export AWS_REGION='us-east-1'
 ADMIN_PASSWORD='YOUR_STRONG_ADMIN_PASSWORD' npm run cloud
 # Deployed URLs
 npm exec -- rta urls`: '# AWS deployment is not available for this backend yet.';
- return `# ${name}\n${templateName} · ${backendId}. Requires Node 22.12+ and Rust/Cargo for the local CLI${backendId==='python'?', Python 3.11+':backendId==='go'?', Go 1.22+':backendId==='java'?', JDK 21+':''}; AWS setup also requires Terraform.\n\n\`\`\`sh\n# Install\nnpm install\n# Local — no AWS credentials needed\nnpm run dev\n${cloud}\n\`\`\`\n`;
+ return `# ${name}\n${templateName} · ${backendId}. Requires Node 22.14+ and Rust/Cargo for the local CLI${backendId==='python'?', Python 3.11+':backendId==='go'?', Go 1.22+':backendId==='java'?', JDK 21+':''}; AWS setup also requires Terraform.\n\n\`\`\`sh\n# Install\nnpm install\n# Local — no AWS credentials needed\nnpm run dev\n${cloud}\n\`\`\`\n`;
 }
 export function claudeGuide({backendId='node-ts'}={}) {
  return `# RT-App agent guide
 - This project uses backend ${backendId}. Read package.json, rt-app.settings.json and modules.json before editing.
 - apps/: executable apps (server, lambda-ts, spa, ssr and template-specific desktop/mobile/native backends).
-- packages/: application modules. rt-app/: reusable framework, admin, CLI, generator and language cores.
+- packages/: application modules. The reusable framework, admin and CLI are installed under node_modules/@gsalgadotoledo/. Do not copy or edit their source inside the application.
 - core-ts is @gsalgadotoledo/rt-app-core; core-go uses local Go Modules replace; core-python installs rt_app_core in a local virtual environment.
 - Go/Python providers are application-scoped, lazy and explicit; use interfaces/Protocol and inject dependencies through constructors. Keep dependency graphs acyclic; close consumers before dependencies.
 - Native Go/Python/Java backends proxy existing auth/admin/CRUD routes to the Node core. Their cloud deployment is pending; do not present it as supported.
@@ -22,10 +22,10 @@ export function claudeGuide({backendId='node-ts'}={}) {
 - Generate CRUD: npm exec -- rta create crud products --fields "name:string,price:number" --json. Edit the generated files in packages/products afterward.
 - Generated CRUD denies application-user access until an admin grants permissions. Preserve this default.
 - Keep tests beside the owning package/app. Run its tests and build; npm run check:architecture checks workspace dependency boundaries.
-- infra/aws contains application Terraform; rt-app/infra/aws contains framework infrastructure and IAM policy data.
+- infra/aws contains application Terraform; node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws contains framework infrastructure and IAM policy data.
 - npm run cloud creates/reuses a deployment IAM user then opens the authenticated installation wizard. The user reviews the account/configuration and confirms infrastructure installation there.
 - Bootstrap variables: RT_APP_BOOTSTRAP_ACCESS_KEY_ID, RT_APP_BOOTSTRAP_SECRET_ACCESS_KEY, optional RT_APP_BOOTSTRAP_SESSION_TOKEN; AWS_REGION defaults to us-east-1. Prefer an administrative role/session over root keys.
-- Policy source: rt-app/infra/aws/data/installer-policy.json. The bootstrap scopes supported resource prefixes to the app. Some creation APIs require broader resource scope; this is an installer policy, not a runtime policy.
+- Policy source: node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/data/installer-policy.json. The bootstrap scopes supported resource prefixes to the app. Some creation APIs require broader resource scope; this is an installer policy, not a runtime policy.
 - .rt-app/aws-identity.json contains the deployment user's access key, created with mode 0600. Never commit, print, copy into templates, expose to a browser, or include it in generated artifacts. Bootstrap credentials are not saved or forwarded to deployment subprocesses.
 - User creation refuses to overwrite existing IAM users. Failed creation attempts roll back new resources when possible. A stale bootstrap lock or incomplete cleanup requires inspection, never blind deletion of existing IAM resources.
 - AWS identity persists locally for later cloud runs. Change app/account/region only through a deliberate migration. Changing an adapter does not migrate data.

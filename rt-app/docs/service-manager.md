@@ -11,7 +11,7 @@ The reusable module lives in `rt-app/packages/service-manager`:
 
 ```sh
 npm ci
-ADMIN_PASSWORD='REPLACE_WITH_YOUR_16_TO_128_CHARACTER_PASSWORD' npm run desktop
+npm run desktop
 ```
 
 The first source checkout launch requires **Rust/Cargo** to build the supervisor.
@@ -131,7 +131,7 @@ in this first version. Do not bypass system security warnings to run a downloade
 
 On first opening the packaged application, select the project folder. A Finder launch
 does not inherit credentials from a terminal. Start the daemon once from the terminal
-with `ADMIN_PASSWORD=... npm run services -- daemon`, then open the application to
+with `npm run services -- daemon`, then open the application to
 control that same daemon. Changed credentials require restarting the daemon.
 
 ## Local versus AWS backend
@@ -221,9 +221,8 @@ startup. No automatic restart loop is used after a process crashes.
 
 Keep the packaged application and registered project folders at their installed paths.
 The agent stores the executable path and PATH only, never AWS keys or ADMIN_PASSWORD.
-Shell-only environment secrets do not survive logout/reboot: services can start, but
-admin authentication remains unavailable unless ADMIN_PASSWORD is supplied to the
-login environment or the project supervisor is relaunched from a terminal with it.
+Local admin does not require a password. Cloud installation and remote administration
+require ADMIN_PASSWORD; shell-only environment secrets do not survive logout/reboot.
 The manager does not silently save passwords in files or in the login agent.
 
 Source `npm run desktop` has the tray too, but login registration uses the packaged

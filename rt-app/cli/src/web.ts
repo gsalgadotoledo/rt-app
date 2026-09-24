@@ -1,3 +1,5 @@
+import { adminAssets } from '@gsalgadotoledo/rt-app-config/paths';
+import { fileURLToPath } from 'node:url';
 import {host} from "./host.js";
 import { AdminIdentity, passwordVerifier } from "@gsalgadotoledo/rt-app-myadmin/backend";
 import { createServer } from "node:http";
@@ -9,7 +11,7 @@ import { inspectInstallation, validateModules } from "@gsalgadotoledo/rt-app-ins
 let port = Number(process.env.SETUP_PORT ?? 4011),
   token = randomBytes(32).toString("hex");
 let origin = "http://127.0.0.1:" + port,
-  root = resolve("rt-app/admin/dist/web");
+  root = adminAssets();
 const rootIdentity = process.env.ADMIN_PASSWORD
   ? new AdminIdentity(
       await passwordVerifier(process.env.ADMIN_PASSWORD),
@@ -139,7 +141,7 @@ const server = createServer(async (req, res) => {
             error: "Install Terraform >= 1.11 before continuing",
           });
         job = { state: "running", messages: [] };
-        const child = spawn(process.execPath, ["rt-app/cli/dist/worker.js"], {
+        const child = spawn(process.execPath, [fileURLToPath(new URL("./worker.js",import.meta.url))], {
           stdio: ["pipe", "pipe", "ignore"],
         });
         let pending = "";

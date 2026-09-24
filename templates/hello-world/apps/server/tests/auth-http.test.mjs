@@ -8,7 +8,7 @@ import {createServer} from 'node:net';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 import {get} from 'node:http';
-import {totpCode} from '../../../rt-app/packages/auth/dist/totp.js';
+import {totpCode} from '@gsalgadotoledo/rt-app-auth/totp';
 test('HTTP starter works without AWS and retains JSON authentication across server restarts',async t=>{
  const dir=await mkdtemp(join(tmpdir(),'rta-auth-http-'));let child;
  async function stop(){if(child&&child.exitCode===null){const exit=once(child,'exit');child.kill('SIGTERM');await exit;}child=undefined;}

@@ -5,7 +5,8 @@
   "exports": {
     ".": "./src/index.tsx",
     "./themes": "./src/themes.ts",
-    "./themes.css": "./themes.css"
+    "./themes.css": "./themes.css",
+    "./package.json": "./package.json"
   },
   "peerDependencies": {
     "react": "^19.0.0"
@@ -47,6 +48,7 @@
     "*.css",
     "*.html",
     "AGENTS.md",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ]
 }

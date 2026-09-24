@@ -2,45 +2,35 @@
   "name": "hello-world-rt-app",
   "private": true,
   "workspaces": [
-    "rt-app",
-    "rt-app/packages/*",
-    "rt-app/admin",
     "apps/*",
-    "rt-app/installer",
-    "rt-app/cli",
     "apps/*/packages/*",
-    "rt-app/packages/*/packages/*",
-    "packages/*",
-    "rt-app/core-ts"
+    "packages/*"
   ],
   "scripts": {
-    "build": "node rt-app/scripts/workspaces.mjs build",
-    "test": "npm run build && npm run test --workspaces --if-present",
-    "check:architecture": "node rt-app/scripts/workspaces.mjs check",
+    "build": "rta build",
+    "test": "npm run build && npm test --workspaces --if-present",
+    "check:architecture": "rta check",
     "dev": "rta dev",
     "start": "rta dev",
     "lambda:build": "node apps/lambda-ts/build.mjs",
     "migrate": "node apps/server/dist/migrate.js",
     "seed": "node apps/server/dist/seed.js",
     "dev:dynamo": "RT_APP_MODE=dynamodb-local npm run dev",
-    "test:dynamo": "npm run test:integration -w @gsalgadotoledo/rt-app-dynamodb",
     "setup": "rta install",
-    "setup:terminal": "npm run build && node rt-app/cli/dist/index.js",
-    "cli": "node rt-app/cli/dist/modules.js",
+    "setup:terminal": "rta setup-terminal",
+    "cli": "rta module",
     "rta": "rta",
     "mail": "rta mail",
     "desktop": "rta desktop",
     "services": "rta services",
-    "desktop:package": "npm run package -w @gsalgadotoledo/rt-app-service-manager",
-    "generator:link": "npm link --workspace @gsalgadotoledo/rt-app-create --ignore-scripts",
-    "generator:pack": "node rt-app/packages/create/scripts/prepare.mjs && mkdir -p .rt-app/npm && npm pack -w @gsalgadotoledo/rt-app-create --pack-destination .rt-app/npm",
-    "core:pack": "npm run build -w @gsalgadotoledo/rt-app-core && mkdir -p .rt-app/npm && npm pack -w @gsalgadotoledo/rt-app-core --pack-destination .rt-app/npm",
     "cloud": "rta cloud",
-    "mcp": "node apps/mcp/index.mjs"
+    "mcp": "node apps/mcp/index.mjs",
+    "admin": "rta admin",
+    "deploy": "rta deploy"
   },
   "version": "1.0.0",
   "engines": {
-    "node": ">=22.12"
+    "node": ">=22.14"
   },
   "type": "module",
   "rtApp": {
@@ -51,5 +41,13 @@
   },
   "overrides": {
     "postcss": "8.5.28"
+  },
+  "dependencies": {
+    "@gsalgadotoledo/rt-app-cli": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-framework": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-core": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-myadmin": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-config": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-infra": "0.1.0-alpha.0"
   }
 }

@@ -38,4 +38,4 @@ deploy:
       terraform -chdir=infra/aws plan -input=false -out="$CI_PROJECT_DIR/deploy.tfplan"
       terraform -chdir=infra/aws apply -input=false "$CI_PROJECT_DIR/deploy.tfplan"
       terraform -chdir=infra/aws output -json deployment > "$CI_PROJECT_DIR/deployment.json"
-      node rt-app/cli/deploy.mjs "$CI_PROJECT_DIR/deployment.json"
+      npm exec -- rta deploy "$CI_PROJECT_DIR/deployment.json"
