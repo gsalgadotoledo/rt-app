@@ -19,7 +19,8 @@ try{
  await cp(join(root,'dist'),join(staging,'dist'),{recursive:true});await cp(join(root,'electron/preload.cjs'),join(staging,'electron/preload.cjs'));
  await cp(binary,join(staging,'native/bin',process.platform==='win32'?'rt-app-services.exe':'rt-app-services'));
  await build({entryPoints:[join(root,'electron/main.mjs')],outfile:join(staging,'main.mjs'),bundle:true,platform:'node',format:'esm',external:['electron','@gsalgadotoledo/rt-app-create','@gsalgadotoledo/rt-app-create/runtime']});
- await writeFile(join(staging,'package.json'),JSON.stringify({name:'rt-app-service-manager',productName:'RT-App Service Manager',version:'0.1.0',type:'module',main:'main.mjs'}));
+ // The app version pins the initializer it runs (npx @gsalgadotoledo/create-rt-app@<version>).
+ await writeFile(join(staging,'package.json'),JSON.stringify({name:'rt-app-service-manager',productName:'RT-App Service Manager',version:JSON.parse(await readFile(join(root,'package.json'))).version,type:'module',main:'main.mjs'}));
  const version=JSON.parse(await readFile(join(root,'package.json'))).devDependencies.electron;
  const paths=await packager({dir:staging,out:join(root,'release'),name:'RT-App Service Manager',electronVersion:version,platform:process.platform,arch:process.arch,overwrite:true,asar:false,appBundleId:'dev.rtapp.services',prune:false});
  console.log(paths.join('\n'));

@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-deployments",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,15 +25,15 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-deploy": "0.1.0",
-    "@gsalgadotoledo/rt-app-deploy-render": "0.1.0",
-    "@gsalgadotoledo/rt-app-deploy-railway": "0.1.0",
-    "@gsalgadotoledo/rt-app-deploy-flyio": "0.1.0",
-    "@gsalgadotoledo/rt-app-deploy-digitalocean": "0.1.0",
-    "@gsalgadotoledo/rt-app-deploy-heroku": "0.1.0",
-    "@gsalgadotoledo/rt-app-deploy-vercel": "0.1.0",
-    "@gsalgadotoledo/rt-app-deploy-neon": "0.1.0",
-    "@gsalgadotoledo/rt-app-deploy-supabase": "0.1.0"
+    "@gsalgadotoledo/rt-app-deploy": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy-render": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy-railway": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy-flyio": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy-digitalocean": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy-heroku": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy-vercel": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy-neon": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy-supabase": "0.2.0"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

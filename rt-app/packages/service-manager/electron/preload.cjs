@@ -18,4 +18,7 @@ contextBridge.exposeInMainWorld('rtAppServices',{
  action:(action,id)=>ipcRenderer.invoke('services:action',action,id),
  logs:id=>ipcRenderer.invoke('services:logs',id),
  openUrl:id=>ipcRenderer.invoke('services:open-url',id),
+ deployInfo:()=>ipcRenderer.invoke('deploy:info'),
+ connectGithub:()=>ipcRenderer.invoke('deploy:connect-github'),
+ openDeployments:()=>ipcRenderer.invoke('deploy:open-admin'),
 });

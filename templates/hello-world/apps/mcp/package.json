@@ -8,13 +8,13 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-cli": "0.1.0",
+    "@gsalgadotoledo/rt-app-cli": "0.2.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
-    "@gsalgadotoledo/rt-app-framework": "0.1.0",
-    "@gsalgadotoledo/rt-app-dynamodb": "0.1.0",
-    "@gsalgadotoledo/rt-app-auth": "0.1.0"
+    "@gsalgadotoledo/rt-app-framework": "0.2.0",
+    "@gsalgadotoledo/rt-app-dynamodb": "0.2.0",
+    "@gsalgadotoledo/rt-app-auth": "0.2.0"
   }
 }

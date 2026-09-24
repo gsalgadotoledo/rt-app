@@ -6,6 +6,7 @@ import {createServiceTray} from './tray.mjs';
 import {configureStartup,startupEnabled} from './startup.mjs';
 import {ProjectWizard} from '../projects.mjs';
 import {ServiceHub} from '../hub.mjs';
+import {deployInfo,connectProject} from '../deploy.mjs';
 let root,window,hub,tray,wizard,quitting=false;
 const background=process.argv.includes('--background');
 const quit=()=>{quitting=true;app.quit();};
@@ -18,6 +19,8 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
  app.whenReady().then(async()=>{
  try{
   const index=process.argv.indexOf('--project');root=index>=0?resolve(process.argv[index+1]):undefined;
+  // CLIs installed from the catalog (gh, flyctl) are available to project commands and deploys.
+  {const {cliPaths}=await import('../catalog.mjs');const home=join(app.getPath('home'),'.rt-app','service-manager');process.env.PATH=[...await cliPaths(home),process.env.PATH].join(':');}
   hub=new ServiceHub({... (app.isPackaged?{binary:join(app.getAppPath(),'native/bin',process.platform==='win32'?'rt-app-services.exe':'rt-app-services')}:{})});await hub.initialize();
   wizard=new ProjectWizard(hub);await wizard.initialize();
   root??=hub.registry[0]?.path;
@@ -48,6 +51,10 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('services:catalog',(event,action,id)=>{trusted(event);return hub.catalogAction(action,id);});
    ipcMain.handle('services:discover',event=>{trusted(event);return hub.discover();});
    ipcMain.handle('services:add-discovered',(event,id)=>{trusted(event);return hub.addDiscovered(id);});
+   // Deploy panel: read-only overview; editing keys and plans happens in the admin Deployments page.
+   ipcMain.handle('deploy:info',event=>{trusted(event);if(!hub.root)throw new Error('Select a project first');return deployInfo(hub.root);});
+   ipcMain.handle('deploy:connect-github',event=>{trusted(event);if(!hub.root)throw new Error('Select a project first');return connectProject(hub.root);});
+   ipcMain.handle('deploy:open-admin',async event=>{trusted(event);const admin=new URL(await hub.url('admin'));admin.pathname='/settings/deployments';await shell.openExternal(admin.href);});
    ipcMain.handle('services:ports',(event,scope,ports)=>{trusted(event);return hub.setPorts(scope,ports);});
    window.on('close',event=>{if(!quitting){event.preventDefault();window.hide();}});
    tray=await createServiceTray({hub,show,quit});

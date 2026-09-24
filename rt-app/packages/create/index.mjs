@@ -1,3 +1,4 @@
+import YAML from 'yaml';
 import * as generator from './crud.mjs';
 import {projectReadme,claudeGuide} from './project-docs.mjs';
 import {backends,backend,generateBackend} from './backends.mjs';
@@ -8,7 +9,31 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 export const packageRoot=dirname(fileURLToPath(import.meta.url));
-export async function templates(){return JSON.parse(await readFile(join(packageRoot,'templates/catalog.json'),'utf8'));}
+/**
+ * Templates are prompts: templates/<id>.md with YAML front matter for the deterministic part
+ * (kind, requirements, CRUD modules) and a Markdown body that tells an LLM what to build on top of
+ * the tested starter. No template stores a copy of application code, so none can go stale.
+ */
+export function parseTemplate(id,text){
+ const match=text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+ if(!match)throw new Error(`Template ${id}: missing front matter`);
+ const meta=YAML.parse(match[1])??{};
+ if(meta.id!==id)throw new Error(`Template ${id}: id must match the file name`);
+ if(typeof meta.name!=='string'||!meta.name||typeof meta.description!=='string'||!meta.description)throw new Error(`Template ${id}: name and description are required`);
+ if(!['fullstack','electron','mobile'].includes(meta.kind??'fullstack'))throw new Error(`Template ${id}: unknown kind`);
+ const requirements=meta.requirements??['node'];
+ if(!Array.isArray(requirements)||requirements.some(r=>typeof r!=='string'))throw new Error(`Template ${id}: requirements must be a list`);
+ // fields: { name: string, notes: string? } → generator fields; "?" marks an optional field.
+ const crud=(meta.crud??[]).map(entry=>({name:entry.name,title:entry.title??entry.name,fields:Object.entries(entry.fields??{}).map(([name,type])=>({name,type:String(type).replace(/\?$/,''),required:!String(type).endsWith('?')})),...(entry.actions?{actions:entry.actions}:{})}));
+ return {id,name:meta.name,description:meta.description,kind:meta.kind??'fullstack',requirements,...(crud.length?{crud}:{}),prompt:match[2].trim()+'\n'};
+}
+export async function templates(){
+ const directory=join(packageRoot,'templates');
+ const files=(await readdir(directory)).filter(f=>f.endsWith('.md')).sort();
+ const list=await Promise.all(files.map(async f=>parseTemplate(f.slice(0,-3),await readFile(join(directory,f),'utf8'))));
+ // The base template first; the rest alphabetically.
+ return list.sort((a,b)=>(a.id==='fullstack'?-1:b.id==='fullstack'?1:a.name.localeCompare(b.name)));
+}
 export async function template(id){const result=(await templates()).find(t=>t.id===id);if(!result)throw new Error('Unknown project template');return result;}
 export function projectName(name){if(typeof name!=='string'||name.length>48||! /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(name)||/^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/.test(name))throw new Error('Use a lowercase project name with letters, numbers and hyphens (max 48).');return name;}
 const ignored=new Set(['node_modules','.git','.rt-app','.next','.next-dev','.terraform','dist','build','bundle','target','release','starter','.venv','__pycache__','.DS_Store']);
@@ -19,6 +44,7 @@ export async function copyStarter(source,destination, selectedRoots){
 }
 export async function starterRoot(){const bundled=join(packageRoot,'starter');await access(join(bundled,'package.json'));return bundled;}
 export function run(command,args,{cwd,env=process.env,onLog=()=>{}}={}){return new Promise((yes,no)=>{const child=spawn(command,args,{cwd,env,stdio:['ignore','pipe','pipe']});let tail='';for(const stream of [child.stdout,child.stderr])stream.on('data',data=>{tail=(tail+data).slice(-4000);onLog(String(data));});child.once('error',no);child.once('exit',code=>code===0?yes():no(new Error(`${command} failed (${code})\n${tail}`)));});}
+const generatorVersion=JSON.parse(await readFile(join(packageRoot,'package.json'),'utf8')).version;
 export async function createProject({workspace,name,templateId='fullstack',backendId='node-ts',install=true,source,env=process.env,onLog=()=>{}}){
  projectName(name);const selectedBackend=backend(backendId);const spec=await template(templateId);workspace=await realpath(workspace);if(!(await lstat(workspace)).isDirectory())throw new Error('Workspace must be a directory');const target=join(workspace,name);
  // Reserve the final directory exclusively. Never merge with or remove an existing project.
@@ -40,7 +66,7 @@ export async function createProject({workspace,name,templateId='fullstack',backe
   for(const crud of spec.crud??[])await generator.generate(target,crud);
   if(spec.kind==='electron'){
    const dir=join(target,'apps/desktop');await mkdir(dir,{recursive:true});
-   await save('apps/desktop/package.json',{name:'@app/desktop',private:true,type:'module',scripts:{dev:'electron .'},main:'main.mjs',dependencies:{electron:'44.4.4','@gsalgadotoledo/rt-app-config':'0.1.0'}});
+   await save('apps/desktop/package.json',{name:'@app/desktop',private:true,type:'module',scripts:{dev:'electron .'},main:'main.mjs',dependencies:{electron:'44.4.4','@gsalgadotoledo/rt-app-config':generatorVersion}});
    await writeFile(join(dir,'main.mjs'),`import {app,BrowserWindow} from 'electron';\nimport {publicConfig} from '@gsalgadotoledo/rt-app-config';\nawait app.whenReady();\nconst window=new BrowserWindow({width:1100,height:760,webPreferences:{contextIsolation:true,nodeIntegration:false,sandbox:true}});\nwindow.webContents.setWindowOpenHandler(()=>({action:'deny'}));\nawait window.loadURL(publicConfig().urls.spa);\napp.on('window-all-closed',()=>app.quit());\n`);
    settings.services.extra.push({id:'desktop',label:'Electron app',command:['npm','run','dev','-w','@app/desktop'],cwd:'.',ports:[],dependencies:['spa']});
   }
@@ -60,7 +86,8 @@ export async function createProject({workspace,name,templateId='fullstack',backe
   }
   await save('rt-app.settings.json',settings);await writeFile(join(target,'mise.toml'),'[tools]\n'+Object.entries(settings.requirements).map(([key,value])=>key+' = '+JSON.stringify(value)).join('\n')+'\n');
   await writeFile(join(target,'README.md'),projectReadme({name,templateName:spec.name,backendId}));
-  await writeFile(join(target,'CLAUDE.md'),claudeGuide({backendId}));
+  await writeFile(join(target,'CLAUDE.md'),claudeGuide({backendId})+'\n- Read TEMPLATE.md first: it is the prompt of the '+spec.name+' template and describes what this project should become.\n');
+  await writeFile(join(target,'TEMPLATE.md'),spec.prompt);
   await rm(join(target,'PROJECT.md'),{force:true});
   complete=true;
   if(install){onLog('Installing project dependencies…');await run('npm',['install','--no-audit','--no-fund'],{cwd:target,env,onLog});if(backendId==='python'){onLog('Installing Python core in the project virtual environment…');await run('npm',['run','setup','--workspace','@app/backend-python'],{cwd:target,env,onLog});}}

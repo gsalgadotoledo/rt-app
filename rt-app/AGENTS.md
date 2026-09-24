@@ -6,6 +6,8 @@
 - packages/nosql defines the storage interface; JsonStore and DynamoDB adapters implement it.
 - Module migrations and seeds belong to their package (`src/migrations.ts|js`, `src/seeds.ts|js`) and are declared on the Feature. packages/migrations runs them through Umzug (`rta migrate`, `rta seed`). Append migrations with a new `module:NNN` id; never edit an applied one. Write through the store contract so steps run on every engine. Demo seeds never declare prod. Read docs/migrations.md.
 - core-ts exports createRTApp and RTAppManager for the component registry. RTAppModule requires init and optionally dispose; RTAppBaseModule is an optional abstract lifecycle base. RTAppModuleConfig declares dependsOn, bindings and preload. RTAppComponentModule.create creates per-view instances with dispose. Domain Feature modules use composition and do not have to extend this base. core-go and core-python follow their language's native composition conventions. Inspect their exported interfaces before adding providers.
+- Deploys: packages/deploy is the provider contract; deploy-<provider> packages implement roles (api, ssr, frontend, files, database); packages/deployments has rta deploy/github, credentials and the admin Deployments page. Only the API role receives secrets. Read docs/deploy.md.
+- Templates are prompts: packages/create/templates/<id>.md (front matter + prompt). Never add a template that copies application code; extend the starter or the prompt.
 - admin hosts shared React UI. cli hosts command adapters. Application configuration stays in main.js and rt-app.settings.json.
 
 ## HTTP, CLI and MCP

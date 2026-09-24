@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-infra",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -21,9 +21,9 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-contracts": "0.1.0",
-    "@gsalgadotoledo/rt-app-admin-ui": "0.1.0",
-    "@gsalgadotoledo/rt-app-nosql": "0.1.0"
+    "@gsalgadotoledo/rt-app-contracts": "0.2.0",
+    "@gsalgadotoledo/rt-app-admin-ui": "0.2.0",
+    "@gsalgadotoledo/rt-app-nosql": "0.2.0"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

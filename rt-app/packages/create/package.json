@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-create",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "RT-App project templates and generator",
   "bin": {
@@ -41,7 +41,8 @@
     "node": ">=22.14"
   },
   "dependencies": {
-    "giget": "^2.0.0"
+    "giget": "^2.0.0",
+    "yaml": "2.9.1"
   },
   "license": "UNLICENSED",
   "publishConfig": {

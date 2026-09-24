@@ -125,3 +125,12 @@
 @media(max-width:900px){.rt-command-row{grid-template-columns:1fr 1fr}.rt-command-row code{grid-column:1}.rt-command-row button{justify-self:end}}
 
 .rt-command-row select{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--line);padding:6px;max-width:100%}
+
+/* Deploy panel and template prompt preview. */
+.rt-deploy-panel{display:grid;gap:12px}
+.rt-deploy-panel h3,.rt-deploy-panel h4{margin:0}
+.rt-deploy-panel small{display:block;color:var(--muted)}
+.rt-deploy-panel .rt-muted{color:var(--muted)}
+.rt-template-prompt{margin:12px 0;border:1px solid var(--line);padding:8px 12px}
+.rt-template-prompt summary{cursor:pointer;font-weight:600}
+.rt-template-prompt pre{white-space:pre-wrap;max-height:320px;overflow:auto;font-size:12px}

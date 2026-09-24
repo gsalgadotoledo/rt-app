@@ -13,11 +13,11 @@
     "next": "15.5.26",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "@gsalgadotoledo/rt-app-config": "0.1.0",
-    "@gsalgadotoledo/rt-app-auth": "0.1.0",
-    "@gsalgadotoledo/rt-app-observer": "0.1.0",
-    "@gsalgadotoledo/rt-app-visits": "0.1.0",
-    "@gsalgadotoledo/rt-app-analytics": "0.1.0"
+    "@gsalgadotoledo/rt-app-config": "0.2.0",
+    "@gsalgadotoledo/rt-app-auth": "0.2.0",
+    "@gsalgadotoledo/rt-app-observer": "0.2.0",
+    "@gsalgadotoledo/rt-app-visits": "0.2.0",
+    "@gsalgadotoledo/rt-app-analytics": "0.2.0"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

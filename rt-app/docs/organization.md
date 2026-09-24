@@ -18,8 +18,8 @@ Rules:
 
 | Name | Kind | Published version |
 | --- | --- | --- |
-| `@gsalgadotoledo/create-rt-app` | initializer (`npm create @gsalgadotoledo/rt-app`) | 0.1.0 (first release) |
-| `@gsalgadotoledo/rt-app-*` (52 packages) | core libraries, adapters, admin, CLI (`rta`), generator, Service Manager | 0.1.0 (`latest`); 20 of them also exist as 0.1.0-alpha.0 (`next`) |
+| `@gsalgadotoledo/create-rt-app` | initializer (`npm create @gsalgadotoledo/rt-app`) | 0.2.0 (pending first publication) |
+| `@gsalgadotoledo/rt-app-*` | core libraries, adapters, deploy providers, admin, CLI (`rta`), generator, Service Manager | 0.2.0 pending publication; 20 of them exist on npm as 0.1.0-alpha.0 |
 | `github.com/gsalgadotoledo/rt-app` | core source | `main` |
 
 Not ours: `create-rt-app` (unscoped) on npm belongs to another author. Never document `npx create-rt-app`.

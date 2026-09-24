@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-service-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "electron/main.mjs",
   "exports": {
@@ -17,11 +17,13 @@
     "package": "node scripts/package.mjs"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-config": "0.1.0",
+    "@gsalgadotoledo/rt-app-config": "0.2.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "@gsalgadotoledo/rt-app-create": "0.1.0",
-    "@gsalgadotoledo/rt-app-admin-ui": "0.1.0"
+    "@gsalgadotoledo/rt-app-create": "0.2.0",
+    "@gsalgadotoledo/rt-app-admin-ui": "0.2.0",
+    "@gsalgadotoledo/rt-app-deployments": "0.2.0",
+    "@gsalgadotoledo/rt-app-deploy": "0.2.0"
   },
   "devDependencies": {
     "@electron/packager": "^20.3.0",

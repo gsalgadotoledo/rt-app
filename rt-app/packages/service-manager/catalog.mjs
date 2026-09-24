@@ -11,10 +11,43 @@ export const catalog=[
  {id:'redis',name:'Redis',kind:'service',port:6379,description:'Verified official source, compiled into the tools directory. Requires Xcode Command Line Tools.'},
  {id:'json',name:'JSON HTTP server',kind:'service',port:3001,description:'Optional local HTTP CRUD server with persistent JSON. Separate from each project’s embedded JSON store.'},
  {id:'sqlite',name:'SQLite',kind:'embedded',description:'Local database file and system SQLite CLI. Embedded: no server process or port.'},
+ {id:'gh',name:'GitHub CLI',kind:'cli',description:'Official release (checksum verified). Used by rta github connect/sync and deploy workflows. Sign in with gh auth login.'},
+ {id:'flyctl',name:'Fly.io CLI',kind:'cli',description:'Official flyctl release (checksum verified). Needed by the Fly.io deploy provider.'},
 ];
-const hostAllowed=new Set(['registry.npmjs.org','downloads.mongodb.org','fastdl.mongodb.org','raw.githubusercontent.com','download.redis.io']);
+
+/** CLIs installed from official GitHub releases: asset pattern and checksum file per tool. */
+export const githubClis={
+ gh:{repo:'cli/cli',asset:(v,arch)=>`gh_${v}_macOS_${arch==='arm64'?'arm64':'amd64'}.zip`,checksums:v=>`gh_${v}_checksums.txt`,binary:'gh'},
+ flyctl:{repo:'superfly/flyctl',asset:(v,arch)=>`flyctl_${v}_macOS_${arch==='arm64'?'arm64':'x86_64'}.tar.gz`,checksums:v=>`flyctl_${v}_checksums.txt`,binary:'flyctl'},
+};
+const hostAllowed=new Set(['registry.npmjs.org','downloads.mongodb.org','fastdl.mongodb.org','raw.githubusercontent.com','download.redis.io','api.github.com','github.com','release-assets.githubusercontent.com','objects.githubusercontent.com']);
 async function download(url,max=350*1024*1024){if(!hostAllowed.has(new URL(url).hostname)||new URL(url).protocol!=='https:')throw new Error('Untrusted download URL');const r=await fetch(url,{redirect:'error',signal:AbortSignal.timeout(120000)});if(!r.ok)throw new Error(`Download failed: ${r.status}`);const chunks=[];let size=0;for await(const c of r.body){size+=c.length;if(size>max)throw new Error('Download exceeds size limit');chunks.push(c);}return Buffer.concat(chunks);}
 const json=async url=>JSON.parse((await download(url,12*1024*1024)).toString());
+/** GitHub release assets redirect to a CDN: follow at most 5 hops, each to an allowed HTTPS host. */
+export async function downloadFollowing(url,{fetchImpl=fetch,max=200*1024*1024}={}){
+ for(let hop=0;hop<6;hop++){
+  const target=new URL(url);if(target.protocol!=='https:'||!hostAllowed.has(target.hostname))throw new Error('Untrusted download URL');
+  const r=await fetchImpl(url,{redirect:'manual',signal:AbortSignal.timeout(120000),headers:{'user-agent':'rt-app-service-manager'}});
+  if([301,302,303,307,308].includes(r.status)){url=new URL(r.headers.get('location'),url).href;continue;}
+  if(!r.ok)throw new Error(`Download failed: ${r.status}`);
+  const bytes=Buffer.from(await r.arrayBuffer());if(bytes.length>max)throw new Error('Download too large');return bytes;
+ }
+ throw new Error('Too many redirects');
+}
+/** Expected SHA-256 of one file from a goreleaser-style checksums.txt. */
+export function checksumFor(text,file){const line=text.split('\n').find(l=>l.trim().endsWith('  '+file)||l.trim().endsWith(' '+file));const hash=line?.trim().split(/\s+/)[0];if(!hash||!/^[a-f0-9]{64}$/.test(hash))throw new Error('No checksum for '+file);return hash;}
+/** Install a CLI from its latest official release into dest (binary at dest/bin/<name>). */
+export async function installGithubCli(id,stage,{fetchImpl=fetch,arch=process.arch,report=()=>{}}={}){
+ const spec=githubClis[id];
+ report('Resolving latest '+id+' release…');
+ const release=JSON.parse((await downloadFollowing(`https://api.github.com/repos/${spec.repo}/releases/latest`,{fetchImpl,max:4*1024*1024})).toString());
+ const version=String(release.tag_name).replace(/^v/,'');if(!/^\d+\.\d+\.\d+$/.test(version))throw new Error('Unexpected release version');
+ const asset=spec.asset(version,arch),checksums=spec.checksums(version);
+ const url=name=>{const found=release.assets.find(a=>a.name===name);if(!found)throw new Error('Release asset missing: '+name);return found.browser_download_url;};
+ const expected=checksumFor((await downloadFollowing(url(checksums),{fetchImpl,max:1024*1024})).toString(),asset);
+ report(`Downloading ${id} ${version}…`);const bytes=await downloadFollowing(url(asset),{fetchImpl});verify(bytes,'sha256',expected);
+ return {version,asset,bytes,binary:spec.binary,source:url(asset),integrity:expected};
+}
 export function verify(bytes,algorithm,expected,encoding='hex'){if(createHash(algorithm).update(bytes).digest(encoding)!==expected)throw new Error('Download checksum mismatch');}
 async function extract(bytes,dir){const archive=join(dir,'download.tgz');await writeFile(archive,bytes);const {stdout}=await exec('tar',['-tzf',archive],{maxBuffer:8*1024*1024});if(stdout.split('\n').some(p=>p.startsWith('/')||p.split('/').includes('..')))throw new Error('Unsafe archive path');await exec('tar',['-xzf',archive,'--strip-components','1','-C',dir],{maxBuffer:8*1024*1024});await rm(archive);}
 async function find(dir,name){for(const entry of await readdir(dir,{withFileTypes:true})){const p=join(dir,entry.name);if(entry.name===name&&entry.isFile())return p;if(entry.isDirectory()){const found=await find(p,name);if(found)return found;}}}
@@ -40,6 +73,14 @@ export async function installTool(home,id,report=()=>{}){
    if(!archive?.sha256)throw new Error('No compatible MongoDB archive');report(`Downloading MongoDB ${release}…`);const bytes=await download(archive.url);verify(bytes,'sha256',archive.sha256);await extract(bytes,stage);info={id,version:release,binary:join(dest,'bin/mongod'),source:archive.url,integrity:archive.sha256};
   }else if(id==='redis'){
    await exec('xcrun',['--find','clang']);report('Resolving latest Redis source release…');const hashes=(await download('https://raw.githubusercontent.com/redis/redis-hashes/master/README')).toString();const releases=[...hashes.matchAll(/^hash redis-(\d+\.\d+\.\d+)\.tar\.gz sha256 ([a-f0-9]{64}) /gm)].sort((a,b)=>b[1].localeCompare(a[1],undefined,{numeric:true}));if(!releases.length)throw new Error('No verified Redis release');const [,version,hash]=releases[0],url=`https://download.redis.io/releases/redis-${version}.tar.gz`;report(`Downloading Redis ${version}…`);const bytes=await download(url);verify(bytes,'sha256',hash);await extract(bytes,stage);report('Compiling Redis (this may take a few minutes)…');await exec('make',['-C','src','-j','4','redis-server','redis-cli','BUILD_TLS=no','MALLOC=libc'],{cwd:stage,timeout:600000,maxBuffer:16*1024*1024});info={id,version,binary:join(dest,'src/redis-server'),source:url,integrity:hash};
+  }else if(githubClis[id]){
+   const cli=await installGithubCli(id,stage,{report});
+   const archive=join(stage,cli.asset);await writeFile(archive,cli.bytes);
+   if(cli.asset.endsWith('.zip'))await exec('/usr/bin/ditto',['-x','-k',archive,stage]);else await extract(cli.bytes,stage);
+   await rm(archive,{force:true});
+   const binary=await find(stage,cli.binary);if(!binary)throw new Error(cli.binary+' binary missing from the release');
+   await mkdir(join(stage,'bin'),{recursive:true});await symlink(relative(join(stage,'bin'),binary),join(stage,'bin',cli.binary));
+   info={id,version:cli.version,binary:join(dest,'bin',cli.binary),source:cli.source,integrity:cli.integrity};
   }else if(id==='json'){
    await writeFile(join(stage,'server.mjs'),await readFile(fileURLToPath(new URL('./json-server.mjs',import.meta.url))));info={id,version:'1',binary:join(dest,'server.mjs'),source:'RT-App'};
   }else{
@@ -58,6 +99,14 @@ export async function toolService(home,info,port){
  }else if(info.id==='mongodb')base.command=[info.binary,'--dbpath',data,'--bind_ip','127.0.0.1','--port','${MONGODB_PORT}'];
  else if(info.id==='redis')base.command=[info.binary,'--bind','127.0.0.1','--protected-mode','yes','--port','${REDIS_PORT}','--dir',data,'--appendonly','yes','--daemonize','no'];
  else if(info.id==='json'){base.command=['node',info.binary];base.env={RT_APP_JSON_SERVER_FILE:join(data,'db.json')};base.url=`http://localhost:${port}`;base.readyUrl=`http://localhost:${port}/health`;}
+ else if(githubClis[info.id])return null;
  else{const file=join(data,'database.sqlite');try{await access(file);}catch(e){if(e.code!=='ENOENT')throw e;await exec(info.binary,[file,'VACUUM;']);}return null;}
  return base;
+}
+
+/** bin folders of installed CLIs (gh, flyctl), to prepend to PATH for project commands. */
+export async function cliPaths(home){
+ const paths=[];
+ for(const id of Object.keys(githubClis)){try{await access(join(home,'tools',id,'bin',githubClis[id].binary));paths.push(join(home,'tools',id,'bin'));}catch{}}
+ return paths;
 }
