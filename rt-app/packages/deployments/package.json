@@ -1,0 +1,76 @@
+{
+  "name": "@gsalgadotoledo/rt-app-deployments",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./admin": "./ui/admin.tsx",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@gsalgadotoledo/rt-app-deploy": "0.1.0",
+    "@gsalgadotoledo/rt-app-deploy-render": "0.1.0",
+    "@gsalgadotoledo/rt-app-deploy-railway": "0.1.0",
+    "@gsalgadotoledo/rt-app-deploy-flyio": "0.1.0",
+    "@gsalgadotoledo/rt-app-deploy-digitalocean": "0.1.0",
+    "@gsalgadotoledo/rt-app-deploy-heroku": "0.1.0",
+    "@gsalgadotoledo/rt-app-deploy-vercel": "0.1.0",
+    "@gsalgadotoledo/rt-app-deploy-neon": "0.1.0",
+    "@gsalgadotoledo/rt-app-deploy-supabase": "0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.0.0"
+  },
+  "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
+    "directory": "rt-app/packages/deployments"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "files": [
+    "dist",
+    "src",
+    "ui",
+    "backend",
+    "bin",
+    "templates",
+    "scripts",
+    "infra",
+    "*.mjs",
+    "*.js",
+    "*.cjs",
+    "*.d.ts",
+    "*.json",
+    "*.css",
+    "*.html",
+    "AGENTS.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "description": "Deployment workbench: provider registry, per-role sources, credentials, GitHub environments, rta deploy/github commands."
+}

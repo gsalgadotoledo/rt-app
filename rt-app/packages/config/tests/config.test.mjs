@@ -30,6 +30,17 @@ test('runtime selection detects Lambda, respects explicit target, never infers A
  assert.throws(()=>runtimeConfig(settings,{RT_APP_TARGET:'invalid'}),/Invalid/);
 });
 
+test('portable deployments and local Postgres are explicit targets', async () => {
+ const {runtimeConfig}=await import('../index.js');const settings={runtime:{local:{mode:'json'},aws:{mode:'aws'}}};
+ assert.deepEqual(runtimeConfig(settings,{RT_APP_TARGET:'portable'}),{target:'portable',mode:'portable'});
+ assert.deepEqual(runtimeConfig(settings,{RT_APP_MODE:'portable'}),{target:'portable',mode:'portable'});
+ assert.deepEqual(runtimeConfig(settings,{RT_APP_MODE:'postgres'}),{target:'local',mode:'postgres'});
+ assert.throws(()=>runtimeConfig(settings,{RT_APP_TARGET:'portable',RT_APP_MODE:'json'}),/portable adapter/);
+ assert.throws(()=>runtimeConfig(settings,{AWS_LAMBDA_FUNCTION_NAME:'api',RT_APP_TARGET:'portable'}),/cannot use local/);
+ assert.throws(()=>runtimeConfig({runtime:{local:{mode:'json'}}},{RT_APP_TARGET:'aws'}),/Missing aws runtime/);
+ assert.throws(()=>runtimeConfig(settings,{RT_APP_MODE:'sqlite'}),/Unsupported local adapter/);
+});
+
 test('Vite binds the configured port and injects matching frontend/API URLs',()=>{
  const config=viteConfiguration({RT_APP_API_URL:'http://localhost:14010',RT_APP_SPA_URL:'http://localhost:15175'});
  assert.equal(config.server.port,15175);assert.equal(config.server.proxy['/api'].target,'http://localhost:14010');

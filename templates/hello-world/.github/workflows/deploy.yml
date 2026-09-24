@@ -1,4 +1,4 @@
-name: Deploy AWS
+name: Deploy
 on:
   push:
     branches: [main, develop, stage]
@@ -111,3 +111,31 @@ jobs:
             fi
           fi
           gh release upload "$tag" "$RUNNER_TEMP/rt-app-release.tgz" --clobber
+  providers:
+    # Roles deployed to providers (Render, Railway, Fly.io, DigitalOcean, Heroku, Vercel, Neon,
+    # Supabase) as configured in rt-app.settings.json → deploy. AWS roles use the job above.
+    # Enable with the repository variable RT_APP_PROVIDERS_ENABLED=true; credentials are the
+    # secrets of the matching GitHub environment (rta github sync).
+    needs: checks
+    if: vars.RT_APP_PROVIDERS_ENABLED == 'true' && (github.ref_name == 'main' || vars.RT_APP_MULTI_ENVIRONMENT == 'true')
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Deploy provider roles
+        env:
+          # All secrets of this environment as JSON; the CLI reads provider keys and runtime secrets from it.
+          RT_APP_SECRETS_JSON: ${{ toJSON(secrets) }}
+          DEPLOY_ENV: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+        run: |
+          npm exec -- rta deploy plan --env "$DEPLOY_ENV"
+          npm exec -- rta deploy apply --env "$DEPLOY_ENV"

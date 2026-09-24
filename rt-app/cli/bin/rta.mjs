@@ -57,6 +57,11 @@ try {
   } else if (command === 'admin') {
     const { runAdmin } = await import('@gsalgadotoledo/rt-app-myadmin/runtime');
     await runAdmin({projectRoot: root});
+  } else if ((command === 'deploy' && ['providers','plan','apply','status','credentials'].includes(args[0])) || command === 'github') {
+    // Provider deployments (Render, Railway, Vercel, Neon…) and GitHub environments.
+    const {deployCommand,githubCommand}=await import('@gsalgadotoledo/rt-app-deployments/cli');
+    const stdin=async()=>{let text='';for await(const chunk of process.stdin)text+=chunk;return text;};
+    await (command==='github'?githubCommand:deployCommand)(args,{root,stdin});
   } else if (command === 'deploy' || command === 'setup-terminal') {
     run(process.execPath,[fileURLToPath(new URL(command === 'deploy' ? '../deploy.mjs' : '../dist/index.js',import.meta.url)),...args]);
   } else if (command === 'native-deploy-pending') {
@@ -95,6 +100,8 @@ try {
       {command:'rta create crud <name>',description:'Copy an editable CRUD package into packages/, register local/Lambda endpoints and admin UI. Explicit permissions; no public access.',options:['--fields name:string,price:number,active:boolean,notes:string?','--title Products','--actions publish,archive','--spec ./crud.json','--dry-run','--json']},
       {command:'rta migrate [status|up|down]',description:'Show, apply or revert module migrations on the RT_APP_MODE database. down refuses irreversible migrations; one runner at a time',options:['--to <id>','--step <n>','--json']},
       {command:'rta seed [status|run]',description:'Run module seeds allowed in this environment (demo seeds: local, develop, stage). Requires DEMO_PASSWORD; deployed environments also CONFIRM_DEMO_SEED=yes',options:['--module <id>','--rerun','--json']},
+      {command:'rta deploy <providers|plan|apply|status|credentials>',description:'Deploy roles (api, ssr, frontend, files, database) to the providers configured in rt-app.settings.json deploy (Render, Railway, Fly.io, DigitalOcean, Heroku, Vercel, Neon, Supabase; AWS through Terraform)',options:['--env develop|stage|prod','--role api','--json']},
+      {command:'rta github <connect|sync>',description:'Create/push the GitHub repo; create develop/stage/prod environments and push credentials as environment secrets (gh CLI)',options:['--public','--name owner/repo','--env stage']},
       {command:'rta module list',description:'Discover documented module actions. Invoke: rta module <name> @input.json'},
       {command:'rta mcp',description:'Start the project MCP stdio server; running API required'},
       {command:'rta desktop',description:'Open the local service manager desktop window'},
@@ -139,6 +146,6 @@ try {
   } else if(command==='desktop') {
     const {desktopCommand}=await import('@gsalgadotoledo/rt-app-service-manager/cli');
     await desktopCommand(root);
-  } else if(command==='help') console.log('RT-App CLI\n  rta build\n  rta check\n  rta admin\n  rta deploy <outputs.json>\n  rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]\n  rta seed [status|run] [--module <id>] [--rerun] [--json]\n  rta module list\n  rta module <action> [@input.json]\n  rta mcp\n  rta cloud\n  rta aws-bootstrap\n  rta create crud <name> [--fields name:string] [--actions publish] [--spec file] [--dry-run] [--json]\n  rta dev [--no-build] [--no-mail]\n  rta mail [--install-only]\n  rta desktop\n  rta services <status|daemon|start|stop|restart|logs|shutdown> [service|all] [--json]\n  rta install [--multi-environment]\n  rta urls [--json]\n  rta workspaces [--json]\n  rta run <workspace> <script>\n  rta tools --json');
+  } else if(command==='help') console.log('RT-App CLI\n  rta build\n  rta check\n  rta admin\n  rta deploy <outputs.json>\n  rta deploy providers|plan|apply|status|credentials [--env stage] [--role api] [--json]\n  rta github connect|sync [--env stage]\n  rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]\n  rta seed [status|run] [--module <id>] [--rerun] [--json]\n  rta module list\n  rta module <action> [@input.json]\n  rta mcp\n  rta cloud\n  rta aws-bootstrap\n  rta create crud <name> [--fields name:string] [--actions publish] [--spec file] [--dry-run] [--json]\n  rta dev [--no-build] [--no-mail]\n  rta mail [--install-only]\n  rta desktop\n  rta services <status|daemon|start|stop|restart|logs|shutdown> [service|all] [--json]\n  rta install [--multi-environment]\n  rta urls [--json]\n  rta workspaces [--json]\n  rta run <workspace> <script>\n  rta tools --json');
   else throw new Error(`Unknown command: ${command}`);
 } catch(e){console.error(e.message);process.exitCode=1;}

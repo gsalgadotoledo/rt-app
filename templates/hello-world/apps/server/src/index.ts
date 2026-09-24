@@ -8,6 +8,7 @@ import {
   runtimeSettings,
   createApplication,
   loadProductionApplication,
+  createPortableApplication,
   seedDemo,
 } from "../../../main.js";
 import { JsonStore } from "@gsalgadotoledo/rt-app-json";
@@ -15,11 +16,16 @@ import { MemoryStore } from "@gsalgadotoledo/rt-app-dynamodb";
 import { LocalSmtpMailer } from "@gsalgadotoledo/rt-app-mail-local";
 import { LocalMailbox } from "@gsalgadotoledo/rt-app-auth";
 import { localDynamo } from "./local-dynamo.js";
-const mode = runtimeSettings().mode;
-if (!["json", "memory", "dynamodb-local", "aws"].includes(mode))
+import { localPostgres } from "./local-postgres.js";
+import { handleDeployRequest } from "@gsalgadotoledo/rt-app-deployments/server";
+import { passwordVerifier } from "@gsalgadotoledo/rt-app-myadmin/backend";
+import { fileURLToPath } from "node:url";
+const { target, mode } = runtimeSettings();
+if (!["json", "memory", "dynamodb-local", "postgres", "aws", "portable"].includes(mode))
   throw new Error("Invalid RT_APP_MODE");
-const local = mode !== "aws";
-if (mode === "dynamodb-local" && !process.env.DEMO_PASSWORD)
+// local: this machine only. aws: Lambda/AWS installation. portable: Render, Railway, Fly.io…
+const local = target === "local";
+if ((mode === "dynamodb-local" || mode === "postgres") && !process.env.DEMO_PASSWORD)
   throw new Error(
     "Set DEMO_PASSWORD explicitly for persistent local demo accounts",
   );
@@ -31,13 +37,15 @@ if (!["memory", "smtp"].includes(mailTransport)) throw new Error("Invalid RT_APP
 const app = local
   ? createApplication({
       store:
-        mode === "json" ? new JsonStore(process.env.RT_APP_JSON_FILE ?? ".rt-app/local.json") : mode === "dynamodb-local" ? await localDynamo() : new MemoryStore(),
+        mode === "json" ? new JsonStore(process.env.RT_APP_JSON_FILE ?? ".rt-app/local.json") : mode === "dynamodb-local" ? await localDynamo() : mode === "postgres" ? localPostgres() : new MemoryStore(),
       localAdminAccess: true,
       mailer: mailTransport === "smtp" ? new LocalSmtpMailer({port: Number(process.env.RT_APP_MAIL_SMTP_PORT ?? 1025), capture: mailbox}) : mailbox,
-      secret: mode === "json" ? await localSecret(process.env.RT_APP_JSON_FILE ?? ".rt-app/local.json") : randomBytes(48).toString("hex"),
+      secret: mode === "json" ? await localSecret(process.env.RT_APP_JSON_FILE ?? ".rt-app/local.json") : mode === "postgres" ? await localSecret(".rt-app/postgres") : randomBytes(48).toString("hex"),
       tasks: process.env.ENABLE_TASKS !== "false",
     })
-  : await loadProductionApplication();
+  : target === "portable"
+    ? createPortableApplication()
+    : await loadProductionApplication();
 if (local) {
   await app.migrate();
   if (mode !== "json" || process.env.DEMO_PASSWORD) {
@@ -116,6 +124,20 @@ const server = createServer(async (req, res) => {
       reply(400, { error: "Invalid JSON" });
       return;
     }
+    // Deployments page of the local admin: provider targets, keys, plan/apply (owner only).
+    if (local && url.pathname.startsWith("/__dev/deploy")) {
+      const actor = await app.admin.auth.actor(req.headers.authorization);
+      if (!actor || actor.role !== "owner") {
+        reply(403, { error: "Only the owner can manage deployments" });
+        return;
+      }
+      const result = await handleDeployRequest(
+        { method: req.method ?? "GET", path: url.pathname, body, query: Object.fromEntries(url.searchParams) },
+        { root: fileURLToPath(new URL("../../../", import.meta.url)), passwordVerifier },
+      );
+      reply(result.status, result.body);
+      return;
+    }
     if (local && url.pathname === "/__dev/modules") {
       const actor = await app.admin.auth.actor(req.headers.authorization);
       if (!actor || actor.role !== "owner") {
@@ -170,8 +192,10 @@ const server = createServer(async (req, res) => {
     reply(500, { error: "Internal error" });
   }
 });
-server.listen(port, "127.0.0.1", () =>
+// Deployed processes accept the platform's proxy; local development stays on loopback.
+server.listen(port, local ? "127.0.0.1" : "0.0.0.0", () =>
   console.log(`RT-App API: http://127.0.0.1:${port}`),
 );
 
-if(local){const timer=setInterval(()=>{void app.subscriptions.maintenance().catch(()=>console.warn("Subscription maintenance will retry"));},60000);timer.unref();}
+// AWS schedules maintenance with EventBridge; local and portable processes run it themselves.
+if(target!=="aws"){const timer=setInterval(()=>{void app.subscriptions.maintenance().catch(()=>console.warn("Subscription maintenance will retry"));},60000);timer.unref();}

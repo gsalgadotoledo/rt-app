@@ -1,0 +1,18 @@
+.deployments{display:grid;gap:14px}
+.deployments h3{margin:14px 0 0}
+.deployments h4{margin:0 0 8px;display:flex;gap:10px;align-items:baseline}
+.deployments h4 a,.deployments .secret-field a{font-size:11px;font-weight:400}
+.deployments td{vertical-align:top}
+.deployments .provider-note{display:block;margin-top:6px;color:var(--muted);font-size:11px;max-width:360px}
+.deployments .provider-settings{display:flex;flex-wrap:wrap;gap:8px}
+.deployments .provider-settings label{margin:0;min-width:120px}
+.deployments .deploy-actions{display:flex;gap:8px;flex-wrap:wrap}
+.deployments .credential-group{border:1px solid var(--line);padding:12px;display:grid;gap:10px}
+.deployments .secret-field{display:flex;align-items:end;gap:8px;flex-wrap:wrap}
+.deployments .secret-field label{flex:1;min-width:220px;margin:0}
+.deployments .secret-field input{width:100%}
+.deployments .plan-action{border:1px solid var(--line);padding:1px 6px;font-size:11px}
+.deployments .plan-action.create,.deployments .plan-action.live{color:var(--accent)}
+.deployments .plan-action.failed{color:var(--danger)}
+.deployments .deploy-results{margin:0;padding-left:18px;display:grid;gap:4px}
+.deployments .tabs small{color:var(--muted)}

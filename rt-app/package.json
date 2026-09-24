@@ -50,7 +50,9 @@
     "@gsalgadotoledo/rt-app-idempotency": "0.1.0",
     "@gsalgadotoledo/rt-app-choice": "0.1.0",
     "@gsalgadotoledo/rt-app-queue": "0.1.0",
-    "@gsalgadotoledo/rt-app-migrations": "0.1.0"
+    "@gsalgadotoledo/rt-app-migrations": "0.1.0",
+    "@gsalgadotoledo/rt-app-postgres": "0.1.0",
+    "@gsalgadotoledo/rt-app-mail-smtp": "0.1.0"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

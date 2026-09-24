@@ -65,3 +65,25 @@ test("seeds of disabled modules do not run", async () => {
   assert.deepEqual(await app.seeds({ secrets: { DEMO_PASSWORD: password } }).run(), ["users:demo-identities"]);
   await assert.rejects(app.seeds().run({ modules: ["tasks"] }), /Unknown module: tasks/);
 });
+
+test("portable deployments need Postgres, secrets and SMTP from the environment", async () => {
+  const { createPortableApplication } = await import("@gsalgadotoledo/rt-app-framework");
+  const { passwordVerifier } = await import("@gsalgadotoledo/rt-app-myadmin/backend");
+  assert.throws(() => createPortableApplication(undefined, [], {}, { DATABASE_URL: "postgres://u:p@db.example.test/app" }), /requires: JWT_SECRET, ADMIN_PASSWORD_VERIFIER, MAIL_FROM, SMTP_URL/);
+  const env = {
+    DATABASE_URL: "postgres://u:p@db.example.test/app",
+    DATABASE_SSL: "false",
+    JWT_SECRET: "j".repeat(64),
+    ADMIN_PASSWORD_VERIFIER: await passwordVerifier("Admin-password-2026!"),
+    MAIL_FROM: "App <no-reply@example.com>",
+    SMTP_URL: "smtps://u:p@smtp.example.com",
+    RT_APP_ENVIRONMENT: "stage",
+    ENABLE_TASKS: "false",
+  };
+  const app = createPortableApplication(undefined, [], { observerOutputs: [] }, env);
+  assert.equal(app.environment, "stage");
+  assert.equal(app.users.store.provider, "postgres");
+  assert.equal(app.features.some((f) => f.id === "tasks"), false);
+  assert.equal(createPortableApplication(undefined, [], { observerOutputs: [] }, { ...env, RT_APP_ENVIRONMENT: undefined, DATABASE_SSL: undefined }).environment, "prod");
+  await app.users.store.close();
+});

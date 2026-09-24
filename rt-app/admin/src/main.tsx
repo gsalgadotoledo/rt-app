@@ -16,6 +16,7 @@ import type { Api } from "@gsalgadotoledo/rt-app-admin-ui";
 import { ModuleWorkspace } from "@gsalgadotoledo/rt-app-admin-ui";
 import ContentPanel from "@gsalgadotoledo/rt-app-content/admin";
 import AuthOverview from "@gsalgadotoledo/rt-app-auth/settings";
+import Deployments from "@gsalgadotoledo/rt-app-deployments/admin";
 import UsersPanel from "@gsalgadotoledo/rt-app-users/admin";
 import TasksPanel from "@gsalgadotoledo/rt-app-tasks/admin";
 import PermissionsPanel from "@gsalgadotoledo/rt-app-acl/admin";
@@ -61,9 +62,9 @@ function AdminApp({
   }, [sidebarWidth]);
   const route = useLocation(), navigate = useNavigate();
   const match = /^\/modules\/([^/]+)\/?$/.exec(route.pathname);
-  const page = route.pathname === "/settings/themes" ? "themes" : route.pathname === "/" ? "home" : match ? decodeURIComponent(match[1]) : "not-found";
+  const page = route.pathname === "/settings/themes" ? "themes" : route.pathname === "/settings/deployments" ? "deployments" : route.pathname === "/" ? "home" : match ? decodeURIComponent(match[1]) : "not-found";
   useEffect(()=>setMenuOpen(false),[route.pathname]);
-  const setPage = (id:string) => navigate(id === "themes" ? "/settings/themes" : id === "home" ? "/" : "/modules/" + encodeURIComponent(id));
+  const setPage = (id:string) => navigate(id === "themes" ? "/settings/themes" : id === "deployments" ? "/settings/deployments" : id === "home" ? "/" : "/modules/" + encodeURIComponent(id));
   useEffect(() => {
     void fetch(API + "/__dev/setup")
       .then(async (r) => {
@@ -195,7 +196,7 @@ function AdminApp({
             <span>{m.title}</span><small className="module-package-badge">{m.module ?? m.id}</small>
           </button>
         ))}
-        <div className="sidebar-settings"><p className="nav-label">PREFERENCES</p><button className={page==='themes'?'selected':''} onClick={()=>setPage('themes')}>Themes <small className="module-package-badge">admin</small></button></div>
+        <div className="sidebar-settings"><p className="nav-label">PREFERENCES</p><button className={page==='themes'?'selected':''} onClick={()=>setPage('themes')}>Themes <small className="module-package-badge">admin</small></button><button className={page==='deployments'?'selected':''} onClick={()=>setPage('deployments')}>Deployments <small className="module-package-badge">deploy</small></button></div>
         </div>
         <div className="sidebar-resizer" role="separator" aria-label="Resize sidebar"
           aria-orientation="vertical" aria-valuemin={180} aria-valuemax={440} aria-valuenow={sidebarWidth}
@@ -211,7 +212,7 @@ function AdminApp({
       </aside>
       <div className="main">
         <header>
-          <div className="admin-page-heading"><nav aria-label="Breadcrumb" className="admin-breadcrumb"><Link to="/">Overview</Link>{page!=="home"&&<><span aria-hidden="true">/</span><Link to={route.pathname} aria-current="page">{page==="themes"?"Themes":manifest?.title??"Page not found"}</Link></>}</nav><h1>{page==="home"?"System console":page==="themes"?"Themes":manifest?.title??"Page not found"}</h1></div>
+          <div className="admin-page-heading"><nav aria-label="Breadcrumb" className="admin-breadcrumb"><Link to="/">Overview</Link>{page!=="home"&&<><span aria-hidden="true">/</span><Link to={route.pathname} aria-current="page">{page==="themes"?"Themes":page==="deployments"?"Deployments":manifest?.title??"Page not found"}</Link></>}</nav><h1>{page==="home"?"System console":page==="themes"?"Themes":page==="deployments"?"Deployments":manifest?.title??"Page not found"}</h1></div>
           {!localAccess && <button
             onClick={() => {
               setSession(undefined);
@@ -236,6 +237,8 @@ function AdminApp({
                 ))}
               </div>
             </section>
+          ) : page==='deployments' ? (
+            <Deployments api={api} />
           ) : page==='themes' ? (
             <section><p className="hint">Choose a theme for this browser. Application sites keep their own design.</p><div className="theme-grid">{themes.map(([id,title,description])=><button key={id} className={'theme-option '+(theme===id?'selected':'')} aria-pressed={theme===id} onClick={()=>setTheme(id)}><span className={'theme-preview '+id}><i/><i/><i/></span><strong>{title}</strong><span>{description}</span><small>{theme===id?'Selected':'Use theme'}</small></button>)}</div></section>
           ) : Component ? (

@@ -132,6 +132,8 @@ import { ACL } from "@gsalgadotoledo/rt-app-acl";
 import { tasksFeature } from "@gsalgadotoledo/rt-app-tasks";
 import { contentFeature } from "@gsalgadotoledo/rt-app-content";
 import { DynamoStore } from "@gsalgadotoledo/rt-app-dynamodb";
+import { PostgresStore } from "@gsalgadotoledo/rt-app-postgres";
+import { SmtpMailer } from "@gsalgadotoledo/rt-app-mail-smtp";
 export function createApplication(options: {
   cacheAdapter?: CacheAdapter;
   choiceProvider?: ChoiceProvider;
@@ -578,6 +580,33 @@ export async function seedDemo(
 ) {
   await app.seeds({ secrets: { DEMO_PASSWORD: password } }).run({ rerun: true });
   return DEMO_USERS.map((user) => user.email);
+}
+
+/**
+ * Deployed outside AWS (Render, Railway, Fly.io, DigitalOcean, Heroku…): Postgres through
+ * DATABASE_URL, secrets and SMTP from environment variables set by the deploy provider.
+ * Fails at startup naming every missing variable (never their values).
+ */
+export function createPortableApplication(
+  modules?: string[],
+  featureFactories: Array<(store: Store) => Feature> = [],
+  components: ComponentOptions = {},
+  env: Record<string, string | undefined> = process.env,
+) {
+  const required = ["DATABASE_URL", "JWT_SECRET", "ADMIN_PASSWORD_VERIFIER", "MAIL_FROM", "SMTP_URL"];
+  const missing = required.filter((key) => !env[key]);
+  if (missing.length) throw new Error("Portable deployment requires: " + missing.join(", "));
+  return createApplication({
+    ...components,
+    featureFactories,
+    modules,
+    environment: (env.RT_APP_ENVIRONMENT ?? "prod") as Environment,
+    adminPasswordVerifier: env.ADMIN_PASSWORD_VERIFIER,
+    store: PostgresStore.connect(env.DATABASE_URL!, { ssl: env.DATABASE_SSL === "false" ? false : undefined }),
+    mailer: new SmtpMailer({ url: env.SMTP_URL!, from: env.MAIL_FROM! }),
+    secret: env.JWT_SECRET!,
+    tasks: env.ENABLE_TASKS !== "false",
+  });
 }
 
 /** Load once per Lambda environment; no plaintext secret in Terraform state or function configuration. */
