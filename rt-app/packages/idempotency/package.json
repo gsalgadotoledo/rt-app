@@ -39,7 +39,9 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-core": "0.1.0-alpha.0"
+    "@gsalgadotoledo/rt-app-core": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-nosql": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-contracts": "0.1.0-alpha.0"
   },
   "license": "UNLICENSED",
   "publishConfig": {

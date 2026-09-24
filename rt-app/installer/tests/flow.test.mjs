@@ -37,6 +37,17 @@ for (const multiEnvironment of [false,true]) test(`installer provisions ${multiE
     uploaded = [],
     statuses = [];
   process.env.ADMIN_PASSWORD="Installer-Test-2026!";
+  // Never inherit a developer's real GitHub token or perform network writes.
+  if (multiEnvironment) delete process.env.GH_TOKEN;
+  else process.env.GH_TOKEN = 'test-only-github-token';
+  const githubWrites = [];
+  let githubReads = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.ok(String(url).startsWith('https://api.github.com/repos/owner/repo/actions/variables'));
+    if (!options.method) return new Response('', {status: ++githubReads % 2 ? 404 : 200});
+    githubWrites.push({method: options.method, ...JSON.parse(options.body)});
+    return new Response('', {status: 200});
+  });
   const secretsWritten=[];
   const table = (name) => {
     if (!stores.has(name)) stores.set(name, new MemoryStore());
@@ -140,6 +151,12 @@ for (const multiEnvironment of [false,true]) test(`installer provisions ${multiE
     },
   );
   assert.equal(result.deployments.length, environments.length);
+  assert.equal(result.githubConfigured, !multiEnvironment);
+  if (!multiEnvironment) {
+    assert.ok(githubWrites.some(write => write.method === 'PATCH'));
+    assert.ok(githubWrites.some(write => write.method === 'POST'));
+    assert.ok(githubWrites.some(write => write.name === 'AWS_ROLE_PROD' && write.value === 'prod'));
+  }
   assert.equal(saved.status, "ready");
   for (const env of environments) {
     assert.equal(stores.has(env+"-admin"),false);

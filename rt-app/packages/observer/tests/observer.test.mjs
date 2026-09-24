@@ -46,3 +46,23 @@ test('measure returns results and rethrows the same error while recording separa
  const report=await storage.report(new Date().toISOString().slice(0,10));
  assert.equal(report.counts.requests,0);assert.equal(report.operationMetrics[0].count,2);assert.equal(report.operationMetrics[0].errors,1);assert.ok(report.operationMetrics[0].averageMs>=0);
 });
+
+test('categories, predicates, request isolation and output-free operation',async()=>{
+ const events=[];
+ const observer=new Observer([{handler:{id:'mail',write:event=>events.push(event)},levels:['error'],categories:['payments'],filter:event=>event.message.includes('declined')},{handler:{id:'bad-filter',write:()=>assert.fail()},filter:()=>{throw Error('filter');}}]);
+ await Promise.all(['a','b'].map(requestId=>observer.withContext({requestId,category:'payments'},async()=>{await new Promise(r=>setTimeout(r,requestId==='a'?10:1));await observer.error('declined');})));
+ await observer.write('info','declined',{category:'payments'});
+ await observer.write('error','declined',{category:'users'});
+ assert.deepEqual(events.map(e=>e.requestId).sort(),['a','b']);assert.equal(observer.health.failed,4);
+ await new Observer([]).error('No outputs');
+});
+
+test('log search validates filters and preserves continuation on empty filtered pages',async()=>{
+ const at=new Date().toISOString();
+ const reader=new ObserverStore({list:async(pk,cursor)=>({items:cursor?[{data:{id:'2',at,level:'error',category:'payments',message:'declined',data:{}}}]:[{data:{id:'1',at,level:'debug',message:'hidden',data:{}}}],cursor:cursor?undefined:'next'})});
+ const query={day:at.slice(0,10),category:'payments',text:'DECLINED'};
+ const first=await reader.search(query);assert.equal(first.events.length,0);assert.equal(first.cursor,'next');
+ const second=await reader.search({...query,cursor:first.cursor});assert.equal(second.events[0].id,'2');
+ await assert.rejects(reader.search({...query,level:'invalid'}),/Invalid level/);
+ const endpoint=observerFeature(new Observer(),reader).endpoints.find(e=>e.path==='/observer/logs');assert.equal(endpoint.access,'owner');
+});

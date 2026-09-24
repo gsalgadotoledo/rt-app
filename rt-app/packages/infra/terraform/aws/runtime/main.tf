@@ -53,6 +53,14 @@ resource "aws_cloudwatch_log_group" "api" {
   name              = "/aws/lambda/${local.name}"
   retention_in_days = 30
 }
+resource "aws_cloudwatch_log_group" "observer" {
+  name              = "/aws/lambda/${local.name}/observer"
+  retention_in_days = 7
+}
+resource "aws_cloudwatch_log_stream" "observer" {
+  name           = "events"
+  log_group_name = aws_cloudwatch_log_group.observer.name
+}
 resource "aws_iam_role" "lambda" {
   name                 = "${local.name}-lambda"
   permissions_boundary = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:policy/${local.name}-runtime-boundary"
@@ -77,6 +85,7 @@ resource "aws_iam_role_policy" "lambda" {
       {
         Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.api.arn}:*"
       },
+      { Effect = "Allow", Action = ["logs:PutLogEvents", "logs:FilterLogEvents"], Resource = "${aws_cloudwatch_log_group.observer.arn}:*" },
       {
         Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:TransactWriteItems"], Resource = var.table_arns
       },
@@ -120,6 +129,8 @@ resource "aws_lambda_function" "api" {
       NOSQL_PROVIDER             = "dynamodb"
       INFRA_PROVIDER             = "aws"
       RT_APP_ENVIRONMENT         = var.environment
+      OBSERVER_LOG_GROUP         = aws_cloudwatch_log_group.observer.name
+      OBSERVER_LOG_STREAM        = aws_cloudwatch_log_stream.observer.name
       RT_APP_AWS_APP             = var.app
       AUTH_PROVIDER              = "cognito"
       COGNITO_USER_POOL_ID       = var.cognito_user_pool_id

@@ -22,6 +22,14 @@ Separate methods/functions with a blank line. Add a short purpose comment to pub
 ## Verification
 Test catalog uniqueness, authorization and mutation validation. Test CLI and MCP against the same APIs; do not hit real billing/email/cloud services in automated tests. Keep tests in the owning package. Shared UI uses theme tokens, modest field gaps, semibold labels and muted help text.
 
+### Component quality contract
+- Every executable component owns unit tests alongside its package. Test behavior, not private implementation details: successful operations, invalid input, permissions, absent records, conflicts, concurrent calls, retries, cancellation and provider failures where applicable.
+- Run `npm run build` and `npm run test:coverage` before completing a core change. Coverage includes unexecuted backend files. New measured components must meet 90% lines/statements, 80% branches and 85% functions. Existing lower baselines are explicit technical debt in `coverage-baseline.json`; never lower them to make a change pass.
+- Read `docs/testing.md` for scope. The backend coverage percentage is not UI, browser, Rust, Go or Python coverage. UI behavior requires separate E2E checks; provider contract tests use fake clients, never live payments/messages.
+- Document public operations with purpose, inputs, return value and failure/side-effect semantics. Add short `@example` input/output examples for non-obvious contracts. Inline comments explain concurrency, security and transaction ordering; do not narrate each assignment.
+- Keep a blank line between functions/methods and separate transport, validation, domain logic and persistence. Inject clocks/transports/storage where needed for deterministic tests. Do not add mandatory startup connections to unused adapters.
+- Never equate line coverage with correctness. A payment test must assert no unauthorized external mutation; retry tests must assert no duplicate side effects. Test boundary cases even when coverage is already above the threshold.
+
 ## Publication example
 ```ts
 // Inside feature().endpoints: add metadata to the existing, authorized handler.
@@ -36,3 +44,12 @@ Test catalog uniqueness, authorization and mutation validation. Test CLI and MCP
 }
 ```
 No separate CLI/MCP registration is necessary. Use the same service method and validation as the HTTP endpoint. Only the admin route copy is published. Add action-level tests before exposing mutations.
+
+## Reusable observability and application components
+- Read `docs/components.md` and `docs/observer.md` before adding cache, flags, analytics, health or visit tracking. Keep module tests and browser/admin entry points in their owning package.
+- Observer output predicates are trusted synchronous code; never evaluate JavaScript received from the admin. Preserve request context across async calls and keep provider credentials server-side.
+- Analytics uses Observer delivery with a distinct kind/category. Do not double-track page views or treat public metrics as billing facts.
+- Cache keys must include tenant/user scope when results depend on identity. Store only explicit JSON with a TTL. Memory/single-flight scope is per process, not per fleet.
+- Flags do not grant permissions. Private flag rules/subjects are admin-only; public evaluation returns booleans and is only a UI hint.
+- Visits record allowlisted public paths and bounded geometry only. Never add DOM/text/keystroke/form capture implicitly. Preserve last-10 retention, token validation, versioned atomic writes, opt-outs and unit tests.
+- Readiness is not an external uptime monitor. Public health responses must not disclose dependency errors or credentials.

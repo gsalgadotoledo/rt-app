@@ -434,7 +434,7 @@ impl Engine {
                         self.stop(&name, action == "restart");
                     }
                     if action != "stop" {
-                        if action == "restart" {
+                        if action == "restart" || (action == "start" && name.starts_with("run-")) {
                             let s = self.services.get_mut(&name).unwrap();
                             if s.state == "completed" {
                                 s.state = "stopped".into();
@@ -757,6 +757,10 @@ fn serve(root: PathBuf, path: PathBuf) -> Result<(), Box<dyn std::error::Error>>
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                     let mut line = String::new();
                     let result = (|| -> Result<Value, String> {
+                        // Accepted sockets can inherit O_NONBLOCK on macOS/BSD.
+                        // This worker uses blocking read_line with a bounded timeout;
+                        // wait for the request bytes instead of returning EAGAIN.
+                        stream.set_nonblocking(false).map_err(|e| e.to_string())?;
                         BufReader::new((&mut stream).take(16385))
                             .read_line(&mut line)
                             .map_err(|e| e.to_string())?;
@@ -769,6 +773,29 @@ fn serve(root: PathBuf, path: PathBuf) -> Result<(), Box<dyn std::error::Error>>
                             return Err("Unauthorized".into());
                         }
                         let action = request["action"].as_str().ok_or("Action required")?;
+                        // Explicit command runs are transient, excluded from Start All, and use the same process/log lifecycle.
+                        if action == "run-command" {
+                            let spec: Spec = serde_json::from_value(request["spec"].clone())
+                                .map_err(|_| "Invalid command definition")?;
+                            if !spec.id.starts_with("run-") || spec.kind != "task" || spec.enabled
+                                || !spec.dependencies.is_empty() || !spec.ports.is_empty()
+                                || spec.url.is_some() || spec.ready_url.is_some() {
+                                return Err("Invalid command task".into());
+                            }
+                            let id = spec.id.clone();
+                            let mut validated = Engine::new(root.clone(), Config { services: vec![spec] })?;
+                            let mut current = engine.lock().unwrap();
+                            if let Some(existing) = current.services.get(&id) {
+                                if existing.child.is_some() || existing.desired {
+                                    return Err("Command already running".into());
+                                }
+                            } else if current.services.keys().filter(|id| id.starts_with("run-")).count() >= 64 {
+                                return Err("Command history is full; restart the supervisor to clear it".into());
+                            }
+                            current.services.insert(id.clone(), validated.services.remove(&id).unwrap());
+                            current.request_start(&id)?;
+                            return Ok(json!({"id":id}));
+                        }
                         if action == "reload" {
                             let config: Config = serde_json::from_reader(
                                 File::open(&path).map_err(|e| e.to_string())?,

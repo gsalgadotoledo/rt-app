@@ -4,6 +4,9 @@
     "infra",
     "users",
     "auth",
-    "acl"
+    "acl",
+    "feature-flags",
+    "visits",
+    "health"
   ]
 }

@@ -1,19 +1,103 @@
-import {Subscriptions,LocalBilling,type BillingProvider} from '@gsalgadotoledo/rt-app-subscriptions';
-import {StripeBilling, StripeCatalog} from '@gsalgadotoledo/rt-app-subscriptions-stripe';
-import {Observer,ObserverStore,observerFeature,type ObserverOutput} from '@gsalgadotoledo/rt-app-observer';
-import {ConsoleOutput} from '@gsalgadotoledo/rt-app-observer-console';
-import {EmailOutput,LocalEmailOutput} from '@gsalgadotoledo/rt-app-observer-email';
-import {SmsOutput} from '@gsalgadotoledo/rt-app-observer-sms';
-import {CloudWatchOutput} from '@gsalgadotoledo/rt-app-observer-cloudwatch';
-function observerDestinations():ObserverOutput[] {
- const outputs:ObserverOutput[]=[];
- if(process.env.OBSERVER_EMAIL_TO)outputs.push({handler:process.env.OBSERVER_EMAIL_TRANSPORT==='local'?new LocalEmailOutput(process.env.OBSERVER_EMAIL_FROM??'observer@localhost.test',process.env.OBSERVER_EMAIL_TO,Number(process.env.RT_APP_MAIL_SMTP_PORT??1025)):new EmailOutput(process.env.OBSERVER_EMAIL_FROM??'',process.env.OBSERVER_EMAIL_TO),levels:['error'],maxPerMinute:1});
- if(process.env.OBSERVER_SMS_TO)outputs.push({handler:new SmsOutput(process.env.OBSERVER_SMS_TO),levels:['error'],maxPerMinute:1});
- if(process.env.OBSERVER_LOG_GROUP)outputs.push({handler:new CloudWatchOutput(process.env.OBSERVER_LOG_GROUP,process.env.OBSERVER_LOG_STREAM??''),maxPerMinute:600});
- return outputs;
+import { Choice, type ChoiceProvider } from "@gsalgadotoledo/rt-app-choice";
+import { Queue, type QueueAdapter } from "@gsalgadotoledo/rt-app-queue";
+import { createIdempotency } from "@gsalgadotoledo/rt-app-idempotency";
+import {
+  Cache,
+  MemoryCache,
+  type CacheAdapter,
+} from "@gsalgadotoledo/rt-app-cache";
+import { FeatureFlags } from "@gsalgadotoledo/rt-app-feature-flags";
+import { Visits } from "@gsalgadotoledo/rt-app-visits";
+import { HealthChecks, type HealthProbe } from "@gsalgadotoledo/rt-app-health";
+import { Analytics } from "@gsalgadotoledo/rt-app-analytics";
+import {
+  Subscriptions,
+  LocalBilling,
+  type BillingProvider,
+} from "@gsalgadotoledo/rt-app-subscriptions";
+import {
+  StripeBilling,
+  StripeCatalog,
+} from "@gsalgadotoledo/rt-app-subscriptions-stripe";
+import {
+  Observer,
+  ObserverStore,
+  observerFeature,
+  type ObserverOutput,
+} from "@gsalgadotoledo/rt-app-observer";
+import { ConsoleOutput } from "@gsalgadotoledo/rt-app-observer-console";
+import {
+  EmailOutput,
+  LocalEmailOutput,
+} from "@gsalgadotoledo/rt-app-observer-email";
+import { SmsOutput } from "@gsalgadotoledo/rt-app-observer-sms";
+import { randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
+import { JsonStore } from "@gsalgadotoledo/rt-app-json";
+import { SlackOutput } from "@gsalgadotoledo/rt-app-observer-slack";
+import { DatadogOutput } from "@gsalgadotoledo/rt-app-observer-datadog";
+import { SentryOutput } from "@gsalgadotoledo/rt-app-observer-sentry";
+import {
+  CloudWatchOutput,
+  CloudWatchLogReader,
+} from "@gsalgadotoledo/rt-app-observer-cloudwatch";
+function observerDestinations(local = false): ObserverOutput[] {
+  const outputs: ObserverOutput[] = [];
+  if (process.env.OBSERVER_EMAIL_TO)
+    outputs.push({
+      handler:
+        local || process.env.OBSERVER_EMAIL_TRANSPORT === "local"
+          ? new LocalEmailOutput(
+              process.env.OBSERVER_EMAIL_FROM ?? "observer@localhost.test",
+              process.env.OBSERVER_EMAIL_TO,
+              Number(process.env.RT_APP_MAIL_SMTP_PORT ?? 1025),
+            )
+          : new EmailOutput(
+              process.env.OBSERVER_EMAIL_FROM ?? "",
+              process.env.OBSERVER_EMAIL_TO,
+            ),
+      levels: ["error"],
+      categories: ["payment", "payments", "purchase", "purchases"],
+      maxPerMinute: 1,
+    });
+  if (!local && process.env.OBSERVER_SLACK_WEBHOOK)
+    outputs.push({
+      handler: new SlackOutput(process.env.OBSERVER_SLACK_WEBHOOK),
+      levels: ["error"],
+      maxPerMinute: 5,
+    });
+  if (!local && process.env.OBSERVER_DATADOG_API_KEY)
+    outputs.push({
+      handler: new DatadogOutput(
+        process.env.OBSERVER_DATADOG_API_KEY,
+        process.env.OBSERVER_DATADOG_SITE,
+      ),
+      levels: ["info", "warn", "error"],
+    });
+  if (!local && process.env.OBSERVER_SENTRY_DSN)
+    outputs.push({
+      handler: new SentryOutput(process.env.OBSERVER_SENTRY_DSN),
+      levels: ["error"],
+      maxPerMinute: 60,
+    });
+  if (!local && process.env.OBSERVER_SMS_TO)
+    outputs.push({
+      handler: new SmsOutput(process.env.OBSERVER_SMS_TO),
+      levels: ["error"],
+      maxPerMinute: 1,
+    });
+  if (!local && process.env.OBSERVER_LOG_GROUP)
+    outputs.push({
+      handler: new CloudWatchOutput(
+        process.env.OBSERVER_LOG_GROUP,
+        process.env.OBSERVER_LOG_STREAM ?? "",
+      ),
+      maxPerMinute: 600,
+    });
+  return outputs;
 }
-import {CognitoIdentity} from "@gsalgadotoledo/rt-app-auth-cognito";
-import type {IdentityProvider} from "@gsalgadotoledo/rt-app-auth";
+import { CognitoIdentity } from "@gsalgadotoledo/rt-app-auth-cognito";
+import type { IdentityProvider } from "@gsalgadotoledo/rt-app-auth";
 import {
   SecretsManagerClient,
   GetSecretValueCommand,
@@ -43,8 +127,15 @@ import { tasksFeature } from "@gsalgadotoledo/rt-app-tasks";
 import { contentFeature } from "@gsalgadotoledo/rt-app-content";
 import { DynamoStore } from "@gsalgadotoledo/rt-app-dynamodb";
 export function createApplication(options: {
+  cacheAdapter?: CacheAdapter;
+  choiceProvider?: ChoiceProvider;
+  queueAdapter?: QueueAdapter;
+  healthProbes?: HealthProbe[];
+  visitPages?: string[];
   billingProvider?: BillingProvider;
+  /** Explicit outputs replace all defaults; [] means no capture or delivery. */
   observerOutputs?: ObserverOutput[];
+  observerStore?: Store;
   identityProvider?: IdentityProvider;
   adminPasswordVerifier?: string;
   localAdminAccess?: boolean;
@@ -59,33 +150,103 @@ export function createApplication(options: {
   managedByTerraform?: boolean;
   awsConnected?: boolean;
 }) {
-  const billingMode=process.env.SUBSCRIPTIONS_PROVIDER??(options.localAdminAccess?'local':'none');
-  if(!['local','none','stripe'].includes(billingMode))throw new Error('Unknown subscriptions provider');
-  if((billingMode==='local'||options.billingProvider?.mode==='local')&&!options.localAdminAccess)throw new Error('Simulated billing requires explicit local development');
-  const billing=options.billingProvider??(billingMode==='stripe'?new StripeBilling(process.env.STRIPE_SECRET_KEY??'',process.env.STRIPE_WEBHOOK_SECRET??'',process.env.STRIPE_PUBLISHABLE_KEY??''):billingMode==='local'?new LocalBilling(options.store):undefined);
-  const subscriptions=new Subscriptions(options.store,billing,options.mailer.send?.bind(options.mailer),undefined,secret=>new StripeCatalog(secret ?? process.env.STRIPE_SECRET_KEY ?? ''));
-  const observerStorage=new ObserverStore(options.store);
-  const observer=new Observer([{handler:observerStorage},{handler:new ConsoleOutput()},...(options.observerOutputs??observerDestinations())]);
+  const billingMode =
+    process.env.SUBSCRIPTIONS_PROVIDER ??
+    (options.localAdminAccess ? "local" : "none");
+  if (!["local", "none", "stripe"].includes(billingMode))
+    throw new Error("Unknown subscriptions provider");
+  if (
+    (billingMode === "local" || options.billingProvider?.mode === "local") &&
+    !options.localAdminAccess
+  )
+    throw new Error("Simulated billing requires explicit local development");
+  const billing =
+    options.billingProvider ??
+    (billingMode === "stripe"
+      ? new StripeBilling(
+          process.env.STRIPE_SECRET_KEY ?? "",
+          process.env.STRIPE_WEBHOOK_SECRET ?? "",
+          process.env.STRIPE_PUBLISHABLE_KEY ?? "",
+        )
+      : billingMode === "local"
+        ? new LocalBilling(options.store)
+        : undefined);
+  const subscriptions = new Subscriptions(
+    options.store,
+    billing,
+    options.mailer.send?.bind(options.mailer),
+    undefined,
+    (secret) =>
+      new StripeCatalog(secret ?? process.env.STRIPE_SECRET_KEY ?? ""),
+  );
+  const localObserverStore =
+    options.store instanceof JsonStore
+      ? new JsonStore(join(dirname(options.store.file), "observer.json"))
+      : options.store;
+  const observerStorage = new ObserverStore(
+    options.observerStore ?? localObserverStore,
+  );
+  const observer = new Observer(
+    options.observerOutputs ?? [
+      { handler: observerStorage },
+      { handler: new ConsoleOutput(), levels: ["info", "warn", "error"] },
+      ...observerDestinations(options.localAdminAccess),
+    ],
+  );
+  const observerLogs =
+    !options.localAdminAccess && process.env.OBSERVER_LOG_GROUP
+      ? new CloudWatchLogReader(process.env.OBSERVER_LOG_GROUP)
+      : observerStorage;
+  const choice = options.choiceProvider ? new Choice(options.choiceProvider) : undefined;
+  const queue = options.queueAdapter ? new Queue(options.queueAdapter) : undefined;
+  const idempotency = createIdempotency(options.store);
+  const cache = new Cache(options.cacheAdapter ?? new MemoryCache());
+  const flags = new FeatureFlags(options.store);
+  const visits = new Visits(options.store, options.secret, options.visitPages);
+  const health = new HealthChecks(
+    options.healthProbes ?? [
+      {
+        id: "database",
+        check: async () => {
+          await options.store.get("SCHEMA", "users");
+        },
+      },
+    ],
+  );
+  const analytics = new Analytics(observer);
   const users = new Users(options.store, options.identityProvider),
     tokens = new JwtTokens(options.secret),
-    auth = new Auth(users, tokens, options.mailer, options.secret, options.identityProvider);
+    auth = new Auth(
+      users,
+      tokens,
+      options.mailer,
+      options.secret,
+      options.identityProvider,
+    );
   let endpoints: Endpoint[] = [];
   const acl = new ACL(options.store, () => endpoints);
   const registered: Feature[] = [
+    flags.feature(),
+    visits.feature(),
+    health.feature(),
     subscriptions.feature(),
-    observerFeature(observer,observerStorage),
+    observerFeature(observer, observerStorage, observerLogs),
     contentFeature(options.store),
     new Infra(
       options.store,
       options.infraDriver ?? new SimulatedInfraDriver(),
       options.managedByTerraform,
     ).feature(),
-    new AwsMonitor(undefined,options.store).feature(),
+    new AwsMonitor(undefined, options.store).feature(),
     users.feature(),
     auth.feature(),
     acl.feature(),
     ...(options.tasks === false ? [] : [tasksFeature(options.store)]),
-    ...(options.featureFactories ?? []).map(factory => factory(options.store)),
+    ...(options.featureFactories ?? []).map((factory) =>
+      factory(options.store),
+    ),
+    ...(choice ? [choice.feature()] : []),
+    ...(queue ? [queue.feature()] : []),
     ...(options.features ?? []),
   ];
   if (new Set(registered.map((f) => f.id)).size !== registered.length)
@@ -99,7 +260,13 @@ export function createApplication(options: {
       throw new Error("Unknown module: " + id);
   for (const id of ["content", "users", "auth", "acl", "infra"])
     if (!requested.includes(id)) throw new Error("Required module: " + id);
-  const features = registered.filter((f) => requested.includes(f.id) || f.id === "observer" || f.id === "subscriptions" || (f.id === "aws-monitor" && requested.includes("infra")));
+  const features = registered.filter(
+    (f) =>
+      requested.includes(f.id) ||
+      f.id === "observer" ||
+      f.id === "subscriptions" ||
+      (f.id === "aws-monitor" && requested.includes("infra")),
+  );
   const admin = new AdminIdentity(
     options.adminPasswordVerifier,
     options.secret,
@@ -110,7 +277,20 @@ export function createApplication(options: {
     .filter((e) => e.access === "permission" || e.access === "owner")
     .map((e) => ({ ...e, path: "/admin/app" + e.path }));
   endpoints = [
-    ...appEndpoints.filter((e) => !e.path.startsWith("/infra") && !e.path.startsWith("/aws/") && e.path !== "/observer/report" && !e.path.startsWith("/subscriptions/admin/")),
+    ...appEndpoints.filter(
+      (e) =>
+        !(
+          (e.path.startsWith("/feature-flags") ||
+            e.path.startsWith("/visits") ||
+            e.path === "/health/report") &&
+          e.access === "owner"
+        ) &&
+        !e.path.startsWith("/infra") &&
+        !e.path.startsWith("/aws/") &&
+        e.path !== "/observer/report" &&
+        e.path !== "/observer/logs" &&
+        !e.path.startsWith("/subscriptions/admin/"),
+    ),
     ...adminEndpoints,
     ...admin.features.flatMap((f) => f.endpoints),
   ];
@@ -136,7 +316,7 @@ export function createApplication(options: {
             (!f.admin.ownerOnly || c.actor?.role === "owner") &&
             admin.acl.allows(c.actor, f.admin.resource),
         )
-        .map((f) => ({...f.admin, module: f.id})),
+        .map((f) => ({ ...f.admin, module: f.id })),
   });
   endpoints.push({
     method: "GET",
@@ -146,15 +326,26 @@ export function createApplication(options: {
     handle: async () => features.map((f) => f.id),
   });
   // Discover only explicitly published admin actions; never expose arbitrary methods.
-  const tools = adminEndpoints.filter(e => e.tool).map(e => ({
-    ...e.tool!, method: e.method, path: e.path,
-  }));
-  if (tools.some(t => !/^[a-z][a-z0-9_]{1,100}$/.test(t.name) || !t.description.trim()))
+  const tools = adminEndpoints
+    .filter((e) => e.tool)
+    .map((e) => ({
+      ...e.tool!,
+      method: e.method,
+      path: e.path,
+    }));
+  if (
+    tools.some(
+      (t) => !/^[a-z][a-z0-9_]{1,100}$/.test(t.name) || !t.description.trim(),
+    )
+  )
     throw new Error("Invalid module tool metadata");
-  if (new Set(tools.map(t => t.name)).size !== tools.length)
+  if (new Set(tools.map((t) => t.name)).size !== tools.length)
     throw new Error("Duplicate module tool name");
   endpoints.push({
-    method: "GET", path: "/admin/tools", resource: "admin.tools", access: "owner",
+    method: "GET",
+    path: "/admin/tools",
+    resource: "admin.tools",
+    access: "owner",
     handle: async () => tools,
   });
 
@@ -168,7 +359,7 @@ export function createApplication(options: {
   endpoints.sort(
     (a, b) => Number(a.path.includes(":")) - Number(b.path.includes(":")),
   );
-  async function dispatch(request: Request, telemetry: {path:string}) {
+  async function dispatch(request: Request, telemetry: { path: string }) {
     try {
       let route: Endpoint | undefined,
         params: Record<string, string> = {};
@@ -197,7 +388,7 @@ export function createApplication(options: {
         }
       }
       if (!route) throw new HttpError(404, "Endpoint not found");
-      telemetry.path=route.path;
+      telemetry.path = route.path;
       const actor =
         route.access === "guest"
           ? undefined
@@ -205,7 +396,26 @@ export function createApplication(options: {
               request.headers.authorization,
             );
       (route.path.startsWith("/admin/") ? admin.acl : acl).check(route, actor);
-      if(route.subscription){if(!actor)throw new HttpError(401,'Authentication required');const key=request.headers['idempotency-key'];if(!key)throw new HttpError(400,'Idempotency-Key is required for this operation');const receipt=await subscriptions.consume(actor.id,route.subscription.product,route.subscription.credits,key);if(receipt.replayed)throw new HttpError(409,'This operation was already charged. Do not repeat its side effects.');}
+      if (route.subscription) {
+        if (!actor) throw new HttpError(401, "Authentication required");
+        const key = request.headers["idempotency-key"];
+        if (!key)
+          throw new HttpError(
+            400,
+            "Idempotency-Key is required for this operation",
+          );
+        const receipt = await subscriptions.consume(
+          actor.id,
+          route.subscription.product,
+          route.subscription.credits,
+          key,
+        );
+        if (receipt.replayed)
+          throw new HttpError(
+            409,
+            "This operation was already charged. Do not repeat its side effects.",
+          );
+      }
       const result = await route.handle({ request, actor, params });
       return { status: 200, body: result };
     } catch (error) {
@@ -215,16 +425,41 @@ export function createApplication(options: {
       return { status: 500, body: { error: "Internal error" } };
     }
   }
-  async function handle(request:Request) {
-    const start=performance.now(),telemetry={path:'unmatched'};
-    const result=await dispatch(request,telemetry);
-    // Exclude the observer itself to prevent refresh/ingestion feedback loops.
-    if(!request.path.startsWith('/observer/')&&!request.path.startsWith('/admin/app/observer/'))
-      await observer.recordRequest({method:request.method,url:telemetry.path==='unmatched'?'/unmatched':telemetry.path,status:result.status,durationMs:performance.now()-start});
-    return result;
+  async function handle(request: Request) {
+    return observer.withContext(
+      {
+        requestId: randomUUID(),
+        category: request.path.includes("/subscriptions") ? "payments" : "http",
+      },
+      async () => {
+        const start = performance.now(),
+          telemetry = { path: "unmatched" };
+        const result = await dispatch(request, telemetry);
+        // Exclude the observer itself to prevent refresh/ingestion feedback loops.
+        if (
+          !request.path.startsWith("/observer/") &&
+          !request.path.startsWith("/admin/app/observer/")
+        )
+          await observer.recordRequest({
+            method: request.method,
+            url: telemetry.path === "unmatched" ? "/unmatched" : telemetry.path,
+            status: result.status,
+            durationMs: performance.now() - start,
+          });
+        return result;
+      },
+    );
   }
   return {
     observer,
+    idempotency,
+    choice,
+    queue,
+    cache,
+    flags,
+    visits,
+    health,
+    analytics,
     subscriptions,
     handle,
     features,
@@ -237,7 +472,22 @@ export function createApplication(options: {
     },
   };
 }
-export function createProductionApplication(modules?: string[], featureFactories: Array<(store: Store) => Feature> = []) {
+export type ComponentOptions = Pick<
+  Parameters<typeof createApplication>[0],
+  | "choiceProvider"
+  | "queueAdapter"
+  | "cacheAdapter"
+  | "healthProbes"
+  | "visitPages"
+  | "observerOutputs"
+  | "observerStore"
+>;
+
+export function createProductionApplication(
+  modules?: string[],
+  featureFactories: Array<(store: Store) => Feature> = [],
+  components: ComponentOptions = {},
+) {
   const table = process.env.TABLE_NAME,
     secret = process.env.JWT_SECRET,
     from = process.env.MAIL_FROM;
@@ -246,10 +496,19 @@ export function createProductionApplication(modules?: string[], featureFactories
       "TABLE_NAME, ADMIN_PASSWORD_VERIFIER, JWT_SECRET and MAIL_FROM are required",
     );
   const authProvider = process.env.AUTH_PROVIDER ?? "local";
-  if (!["local", "cognito"].includes(authProvider)) throw new Error("Unknown AUTH_PROVIDER");
+  if (!["local", "cognito"].includes(authProvider))
+    throw new Error("Unknown AUTH_PROVIDER");
   return createApplication({
+    ...components,
     featureFactories,
-    identityProvider: authProvider === "cognito" ? new CognitoIdentity(process.env.COGNITO_USER_POOL_ID ?? "", process.env.COGNITO_CLIENT_ID ?? "", process.env.AWS_REGION ?? "us-east-1") : undefined,
+    identityProvider:
+      authProvider === "cognito"
+        ? new CognitoIdentity(
+            process.env.COGNITO_USER_POOL_ID ?? "",
+            process.env.COGNITO_CLIENT_ID ?? "",
+            process.env.AWS_REGION ?? "us-east-1",
+          )
+        : undefined,
     modules,
     managedByTerraform: true,
     awsConnected: true,
@@ -312,8 +571,27 @@ export async function seedDemo(
 }
 
 /** Load once per Lambda environment; no plaintext secret in Terraform state or function configuration. */
-export async function loadProductionApplication(modules?: string[], featureFactories: Array<(store: Store) => Feature> = []) {
-  if(process.env.STRIPE_SECRET_ARN){const client=new SecretsManagerClient({});try{const value=await client.send(new GetSecretValueCommand({SecretId:process.env.STRIPE_SECRET_ARN}));const keys=JSON.parse(value.SecretString??'{}');if(!keys.secretKey||!keys.webhookSecret||!keys.publishableKey)throw new Error('Stripe secret is incomplete');process.env.STRIPE_SECRET_KEY=keys.secretKey;process.env.STRIPE_WEBHOOK_SECRET=keys.webhookSecret;process.env.STRIPE_PUBLISHABLE_KEY=keys.publishableKey;}finally{client.destroy();}}
+export async function loadProductionApplication(
+  modules?: string[],
+  featureFactories: Array<(store: Store) => Feature> = [],
+  components: ComponentOptions = {},
+) {
+  if (process.env.STRIPE_SECRET_ARN) {
+    const client = new SecretsManagerClient({});
+    try {
+      const value = await client.send(
+        new GetSecretValueCommand({ SecretId: process.env.STRIPE_SECRET_ARN }),
+      );
+      const keys = JSON.parse(value.SecretString ?? "{}");
+      if (!keys.secretKey || !keys.webhookSecret || !keys.publishableKey)
+        throw new Error("Stripe secret is incomplete");
+      process.env.STRIPE_SECRET_KEY = keys.secretKey;
+      process.env.STRIPE_WEBHOOK_SECRET = keys.webhookSecret;
+      process.env.STRIPE_PUBLISHABLE_KEY = keys.publishableKey;
+    } finally {
+      client.destroy();
+    }
+  }
   if (!process.env.JWT_SECRET) {
     if (!process.env.JWT_SECRET_ARN)
       throw new Error("JWT_SECRET_ARN is required");
@@ -345,5 +623,5 @@ export async function loadProductionApplication(modules?: string[], featureFacto
       client.destroy();
     }
   }
-  return createProductionApplication(modules, featureFactories);
+  return createProductionApplication(modules, featureFactories, components);
 }

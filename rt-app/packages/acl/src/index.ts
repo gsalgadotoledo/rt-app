@@ -1,4 +1,4 @@
-import {auditUpdate} from '@gsalgadotoledo/rt-app-contracts';
+import { auditUpdate } from "@gsalgadotoledo/rt-app-contracts";
 import type { NoSQL as Store } from "@gsalgadotoledo/rt-app-nosql";
 import { migrations } from "./migrations.js";
 import admin from "./admin.json" with { type: "json" };
@@ -15,11 +15,13 @@ export class ACL {
     private store: Store,
     private resources: () => Endpoint[],
   ) {}
+  /** Owners have normal resource access; other actors need the named grant. */
   allows(actor: Actor | undefined, resource: string) {
     return (
       !!actor && (actor.role === "owner" || actor.grants.includes(resource))
     );
   }
+  /** Enforce the endpoint access policy; explicitGrant also applies to owners. */
   check(endpoint: Endpoint, actor?: Actor) {
     if (endpoint.access === "guest") return;
     if (!actor) throw new HttpError(401, "Sign in");
@@ -27,10 +29,16 @@ export class ACL {
       throw new HttpError(403, "Only the owner can perform this operation");
     if (
       endpoint.access === "permission" &&
-      (endpoint.explicitGrant ? !actor.grants.includes(endpoint.resource) : !this.allows(actor, endpoint.resource))
+      (endpoint.explicitGrant
+        ? !actor.grants.includes(endpoint.resource)
+        : !this.allows(actor, endpoint.resource))
     )
-      throw new HttpError(403, "You do not have permission to access this resource");
+      throw new HttpError(
+        403,
+        "You do not have permission to access this resource",
+      );
   }
+  /** Publish resource discovery and owner-only delegation with token-version revocation. */
   feature(): Feature {
     return {
       id: "acl",
@@ -64,7 +72,8 @@ export class ACL {
             if (c.actor!.role !== "owner")
               throw new HttpError(403, "Only the owner can assign permissions");
             const row = await this.store.get("USERS", c.params.id);
-            if (!row || row.data.deletedAt) throw new HttpError(404, "User not found");
+            if (!row || row.data.deletedAt)
+              throw new HttpError(404, "User not found");
             if (row.data.role === "owner")
               throw new HttpError(
                 403,

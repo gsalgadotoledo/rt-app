@@ -1,6 +1,7 @@
 'use client';
 import {useEffect} from 'react';
-import {trackPage} from '@gsalgadotoledo/rt-app-observer/browser';
+import {trackPage} from '@gsalgadotoledo/rt-app-analytics/browser';
+import {startVisitCapture} from '@gsalgadotoledo/rt-app-visits/browser';
 import {browserApiUrl} from '@gsalgadotoledo/rt-app-config';
 import Link from 'next/link';
 import {usePathname} from 'next/navigation';
@@ -9,6 +10,8 @@ import branding from '../branding.json';
 import Account from './account';
 export default function SiteHeader({config}:{config:PublicConfig}) {
  const pathname=usePathname();
+ const apiUrl=browserApiUrl(config);
+ useEffect(()=>startVisitCapture({apiUrl,enabled:process.env.NEXT_PUBLIC_RT_APP_VISITS!=='false'}),[apiUrl]);
  useEffect(()=>{trackPage(browserApiUrl(config),'ssr',pathname);},[pathname,config]);
  return <header className="topbar"><Link className="brand" href="/">{branding.name}</Link><div className="site-navigation"><nav aria-label="Pages">{[['/','Home'],['/about','About'],['/services','Services']].map(([href,label])=><Link key={href} href={href} aria-current={pathname===href?'page':undefined}>{label}</Link>)}</nav><Account config={config}/></div></header>;
 }

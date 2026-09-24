@@ -5,6 +5,6 @@ import { featureFactories } from "./packages/index.js";
 import configuration from "./modules.json" with {type: "json"};
 import * as framework from "@gsalgadotoledo/rt-app-framework";
 export const createApplication = options => framework.createApplication({...options, modules: configuration.modules, featureFactories: [...featureFactories, ...(options.featureFactories ?? [])]});
-export const createProductionApplication = () => framework.createProductionApplication(configuration.modules, featureFactories);
+export const createProductionApplication = (components = {}) => framework.createProductionApplication(configuration.modules, featureFactories, components);
 export const seedDemo = framework.seedDemo;
-export const loadProductionApplication = () => framework.loadProductionApplication(configuration.modules, featureFactories);
+export const loadProductionApplication = (components = {}) => framework.loadProductionApplication(configuration.modules, featureFactories, components);

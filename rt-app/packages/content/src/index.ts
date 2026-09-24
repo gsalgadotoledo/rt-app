@@ -10,6 +10,7 @@ export const defaultHome = {
   title: "Welcome to RT-App",
   content: "A small starting point for building great applications.",
 };
+/** Home content endpoints: validated edits use optimistic revision checks; reads supply defaults. */
 export function contentFeature(store: Store): Feature {
   const settings = async () => {
     const row = await store.get("CONTENT", "home");

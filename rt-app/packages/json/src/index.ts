@@ -52,7 +52,7 @@ export class JsonStore implements NoSQL {
       }
       for (const w of snapshot) { if (w.delete) rows.delete(key(w.row)); else rows.set(key(w.row),w.row); }
       // Observer retention also applies to the local JSON adapter.
-      for (const [k,row] of rows) if(row.pk.startsWith('OBSERVER#') && row.ttl && row.ttl <= Date.now()/1000) rows.delete(k);
+      for (const [k,row] of rows) if((row.pk.startsWith('OBSERVER#')||row.pk.startsWith('CACHE#')||row.pk==='VISITS') && row.ttl && row.ttl <= Date.now()/1000) rows.delete(k);
       const temp = this.file + '.' + randomUUID() + '.tmp';
       try {
         const out = await open(temp, 'wx', 0o600);

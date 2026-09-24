@@ -18,6 +18,30 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm run prepare:templates
-      - run: npm test
+      - run: npm run test:coverage
+      - run: npm run test:native -w @gsalgadotoledo/rt-app-service-manager
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: coverage/
+          if-no-files-found: ignore
       - run: npm run release:pack
       - run: npm run release:verify
+  reference-cores:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: go test -race -cover ./...
+        working-directory: rt-app/core-go
+      - run: python -m unittest discover -s tests -v
+        working-directory: rt-app/core-python
+        env:
+          PYTHONPATH: src

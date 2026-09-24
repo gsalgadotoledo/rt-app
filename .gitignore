@@ -41,6 +41,8 @@ rt-app/packages/service-manager/release/
 rt-app/packages/create/starter/
 
 artifacts/
+coverage/
+.coverage-tmp/
 **/target/
 *.tgz
 *.zip

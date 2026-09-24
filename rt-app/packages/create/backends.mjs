@@ -17,6 +17,19 @@ export async function generateBackend(target,id,packageRoot){
   const pkg=JSON.parse(await readFile(join(directory,'package.json'),'utf8'));pkg.scripts.setup='node setup.mjs';await writeFile(join(directory,'package.json'),JSON.stringify(pkg,null,2)+'\n');
   await writeFile(join(directory,'run.mjs'),`import {spawn} from 'node:child_process';\nimport {ensurePython} from './setup.mjs';\nconst python=await ensurePython();\nconst child=spawn(python,['main.py'],{stdio:'inherit',env:process.env});\nfor(const signal of ['SIGTERM','SIGINT'])process.on(signal,()=>child.kill(signal));\nchild.on('error',error=>{console.error(error.message);process.exitCode=1});\nchild.on('exit',code=>process.exitCode=code??0);\n`);
  }
+ // Generated native dev scripts watch sources; start remains a one-shot production-style launch.
+ await cp(join(packageRoot,'templates/backends/watch.mjs'),join(directory,'watch.mjs'));
+ const nativePackage=JSON.parse(await readFile(join(directory,'package.json'),'utf8'));
+ nativePackage.scripts.start='node run.mjs';
+ nativePackage.scripts.dev='node dev.mjs';
+ if(id==='go'){nativePackage.scripts.test='go test ./...';nativePackage.scripts.build='go build ./...';}
+ if(id==='python'){
+  nativePackage.scripts.test='node test.mjs';
+  await writeFile(join(directory,'test.mjs'),"import {spawn} from 'node:child_process';\nimport {ensurePython} from './setup.mjs';\nconst child=spawn(await ensurePython(),['-m','unittest','discover'],{stdio:'inherit'});\nchild.on('error',e=>{console.error(e.message);process.exitCode=1});\nchild.on('exit',code=>process.exitCode=code??1);\n");
+ }
+ await writeFile(join(directory,'package.json'),JSON.stringify(nativePackage,null,2)+'\n');
+ const preparation=id==='python'?"import {ensurePython} from './setup.mjs';\nconst command=[await ensurePython(),'main.py'];":'const command='+JSON.stringify(commands[id])+';';
+ await writeFile(join(directory,'dev.mjs'),"import {watchCommand} from './watch.mjs';\n"+preparation+"\nawait watchCommand(command, {roots:['.'"+(['go','python'].includes(id)?",'../../packages/core-"+id+"'":'')+"]});\n");
  // Refuse to silently publish only the TS core while omitting the selected application API.
  if(['go','python'].includes(id))await cp(join(packageRoot,'languages','core-'+id),join(target,'packages','core-'+id),{recursive:true});
  for(const path of ['.github/workflows/deploy.yml','.gitlab-ci.yml'])await rm(join(target,path),{force:true});

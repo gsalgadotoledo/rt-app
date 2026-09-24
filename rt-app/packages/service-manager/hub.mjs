@@ -1,3 +1,4 @@
+import {projectCommands, commandSpec} from './commands.mjs';
 import { packageFile } from '@gsalgadotoledo/rt-app-config/paths';
 import {runtimeLabel} from './runtime-label.mjs';
 import {Toolchains} from '@gsalgadotoledo/rt-app-create/runtime';
@@ -70,12 +71,36 @@ export class ServiceHub {
   const runtime=(s,list,backend)=>runtimeLabel(list.find(spec=>spec.id===s.id)??s,backend);
   return {...project,catalog:catalog.map(t=>({...t,installed:(this.global.catalogTools??[]).includes(t.id),job:jobs.get(t.id)})),projects:this.registry,globalPorts:{...this.global.ports,...extraPorts(this.global.extra)},projectPorts:{...defaults,...settings.local?.ports,...extraPorts(settings.services?.extra)},services:[...global.services.map(s=>({...s,runtime:runtime(s,globalConfig.services),id:`global:${s.id}`,scope:'global',project:'Shared across projects'})),...project.services.map(s=>({...s,runtime:runtime(s,config.services,settings.backend),scope:'project',project:this.registry.find(p=>p.path===this.root)?.name??basename(this.root)}))]};
  }
+ /** List scripts on demand; polling status never scans the source tree. */
+ async commands(){
+  if(!this.root) return [];
+  const config=await read(join(this.root,'.rt-app/services.json'));
+  return projectCommands(this.root,config.services);
+ }
+
+ /** Start an existing dev service or an independent, explicitly requested task. */
+ runCommand(id){return this.exclusive(async()=>{
+  if(!this.root || typeof id!=='string') throw new Error('Select a project and command');
+  const config=await read(join(this.root,'.rt-app/services.json'));
+  const resolved=await commandSpec(this.root,id,config.services);
+  const settings=await read(join(this.root,'rt-app.settings.json'));
+  const required=Object.keys(settings.requirements??{node:'24'});
+  const missing=(await new Toolchains(this.home).status(required)).filter(t=>t.required&&!t.ready);
+  if(missing.length)throw new Error('Install project requirements first: '+missing.map(t=>t.name).join(', '));
+  if(resolved.serviceId){
+   if(!this.options.noMail)await this.waitMail();
+   await request(this.root,'start',resolved.serviceId);
+   return {id:resolved.serviceId==='all'?'api':resolved.serviceId};
+  }
+  try{await request(this.root,'run-command',undefined,resolved.spec);}catch(error){if(error.message==='Unknown action')throw new Error('The running supervisor is an older version. Run rta services shutdown in this project, then reopen the project. This stops its services.');throw error;}
+  return {id:resolved.spec.id};
+ });}
  async waitMail(){await request(this.home,'start','mail');for(let i=0;i<950;i++){const s=(await request(this.home,'status')).services.find(s=>s.id==='mail');if(s.state==='running')return;if(['failed','blocked'].includes(s.state))throw new Error(`Shared mail: ${s.error}`);await delay(100);}throw new Error('Shared email startup timed out');}
  action(action,id){return this.exclusive(async()=>{
   if(!['start','stop','restart'].includes(action))throw new Error('Invalid action');
   if(id.startsWith('global:'))return request(this.home,action,id.slice(7));
   if(action!=='stop'){const settings=await read(join(this.root,'rt-app.settings.json'));const required=Object.keys(settings.requirements??{node:'24'});const missing=(await new Toolchains(this.home).status(required)).filter(t=>t.required&&!t.ready);if(missing.length)throw new Error('Install project requirements first: '+missing.map(t=>t.name).join(', '));}
-  if(action!=='stop'&&!this.options.noMail&&id!=='build')await this.waitMail();
+  if(action!=='stop'&&!this.options.noMail&&id!=='build'&&!id.startsWith('run-'))await this.waitMail();
   return request(this.root,action,id==='project:all'?'all':id);
  });}
  logs(id){return request(id.startsWith('global:')?this.home:this.root,'logs',id.replace(/^global:/,''));}

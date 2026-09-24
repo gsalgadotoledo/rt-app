@@ -1,7 +1,7 @@
 import { manifestFixture } from './manifest-fixture.mjs';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,writeFile,readFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createServer,connect} from 'node:net';
@@ -27,6 +27,17 @@ test('shared supervisor: dependencies, logs, secrets, restart, occupied ports an
  ]}}));
  try{
   assert.equal((await ensureDaemon(root)).started,true);assert.equal((await ensureDaemon(root)).started,false);
+  // Connect before writing: accepted sockets must wait for bytes on macOS too.
+  const registry=JSON.parse(await readFile(join(root,'.rt-app/supervisor.json'),'utf8'));
+  const delayed=connect({host:'127.0.0.1',port:registry.port});
+  delayed.setTimeout(3000,()=>delayed.destroy(new Error('Delayed request timed out')));
+  const response=new Promise((resolve,reject)=>{
+   let data='';delayed.on('data',chunk=>{data+=chunk;if(data.includes('\n')){try{resolve(JSON.parse(data.trim()));}catch(error){reject(error);}delayed.end();}});
+   delayed.once('error',reject);delayed.once('end',()=>{if(!data.includes('\n'))reject(new Error('Incomplete response'));});
+  });
+  await once(delayed,'connect');await delay(100);
+  delayed.write(JSON.stringify({token:registry.token,action:'status'})+'\n');
+  assert.equal((await response).ok,true);
   await request(root,'start','all');const first=await wait(root,'api','running');await wait(root,'occupied','blocked');const failed=await wait(root,'failure','failed');assert.equal(failed.exitCode,7);
   const logs=await request(root,'logs','api');assert.ok(logs.some(l=>l.text.includes('[redacted]')));assert.ok(logs.some(l=>l.stream==='stderr'));assert.doesNotMatch(JSON.stringify(logs),/PRIVATE-SUPERVISOR-TEST/);
   const {stdout}=await promisify(execFile)(defaultBinary,['status','--project',root,'--json']);assert.equal(JSON.parse(stdout).services.find(s=>s.id==='api').pid,first.pid);
@@ -48,4 +59,28 @@ test('default services select existing scripts and respect optional build/mail',
  assert.equal(config.services.some(s=>s.id==='build'||s.id==='mail'),false);
  assert.equal(config.services.find(s=>s.id==='api').env.RT_APP_TARGET,'local');
  assert.equal(config.services.find(s=>s.id==='api').env.RT_APP_MAIL_TRANSPORT,'memory');
+});
+
+test('extra command processes preserve dev PID, capture errors, reject duplicates and stay out of start all', {timeout:120000}, async()=>{
+ const root=await mkdtemp(join(tmpdir(),'rt-command-process-'));
+ const base={cwd:'.',env:{},ports:[],dependencies:[]};
+ try{
+  await ensureDaemon(root,{config:{services:[{...base,id:'dev',label:'Dev',command:[process.execPath,'-e','setInterval(()=>{},1000)']}]}});
+  await request(root,'start','all');const dev=await wait(root,'dev','running');
+  const spec={...base,id:'run-test',label:'Tests',kind:'task',enabled:false,command:[process.execPath,'-e',"console.log('test output');setTimeout(()=>process.exit(3),500)"]};
+  await request(root,'run-command',undefined,spec);
+  await assert.rejects(request(root,'run-command',undefined,spec),/already running/);
+  const failed=await wait(root,'run-test','failed');assert.equal(failed.exitCode,3);
+  assert.ok((await request(root,'logs','run-test')).some(l=>l.text.includes('test output')));
+  assert.equal((await request(root,'status')).services.find(s=>s.id==='dev').pid,dev.pid);
+  await request(root,'start','all');assert.equal((await request(root,'status')).services.find(s=>s.id==='run-test').state,'failed');
+  await assert.rejects(request(root,'run-command',undefined,{...spec,cwd:'..'}),/inside/);
+  await assert.rejects(request(root,'run-command',undefined,{...spec,enabled:true}),/Invalid command task/);
+  await request(root,'run-command',undefined,{...spec,command:[process.execPath,'-e','console.log("done")']});
+  await wait(root,'run-test','completed');
+  await request(root,'start','run-test');
+  await wait(root,'run-test','completed');
+  assert.equal((await request(root,'logs','run-test')).filter(l=>l.text==='done').length,2);
+  await request(root,'stop','all');await wait(root,'dev','stopped');
+ }finally{await request(root,'shutdown').catch(()=>{});await delay(500);await rm(root,{recursive:true,force:true});}
 });

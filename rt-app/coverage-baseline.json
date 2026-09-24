@@ -1,0 +1,245 @@
+{
+  "description": "Initial measured backend floors. Raise after improving coverage; never lower to accept regressions. UI/tooling/native code is outside this metric; see docs/testing.md.",
+  "newComponentMinimum": {
+    "lines": 90,
+    "statements": 90,
+    "branches": 80,
+    "functions": 85
+  },
+  "components": {
+    "acl": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "admin-backend": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 90,
+      "functions": 90
+    },
+    "analytics": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "auth": {
+      "lines": 92,
+      "statements": 92,
+      "branches": 78,
+      "functions": 82
+    },
+    "auth-cognito": {
+      "lines": 93,
+      "statements": 93,
+      "branches": 76,
+      "functions": 95
+    },
+    "aws": {
+      "lines": 92,
+      "statements": 92,
+      "branches": 71,
+      "functions": 84
+    },
+    "cache": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "cache-dynamodb": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "cache-file": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "cache-nosql": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 89,
+      "functions": 100
+    },
+    "cache-redis": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 88,
+      "functions": 100
+    },
+    "content": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "contracts": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 91,
+      "functions": 100
+    },
+    "core-ts": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 95,
+      "functions": 100
+    },
+    "dynamodb": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "feature-flags": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "framework": {
+      "lines": 93,
+      "statements": 93,
+      "branches": 85,
+      "functions": 84
+    },
+    "health": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "idempotency": {
+      "lines": 93,
+      "statements": 93,
+      "branches": 96,
+      "functions": 100
+    },
+    "infra": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 80,
+      "functions": 100
+    },
+    "installer": {
+      "lines": 93,
+      "statements": 93,
+      "branches": 71,
+      "functions": 87
+    },
+    "json": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 90,
+      "functions": 100
+    },
+    "jwt": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "mail-local": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 80,
+      "functions": 100
+    },
+    "nosql": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "observer": {
+      "lines": 97,
+      "statements": 97,
+      "branches": 88,
+      "functions": 80
+    },
+    "observer-cloudwatch": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "observer-console": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "observer-datadog": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 83,
+      "functions": 100
+    },
+    "observer-email": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "observer-sentry": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "observer-slack": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "observer-sms": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 80,
+      "functions": 100
+    },
+    "observer-webhook": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 83,
+      "functions": 100
+    },
+    "subscriptions": {
+      "lines": 95,
+      "statements": 95,
+      "branches": 79,
+      "functions": 91
+    },
+    "subscriptions-stripe": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 90,
+      "functions": 100
+    },
+    "tasks": {
+      "lines": 100,
+      "statements": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "users": {
+      "lines": 98,
+      "statements": 98,
+      "branches": 83,
+      "functions": 95
+    },
+    "visits": {
+      "lines": 99,
+      "statements": 99,
+      "branches": 86,
+      "functions": 100
+    }
+  }
+}

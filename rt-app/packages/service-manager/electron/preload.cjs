@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('rtAppServices',{
  catalogAction:(action,id)=>ipcRenderer.invoke('services:catalog',action,id),
  discover:()=>ipcRenderer.invoke('services:discover'),
  addDiscovered:id=>ipcRenderer.invoke('services:add-discovered',id),
+ commands:()=>ipcRenderer.invoke('services:commands'),
+ runCommand:id=>ipcRenderer.invoke('services:run-command',id),
  snapshot:()=>ipcRenderer.invoke('services:status'),
  action:(action,id)=>ipcRenderer.invoke('services:action',action,id),
  logs:id=>ipcRenderer.invoke('services:logs',id),

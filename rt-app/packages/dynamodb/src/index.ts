@@ -31,6 +31,7 @@ export class DynamoStore implements Store {
       { marshallOptions: { removeUndefinedValues: true } },
     );
   }
+  /** Read one row; absence returns undefined. Durable reads use ConsistentRead. */
   async get(pk: string, sk: string) {
     return (
       await this.client.send(
@@ -42,6 +43,7 @@ export class DynamoStore implements Store {
       )
     ).Item as Row | undefined;
   }
+  /** Apply all version-guarded writes atomically; conflicts never commit a partial transaction. */
   async transact(writes: Write[]) {
     if (!writes.length) return;
     try {
@@ -79,6 +81,7 @@ export class DynamoStore implements Store {
       throw error;
     }
   }
+  /** Return up to 50 rows and a cursor bound to this partition; reject cross-partition cursors. */
   async list(pk: string, cursor?: string) {
     let key: { pk: string; sk: string } | undefined;
     if (cursor) {
@@ -114,9 +117,11 @@ export class MemoryStore implements Store {
   readonly provider = "memory";
   readonly capabilities = requiredCapabilities;
   private rows = new Map<string, Row>();
+  /** Read one row; absence returns undefined. Durable reads use ConsistentRead. */
   async get(pk: string, sk: string) {
     return structuredClone(this.rows.get(JSON.stringify([pk, sk])));
   }
+  /** Apply all version-guarded writes atomically; conflicts never commit a partial transaction. */
   async transact(writes: Write[]) {
     const keys = new Set<string>();
     for (const w of writes) {
@@ -133,6 +138,7 @@ export class MemoryStore implements Store {
       else this.rows.set(key, structuredClone(w.row));
     }
   }
+  /** Return up to 50 rows and a cursor bound to this partition; reject cross-partition cursors. */
   async list(pk: string, cursor?: string) {
     let after = "";
     if (cursor) {

@@ -1,3 +1,7 @@
+import QueuePanel from '@gsalgadotoledo/rt-app-queue/admin';
+import FlagsPanel from '@gsalgadotoledo/rt-app-feature-flags/admin';
+import VisitsPanel from '@gsalgadotoledo/rt-app-visits/admin';
+import HealthPanel from '@gsalgadotoledo/rt-app-health/admin';
 import "@gsalgadotoledo/rt-app-admin-ui/themes.css";
 import {themes} from "@gsalgadotoledo/rt-app-admin-ui/themes";
 import SubscriptionsAdmin from '@gsalgadotoledo/rt-app-subscriptions/admin';
@@ -21,6 +25,10 @@ import "./style.css";
 const components: Record<string, React.ComponentType<any>> = {
   "aws-monitor": AwsMonitorPanel,
   observer: ObserverPanel,
+  "feature-flags": FlagsPanel,
+  visits: VisitsPanel,
+  health: HealthPanel,
+  queue: QueuePanel,
   subscriptions: SubscriptionsAdmin,
   content: ContentPanel,
   "auth-settings": AuthOverview,

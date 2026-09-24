@@ -56,9 +56,9 @@ export async function manifest(root,{noBuild=false,noMail=false,sharedMail,share
  for(const service of settings.services?.extra??[])services.push(bindPorts({...service,env:{...shared,...service.env}}));
  return {services};
 }
-export async function request(root,action,service) {
+export async function request(root,action,service,spec) {
  let registry;try{registry=JSON.parse(await readFile(join(root,'.rt-app/supervisor.json'),'utf8'));}catch{throw new Error('Supervisor is not running');}
- return new Promise((yes,no)=>{const socket=connect({host:'127.0.0.1',port:registry.port});let data='';socket.setTimeout(10000,()=>socket.destroy(new Error('Supervisor request timed out')));socket.once('connect',()=>socket.write(JSON.stringify({token:registry.token,action,service})+'\n'));socket.on('data',chunk=>{data+=chunk;if(data.length>4000000)return socket.destroy(new Error('Response too large'));if(data.includes('\n')){socket.end();try{const value=JSON.parse(data.trim());value.ok?yes(value.data):no(new Error(value.error));}catch(error){no(error);}}});socket.once('error',()=>no(new Error('Supervisor is not running or unavailable')));socket.once('end',()=>{if(!data.includes('\n'))no(new Error('Supervisor closed the connection'));});});
+ return new Promise((yes,no)=>{const socket=connect({host:'127.0.0.1',port:registry.port});let data='';socket.setTimeout(10000,()=>socket.destroy(new Error('Supervisor request timed out')));socket.once('connect',()=>socket.write(JSON.stringify({token:registry.token,action,service,spec})+'\n'));socket.on('data',chunk=>{data+=chunk;if(data.length>4000000)return socket.destroy(new Error('Response too large'));if(data.includes('\n')){socket.end();try{const value=JSON.parse(data.trim());value.ok?yes(value.data):no(new Error(value.error));}catch(error){no(error);}}});socket.once('error',()=>no(new Error('Supervisor is not running or unavailable')));socket.once('end',()=>{if(!data.includes('\n'))no(new Error('Supervisor closed the connection'));});});
 }
 export async function ensureDaemon(root,options={}) {
  root=resolve(root);

@@ -11,6 +11,7 @@ export class JwtTokens {
       throw new Error("JWT_SECRET must contain at least 32 bytes");
     this.key = new TextEncoder().encode(secret);
   }
+  /** Sign a 15-minute session; user.id becomes sub and tokenVersion enables server-side revocation. */
   async issue(user: { id: string; tokenVersion: number }) {
     return new SignJWT({ v: user.tokenVersion })
       .setProtectedHeader({ alg: "HS256", typ: "JWT" })
@@ -21,6 +22,7 @@ export class JwtTokens {
       .setExpirationTime("15m")
       .sign(this.key);
   }
+  /** Return {id, version}; malformed, expired or foreign-audience tokens always yield HTTP 401. */
   async verify(token: string) {
     try {
       const { payload } = await jwtVerify(token, this.key, {

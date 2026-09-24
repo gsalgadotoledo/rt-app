@@ -110,7 +110,7 @@ resource "aws_iam_policy" "runtime_boundary" {
         Condition = { StringEquals = { "aws:ResourceTag/Application" = local.names[each.key] } }
       },
       {
-        Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = "${local.arn}:logs:${var.region}:${local.account}:log-group:/aws/lambda/${local.names[each.key]}:*"
+        Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:FilterLogEvents"], Resource = ["${local.arn}:logs:${var.region}:${local.account}:log-group:/aws/lambda/${local.names[each.key]}:*", "${local.arn}:logs:${var.region}:${local.account}:log-group:/aws/lambda/${local.names[each.key]}/observer:*"]
       },
       {
         Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:TransactWriteItems"], Resource = "${local.arn}:dynamodb:${var.region}:${local.account}:table/${local.names[each.key]}-application"
@@ -192,7 +192,7 @@ resource "aws_iam_role_policy" "deploy" {
         Effect = "Allow", Action = ["secretsmanager:*"], Resource = "${local.arn}:secretsmanager:${var.region}:${local.account}:secret:${local.names[each.key]}/*"
       },
       {
-        Effect = "Allow", Action = ["logs:*"], Resource = "${local.arn}:logs:${var.region}:${local.account}:log-group:/aws/lambda/${local.names[each.key]}:*"
+        Effect = "Allow", Action = ["logs:*"], Resource = ["${local.arn}:logs:${var.region}:${local.account}:log-group:/aws/lambda/${local.names[each.key]}:*", "${local.arn}:logs:${var.region}:${local.account}:log-group:/aws/lambda/${local.names[each.key]}/observer:*"]
       },
       {
         Effect = "Allow", Action = ["apigateway:GET", "apigateway:POST", "apigateway:PUT", "apigateway:PATCH", "apigateway:DELETE"], Resource = "${local.arn}:apigateway:${var.region}::/*"

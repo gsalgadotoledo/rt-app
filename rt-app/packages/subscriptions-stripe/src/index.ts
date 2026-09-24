@@ -1,6 +1,9 @@
 import Stripe from "stripe";
 import { HttpError, type Actor } from "@gsalgadotoledo/rt-app-contracts";
-import type { BillingProvider, Plan } from "@gsalgadotoledo/rt-app-subscriptions";
+import type {
+  BillingProvider,
+  Plan,
+} from "@gsalgadotoledo/rt-app-subscriptions";
 export class StripeBilling implements BillingProvider {
   readonly mode = "stripe" as const;
   private stripe: Stripe;
@@ -15,6 +18,7 @@ export class StripeBilling implements BillingProvider {
       );
     this.stripe = new Stripe(secret, { maxNetworkRetries: 1, timeout: 10000 });
   }
+  /** Create a Stripe customer using the caller's stable idempotency key; return its provider ID. */
   async customer(user: Actor, key: string) {
     return (
       await this.stripe.customers.create(
@@ -23,6 +27,7 @@ export class StripeBilling implements BillingProvider {
       )
     ).id;
   }
+  /** Fetch a subscription and reject cross-customer access before reads or writes. */
   private async owned(customer: string, subscriptionId: string) {
     const subscription: any =
       await this.stripe.subscriptions.retrieve(subscriptionId);
@@ -30,6 +35,7 @@ export class StripeBilling implements BillingProvider {
       throw new HttpError(403, "Subscription owner mismatch");
     return subscription;
   }
+  /** Normalize current/legacy expanded invoice secrets; unexpanded invoices return null. */
   private secret(subscription: any) {
     const invoice = subscription.latest_invoice;
     return typeof invoice === "object"
@@ -38,6 +44,7 @@ export class StripeBilling implements BillingProvider {
           null)
       : null;
   }
+  /** Validate the remote price against local minor units, currency and licensed interval. */
   async validatePlan(plan: Plan, customer?: string): Promise<void> {
     if (!plan.stripePriceId)
       throw new HttpError(400, "This plan needs a Stripe price");
@@ -57,19 +64,29 @@ export class StripeBilling implements BillingProvider {
         400,
         "Stripe price must match the configured amount, currency and billing interval",
       );
-    if(plan.amount===0){
-      const record=customer?await this.stripe.customers.retrieve(customer):undefined;
-      if(!record||record.deleted||!record.invoice_settings.default_payment_method)
-        throw new HttpError(400,'Add a payment method before selecting a zero-price billing plan');
+    if (plan.amount === 0) {
+      const record = customer
+        ? await this.stripe.customers.retrieve(customer)
+        : undefined;
+      if (
+        !record ||
+        record.deleted ||
+        !record.invoice_settings.default_payment_method
+      )
+        throw new HttpError(
+          400,
+          "Add a payment method before selecting a zero-price billing plan",
+        );
     }
   }
+  /** Create/change one recurring item; incomplete payment never silently grants active access. */
   async change(
     customer: string,
     plan: Plan,
     subscriptionId: string | undefined,
     key: string,
   ) {
-    const price = {id:plan.stripePriceId!};
+    const price = { id: plan.stripePriceId! };
     if (subscriptionId) {
       const existing = await this.owned(customer, subscriptionId);
       if (["canceled", "incomplete_expired"].includes(existing.status))
@@ -113,6 +130,7 @@ export class StripeBilling implements BillingProvider {
       status: subscription.status,
     };
   }
+  /** Create a card SetupIntent; return only the ID and client secret needed by secure client fields. */
   async setup(customer: string, key: string) {
     const intent = await this.stripe.setupIntents.create(
       { customer, payment_method_types: ["card"], usage: "off_session" },
@@ -120,6 +138,7 @@ export class StripeBilling implements BillingProvider {
     );
     return { setupId: intent.id, clientSecret: intent.client_secret };
   }
+  /** Accept a succeeded, customer-owned SetupIntent; update defaults only after all ownership checks. */
   async setPaymentMethod(
     customer: string,
     setupId: string,
@@ -132,16 +151,19 @@ export class StripeBilling implements BillingProvider {
       typeof intent.payment_method !== "string"
     )
       throw new HttpError(400, "Complete payment-method verification first");
+    // Verify all ownership before making the first external mutation.
+    // A foreign subscription must not partially update this customer's settings.
+    if (subscriptionId) await this.owned(customer, subscriptionId);
     await this.stripe.customers.update(customer, {
       invoice_settings: { default_payment_method: intent.payment_method },
     });
     if (subscriptionId) {
-      await this.owned(customer, subscriptionId);
       await this.stripe.subscriptions.update(subscriptionId, {
         default_payment_method: intent.payment_method,
       });
     }
   }
+  /** Schedule end-of-period cancellation; preserve access until the provider period ends. */
   async cancel(customer: string, subscriptionId: string, key: string) {
     await this.owned(customer, subscriptionId);
     await this.stripe.subscriptions.update(
@@ -151,6 +173,7 @@ export class StripeBilling implements BillingProvider {
     );
     return { ok: true };
   }
+  /** Return bounded invoices/card summaries and currency-separated totals; partial marks more invoices. */
   async snapshot(customer: string, subscriptionId?: string) {
     const [invoices, methods] = await Promise.all([
       this.stripe.invoices.list({ customer, limit: 100 }),
@@ -203,6 +226,7 @@ export class StripeBilling implements BillingProvider {
       cancelAtPeriodEnd: subscription.cancel_at_period_end,
     };
   }
+  /** Verify the original webhook bytes/signature and extract only routing identity. */
   verify(raw: string, signature: string) {
     const event = this.stripe.webhooks.constructEvent(
       raw,
@@ -221,4 +245,4 @@ export class StripeBilling implements BillingProvider {
   }
 }
 
-export {StripeCatalog} from "./catalog.js";
+export { StripeCatalog } from "./catalog.js";

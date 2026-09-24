@@ -26,7 +26,11 @@
     "react-router-dom": "^7.18.4",
     "@gsalgadotoledo/rt-app-observer": "0.1.0-alpha.0",
     "@gsalgadotoledo/rt-app-subscriptions": "0.1.0-alpha.0",
-    "vite": "^7.0.0"
+    "vite": "^7.0.0",
+    "@gsalgadotoledo/rt-app-feature-flags": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-visits": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-health": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-queue": "0.1.0-alpha.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

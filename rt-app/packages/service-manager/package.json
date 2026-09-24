@@ -12,7 +12,7 @@
   "scripts": {
     "build": "tsc --noEmit && vite build",
     "build:native": "cargo build --release --manifest-path native/Cargo.toml",
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
     "test:native": "cargo test --manifest-path native/Cargo.toml",
     "package": "node scripts/package.mjs"
   },

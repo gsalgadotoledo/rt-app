@@ -11,6 +11,8 @@ export async function servicesCommand(root,args){
  const hub=new ServiceHub();await hub.initialize();await hub.select(root);
  let result;
  if(action==='ports'){const keys=id==='global'?['smtp','mail']:['api','admin','spa','ssr'];if(values.length!==keys.length)throw new Error(`Usage: services ports ${id} ${keys.join(' ')}`);const snapshot=await hub.snapshot();result=await hub.setPorts(id,{...(id==='global'?snapshot.globalPorts:snapshot.projectPorts),...Object.fromEntries(keys.map((k,i)=>[k,Number(values[i])]))});}
+ else if(action==='commands')result=await hub.commands();
+ else if(action==='run-command')result=await hub.runCommand(id);
  else if(action==='discover')result=await hub.discover();
  else if(action==='add-discovered')result=await hub.addDiscovered(id);
  else if(action==='catalog'){if(!id||id==='list')result=(await hub.snapshot()).catalog;else{result=await hub.catalogAction(id,values[0]);if(id==='add'){while(true){const item=(await hub.snapshot()).catalog.find(x=>x.id===values[0]);if(!item?.job||['ready','error'].includes(item.job.state)){result=item;break;}await new Promise(r=>setTimeout(r,500));}}}}

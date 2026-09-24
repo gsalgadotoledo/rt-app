@@ -16,7 +16,7 @@ Await logging in Lambda so delivery finishes before the invocation is frozen. Th
 
 ## Output adapters
 
-Each output implements `ObserverOutputHandler` with `id` and `write(event, signal)`. Each subscription accepts `enabled`, `levels`, `kinds`, `sources`, and `maxPerMinute`.
+Each output implements `ObserverOutputHandler` with `id` and `write(event, signal)`. Each subscription accepts `enabled`, `levels`, `kinds`, `sources`, `categories`, a synchronous `filter(event)` predicate, and `maxPerMinute`.
 
 ```ts
 import { Observer } from '@gsalgadotoledo/rt-app-observer';
@@ -31,7 +31,7 @@ const observer = new Observer([
 await observer.console.error('Import failed', { jobId: 'job-1' });
 ```
 
-`createApplication({ observerOutputs: [...] })` adds configured handlers to built-in storage and console. Supplying an empty array disables environment-configured external outputs. Standalone `Observer` controls the complete array.
+`createApplication({ observerOutputs: [...] })` now replaces the complete output list. Supplying `[]` disables all recording/delivery. Omit the option for the defaults: storage, console, and configured external outputs. If overriding, include an `ObserverStore` output explicitly to keep dashboard analytics. This is a change from alpha.0, where the option appended external outputs.
 
 Packages: `observer`, `observer-console`, `observer-email` (SES or local SMTP), `observer-cloudwatch`, `observer-sms` (SNS). All are under `rt-app/packages`.
 
@@ -53,9 +53,9 @@ OBSERVER_LOG_GROUP=/app/observer OBSERVER_LOG_STREAM=events npm run dev
 OBSERVER_SMS_TO=+15555550123 npm run dev
 ```
 
-Email and SMS environment defaults send errors only, at most one per minute **per process / Lambda execution environment**. These are suppression limits, not durable/global spending caps; suppressed events are not replayed. CloudWatch exports all kinds up to 600 events/minute per instance. Lambda stdout already reaches its standard CloudWatch group; the explicit handler is for a separate destination and would duplicate events if sent to the same stream.
+Email environment defaults send only errors in `payment`, `payments`, `purchase`, or `purchases`; SMS sends all errors. Both send at most one per minute **per process / Lambda execution environment**. These are suppression limits, not durable/global spending caps; suppressed events are not replayed. CloudWatch exports all kinds up to 600 events/minute per instance. Lambda stdout already reaches its standard CloudWatch group; the explicit handler is for a separate destination and would duplicate events if sent to the same stream.
 
-Grant SES `ses:SendEmail` for the verified sender, CloudWatch `logs:PutLogEvents` for the pre-created stream, and SNS `sns:Publish` for SMS using your cloud role. Current runtime SES permissions restrict the sender to `MAIL_FROM`; use that sender or update the policy. The default deployment does not enable SMS permissions or provision an extra observer log stream. AWS sandbox/verification requirements and messaging charges still apply. No external notifications are sent during local installation.
+Grant SES `ses:SendEmail` for the verified sender, CloudWatch `logs:PutLogEvents` for the pre-created stream, and SNS `sns:Publish` for SMS using your cloud role. Current runtime SES permissions restrict the sender to `MAIL_FROM`; use that sender or update the policy. The runtime Terraform now provisions a dedicated seven-day Observer group/stream and restricted read/write IAM permissions (including the bootstrap permission boundary). Apply both bootstrap and runtime changes when upgrading an existing deployment. SMS remains disabled by default. AWS sandbox/verification requirements and messaging charges still apply. No external notifications are sent during local installation.
 
 ## Storage and delivery limits
 
@@ -94,3 +94,50 @@ const recorded = await countView('Home page', {
 ```
 
 The browser helper returns a boolean and honors Do Not Track. It only sends allowlisted page paths (`pages` option); other paths become `/other`. Existing automatic SPA/SSR tracking uses this helper—do not add a second call for the same view.
+
+
+## Categories, correlation and search
+
+```ts
+await app.observer.error('Payment declined', {category: 'payments', orderId: 'order-42'});
+await app.observer.withContext({sessionId: 'opaque-random-correlation-id'}, async () => {
+  await app.observer.info('Checkout started', {category: 'purchases'});
+});
+```
+
+Every API request gets a server-generated `requestId`, propagated across async calls without mixing concurrent requests. Sessions are optional opaque correlation IDs supplied by trusted server code, never cookies or access tokens. `write(level, message, context, data)` is available for fully structured calls. Category defaults to `app` (HTTP events use `http` or `payments`).
+
+Admin → Observer → Logs searches by UTC day, level, category, request ID, session ID and text. The default includes info, warn and error. Reads are owner-only and paginated. Empty filtered pages can still have a Next cursor. Local JSON projects store logs in `observer.json` beside their application JSON file; the application database is untouched. Other NoSQL adapters use isolated `OBSERVER#` partitions. Old JSON logs remain in the former file; they are not migrated automatically.
+
+AWS Logs search reads the configured CloudWatch group directly; analytics continue using the NoSQL metrics snapshot. Delivery/read delays or suppression can make those two views differ. CloudWatch log search needs `logs:FilterLogEvents`. Outputs use awaited best-effort delivery, not a durable queue or guaranteed alerts.
+
+```ts
+const outputs = [{
+  handler: new EmailOutput('verified@example.com', 'ops@example.com'),
+  levels: ['error'], categories: ['payments', 'purchases'],
+  filter: event => event.data.retryable !== true,
+  maxPerMinute: 1,
+}];
+```
+
+Filters run in trusted JavaScript configuration, never as executable strings from the admin. Predicates receive sanitized copies. A throwing filter or failing output increments delivery health without failing the request. Filters and rate limits are independent per output. Filters must be fast and synchronous.
+
+## Output catalog
+
+| Package suffix | Class | Destination |
+| --- | --- | --- |
+| observer | ObserverStore | Dedicated local JSON / NoSQL analytics and search |
+| observer-console | ConsoleOutput | Structured stdout |
+| observer-cloudwatch | CloudWatchOutput / CloudWatchLogReader | AWS Logs export / admin search |
+| observer-email | EmailOutput / LocalEmailOutput | SES / local mail viewer |
+| observer-sms | SmsOutput | SNS SMS |
+| observer-slack | SlackOutput | Slack incoming webhook |
+| observer-datadog | DatadogOutput | Datadog HTTP logs intake |
+| observer-sentry | SentryOutput | Sentry message events (no automatic stack capture) |
+| observer-webhook | WebhookOutput | Custom HTTPS JSON receiver |
+
+All packages have the `@gsalgadotoledo/rt-app-` prefix. Remote transports never run in tests. Environment-enabled remote outputs are disabled during explicit local development; local email goes only to the loopback mail viewer. Custom outputs passed in code are explicit overrides and can send remotely.
+
+Set server-side variables to opt in: `OBSERVER_SLACK_WEBHOOK`, `OBSERVER_DATADOG_API_KEY` (optional `OBSERVER_DATADOG_SITE`), or `OBSERVER_SENTRY_DSN`. Leave them unset to disable. Configure generic webhooks in code. No real recipient is assumed: email requires `OBSERVER_EMAIL_TO`; production SES also requires the verified `OBSERVER_EMAIL_FROM`.
+
+Provider contracts: [Slack webhooks](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/), [Datadog logs](https://docs.datadoghq.com/api/latest/logs/), [Sentry envelopes](https://develop.sentry.dev/sdk/data-model/envelopes/), [CloudWatch search](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_FilterLogEvents.html).

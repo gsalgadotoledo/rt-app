@@ -38,6 +38,8 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('projects:create',(event,spec)=>{trusted(event);return wizard.create(spec);});
    ipcMain.handle('services:copy-text',(event,text)=>{trusted(event);if(typeof text!=='string')throw new Error('Invalid output');clipboard.writeText(text);});
    ipcMain.handle('projects:open-location',async(event,target,path)=>{trusted(event);return openProjectLocation({target,path,registry:hub.registry,shell});});
+   ipcMain.handle('services:commands',event=>{trusted(event);return hub.commands();});
+   ipcMain.handle('services:run-command',(event,id)=>{trusted(event);return hub.runCommand(id);});
    ipcMain.handle('services:status',event=>{trusted(event);return hub.snapshot();});
    ipcMain.handle('services:logs',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid service');return hub.logs(id);});
    ipcMain.handle('services:action',(event,action,id)=>{trusted(event);if(!['start','stop','restart'].includes(action)||typeof id!=='string')throw new Error('Invalid action');return hub.action(action,id);});

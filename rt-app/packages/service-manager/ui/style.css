@@ -115,3 +115,13 @@
 @media(max-width:640px){.rt-theme-grid{grid-template-columns:1fr}.rt-theme-preview{min-height:150px}}
 .rt-services .rt-theme-gallery>header{display:block;margin:0;padding:0;border:0}
 .rt-services .rt-theme-gallery>header h2{margin:8px 0}
+
+/* Command discovery is independent from the managed development process. */
+.rt-command-catalog p,.rt-command-row small{color:var(--muted);font-size:12px}
+.rt-command-row{display:grid;grid-template-columns:minmax(120px,1fr) minmax(100px,160px) minmax(100px,2fr) auto;gap:16px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
+.rt-command-row small{display:block;margin-top:4px}
+.rt-command-row label{display:grid;gap:4px;font-size:11px}
+.rt-command-row code{overflow-wrap:anywhere;white-space:pre-wrap;font-size:12px}
+@media(max-width:900px){.rt-command-row{grid-template-columns:1fr 1fr}.rt-command-row code{grid-column:1}.rt-command-row button{justify-self:end}}
+
+.rt-command-row select{font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--line);padding:6px;max-width:100%}
