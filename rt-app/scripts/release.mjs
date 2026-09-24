@@ -44,6 +44,7 @@ if(action==='pack'){
   // The public initializer (npm create @gsalgadotoledo/rt-app) from its packed tarball.
   run(process.execPath,[join(temp,'node_modules/@gsalgadotoledo/create-rt-app/bin/create-rt-app.mjs'),'cli-app','--no-install','--no-git'],{cwd:temp});
   if(!existsSync(join(temp,'cli-app','apps/server/src/data-application.ts')))throw Error('Initializer did not create the starter');
+  for(const app of ['smoke-app','cli-app']){const ignore=readFileSync(join(temp,app,'.gitignore'),'utf8');if(!/^node_modules\/?$/m.test(ignore)||!/^\.rt-app\/?$/m.test(ignore))throw Error(app+': .gitignore must ignore node_modules and .rt-app');}
   run('npm',['run','build'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
   run(process.execPath,[join(root,'rt-app/scripts/smoke-admin.mjs'),join(temp,'smoke-app')],{maxBuffer:20*1024*1024});
   run('npm',['test','--workspaces','--if-present'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});

@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-migrations",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -20,14 +20,14 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-contracts": "0.2.0",
-    "@gsalgadotoledo/rt-app-nosql": "0.2.0",
+    "@gsalgadotoledo/rt-app-contracts": "0.2.1",
+    "@gsalgadotoledo/rt-app-nosql": "0.2.1",
     "umzug": "3.8.3"
   },
   "devDependencies": {
     "@faker-js/faker": "10.6.0",
-    "@gsalgadotoledo/rt-app-dynamodb": "0.2.0",
-    "@gsalgadotoledo/rt-app-json": "0.2.0",
+    "@gsalgadotoledo/rt-app-dynamodb": "0.2.1",
+    "@gsalgadotoledo/rt-app-json": "0.2.1",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.2"
   },

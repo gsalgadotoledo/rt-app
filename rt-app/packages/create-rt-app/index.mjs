@@ -40,7 +40,8 @@ export function parseArgs(argv) {
  * Returns false (and leaves the files untouched) when git is missing or has no identity.
  */
 export function initGit(path, run = spawnSync) {
-  const git = (...args) => run("git", args, { cwd: path, encoding: "utf8" });
+  // Output is discarded: a large first commit must not overflow a buffer and look like a failure.
+  const git = (...args) => run("git", args, { cwd: path, stdio: "ignore" });
   if (git("--version").status !== 0) return false;
   if (git("init", "-b", "main").status !== 0) return false;
   git("add", "-A");

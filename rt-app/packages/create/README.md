@@ -28,7 +28,7 @@ Without a global link, run `node /absolute/path/to/rt-app/packages/create/bin/cr
 
 ```sh
 npm run generator:pack
-npx --yes --package ./.rt-app/npm/rt-app-create-0.2.0.tgz rt-app-create --list
+npx --yes --package ./.rt-app/npm/rt-app-create-0.2.1.tgz rt-app-create --list
 ```
 
 The tarball contains the sanitized starter and works without the original repository. No npm publication is performed. After publishing under a scope you own, the equivalent command is `npx @gsalgadotoledo/rt-app-create --workspace ... --name ...`. The core runtime has its own `npm run core:pack` command and `@gsalgadotoledo/rt-app-core` package.

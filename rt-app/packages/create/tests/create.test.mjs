@@ -12,6 +12,7 @@ test('all built-in templates generate independently without credentials, state o
   await assert.rejects(access(join(result.path,'rt-app')));await assert.rejects(access(join(result.path,'package-lock.json')));await assert.rejects(access(join(result.path,'.rt-app')));await assert.rejects(access(join(result.path,'node_modules')));await assert.rejects(access(join(result.path,'apps/ssr/.next')));
   for(const crud of item.crud??[])await access(join(result.path,'packages',crud.name,'src/schema.json'));
   assert.equal(await readFile(join(result.path,'TEMPLATE.md'),'utf8'),item.prompt);
+  assert.match(await readFile(join(result.path,'.gitignore'),'utf8'),/^node_modules\/$/m);await assert.rejects(access(join(result.path,'gitignore')));
   assert.match(await readFile(join(result.path,'CLAUDE.md'),'utf8'),/Read TEMPLATE.md first/);
   if(item.kind==='electron')await access(join(result.path,'apps/desktop/main.mjs'));
   if(item.kind==='mobile')await access(join(result.path,'apps/mobile/App.js'));

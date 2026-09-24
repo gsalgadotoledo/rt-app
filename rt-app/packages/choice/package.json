@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-choice",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -16,8 +16,8 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-contracts": "0.2.0",
-    "@gsalgadotoledo/rt-app-cache": "0.2.0"
+    "@gsalgadotoledo/rt-app-contracts": "0.2.1",
+    "@gsalgadotoledo/rt-app-cache": "0.2.1"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

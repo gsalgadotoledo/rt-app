@@ -38,7 +38,7 @@ export async function template(id){const result=(await templates()).find(t=>t.id
 export function projectName(name){if(typeof name!=='string'||name.length>48||! /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(name)||/^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/.test(name))throw new Error('Use a lowercase project name with letters, numbers and hyphens (max 48).');return name;}
 const ignored=new Set(['node_modules','.git','.rt-app','.next','.next-dev','.terraform','dist','build','bundle','target','release','starter','.venv','__pycache__','.DS_Store']);
 export async function copyStarter(source,destination, selectedRoots){
- const roots=selectedRoots??['apps','packages','infra','.github','.gitignore','.gitlab-ci.yml','package.json','main.js','main.d.ts','modules.json','rt-app.settings.json','README.md','CLAUDE.md','AGENTS.md'];
+ const roots=selectedRoots??['apps','packages','infra','.github','.gitignore','gitignore','.gitlab-ci.yml','package.json','main.js','main.d.ts','modules.json','rt-app.settings.json','README.md','CLAUDE.md','AGENTS.md'];
  async function copy(from,to){const st=await lstat(from);if(st.isSymbolicLink())throw new Error('Template contains a symbolic link: '+relative(source,from));if(st.isDirectory()){await mkdir(to,{recursive:true});for(const entry of await readdir(from)){if(ignored.has(entry)||entry.startsWith('.env')||/\.(tfstate|tfplan|plan|tgz|zip|sqlite|db|log|tsbuildinfo)(\.|$)/.test(entry))continue;if(entry.endsWith('.egg-info')||entry.endsWith('.pyc'))continue;await copy(join(from,entry),join(to,entry));}}else if(st.isFile()){await cp(from,to,{errorOnExist:true,force:false});}}
  for(const name of roots){try{await access(join(source,name));}catch(e){if(e.code==='ENOENT')continue;throw e;}await copy(join(source,name),join(destination,name));}
 }
@@ -56,6 +56,9 @@ export async function createProject({workspace,name,templateId='fullstack',backe
    const {downloadTemplate}=await import('giget');const cache=join(workspace,'.rt-template-'+randomUUID());
    try{await downloadTemplate(spec.source,{dir:cache,install:false});await copyStarter(cache,target);}finally{await rm(cache,{recursive:true,force:true});}
   }else await copyStarter(source??await starterRoot(),target);
+  // Published starters carry "gitignore" (npm strips .gitignore); every project gets a real one.
+  try{await rename(join(target,'gitignore'),join(target,'.gitignore'));}catch(e){if(e.code!=='ENOENT')throw e;}
+  await access(join(target,'.gitignore'));
   const read=async p=>JSON.parse(await readFile(join(target,p),'utf8'));const save=async(p,value)=>writeFile(join(target,p),JSON.stringify(value,null,2)+'\n');
   const pkg=await read('package.json');pkg.name=name;delete pkg.version;await save('package.json',pkg);
   for(const app of ['spa','ssr'])await save('apps/'+app+'/branding.json',{name});

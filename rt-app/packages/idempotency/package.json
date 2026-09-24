@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-idempotency",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -39,9 +39,9 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-core": "0.2.0",
-    "@gsalgadotoledo/rt-app-nosql": "0.2.0",
-    "@gsalgadotoledo/rt-app-contracts": "0.2.0"
+    "@gsalgadotoledo/rt-app-core": "0.2.1",
+    "@gsalgadotoledo/rt-app-nosql": "0.2.1",
+    "@gsalgadotoledo/rt-app-contracts": "0.2.1"
   },
   "license": "UNLICENSED",
   "publishConfig": {

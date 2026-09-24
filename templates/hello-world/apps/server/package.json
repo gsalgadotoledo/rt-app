@@ -19,17 +19,17 @@
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.700.0",
-    "@gsalgadotoledo/rt-app-auth": "0.2.0",
-    "@gsalgadotoledo/rt-app-config": "0.2.0",
-    "@gsalgadotoledo/rt-app-contracts": "0.2.0",
-    "@gsalgadotoledo/rt-app-deployments": "0.2.0",
-    "@gsalgadotoledo/rt-app-dynamodb": "0.2.0",
-    "@gsalgadotoledo/rt-app-framework": "0.2.0",
-    "@gsalgadotoledo/rt-app-json": "0.2.0",
-    "@gsalgadotoledo/rt-app-mail-local": "0.2.0",
-    "@gsalgadotoledo/rt-app-migrations": "0.2.0",
-    "@gsalgadotoledo/rt-app-myadmin": "0.2.0",
-    "@gsalgadotoledo/rt-app-postgres": "0.2.0"
+    "@gsalgadotoledo/rt-app-auth": "0.2.1",
+    "@gsalgadotoledo/rt-app-config": "0.2.1",
+    "@gsalgadotoledo/rt-app-contracts": "0.2.1",
+    "@gsalgadotoledo/rt-app-deployments": "0.2.1",
+    "@gsalgadotoledo/rt-app-dynamodb": "0.2.1",
+    "@gsalgadotoledo/rt-app-framework": "0.2.1",
+    "@gsalgadotoledo/rt-app-json": "0.2.1",
+    "@gsalgadotoledo/rt-app-mail-local": "0.2.1",
+    "@gsalgadotoledo/rt-app-migrations": "0.2.1",
+    "@gsalgadotoledo/rt-app-myadmin": "0.2.1",
+    "@gsalgadotoledo/rt-app-postgres": "0.2.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

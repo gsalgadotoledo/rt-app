@@ -8,7 +8,7 @@ import { moduleClient } from "@gsalgadotoledo/rt-app-cli/module-tools";
 const client = await moduleClient(
   process.env.RT_APP_PROJECT_ROOT ?? fileURLToPath(new URL("../../", import.meta.url)),
 );
-const server = new McpServer({ name: "rt-app-modules", version: "0.2.0" });
+const server = new McpServer({ name: "rt-app-modules", version: "0.2.1" });
 
 // Every enabled module contributes documented actions to this same catalog.
 for (const tool of client.tools) {
