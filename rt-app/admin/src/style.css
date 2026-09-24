@@ -135,3 +135,7 @@ body{background:var(--bg);color:var(--text)}
 .layout main .subscription-plan label{margin:0}
 .layout main .filters label{margin-block:8px}
 .layout main .currency-picker>span{font-weight:600;font-size:12px}.layout main .hint{font-weight:400;color:var(--muted)}
+
+/* Record-level actions sit at the trailing edge; destructive ones need an explicit confirmation. */
+.record-actions{align-items:center;gap:8px}
+.layout .record-actions button.danger{border-color:var(--danger);color:var(--danger)}

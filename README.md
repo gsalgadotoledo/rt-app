@@ -1,6 +1,6 @@
 # RT-App
 
-Backend modules, admin, CLI and app templates. npm scope: `@gsalgadotoledo`. Alpha: `0.1.0-alpha.0`. All rights reserved.
+Backend modules, admin, CLI and app templates. npm scope: `@gsalgadotoledo`. Alpha: `0.1.0`. All rights reserved.
 
 ```sh
 npm ci

@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-observer-sentry",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -16,7 +16,7 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-observer": "0.1.0-alpha.0"
+    "@gsalgadotoledo/rt-app-observer": "0.1.0"
   },
   "devDependencies": {
     "typescript": "^5.7.2",
@@ -25,7 +25,7 @@
   "license": "UNLICENSED",
   "publishConfig": {
     "access": "public",
-    "tag": "next"
+    "tag": "latest"
   },
   "repository": {
     "type": "git",

@@ -41,9 +41,21 @@ if(action==='pack'){
   run(process.execPath,['--input-type=module','-e',"const {createProject}=await import('@gsalgadotoledo/rt-app-create');await createProject({workspace:process.cwd(),name:'smoke-app',templateId:'admin-crm',install:false});"],{cwd:temp});
   run('npm',['install','--ignore-scripts','--no-audit','--no-fund',...manifest.map(p=>join(output,p.file))],{cwd:join(temp,'smoke-app')});
   if(existsSync(join(temp,'smoke-app','rt-app')))throw Error('Starter contains a source copy of the framework');
+  // The public initializer (npm create @gsalgadotoledo/rt-app) from its packed tarball.
+  run(process.execPath,[join(temp,'node_modules/@gsalgadotoledo/create-rt-app/bin/create-rt-app.mjs'),'cli-app','--no-install','--no-git'],{cwd:temp});
+  if(!existsSync(join(temp,'cli-app','apps/server/src/data-application.ts')))throw Error('Initializer did not create the starter');
   run('npm',['run','build'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
   run(process.execPath,[join(root,'rt-app/scripts/smoke-admin.mjs'),join(temp,'smoke-app')],{maxBuffer:20*1024*1024});
   run('npm',['test','--workspaces','--if-present'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
+  // Migrations and seeds end to end: packaged CLI, generated app, persistent JSON database.
+  const dataEnv={...process.env,RT_APP_MODE:'json',RT_APP_JSON_FILE:join(temp,'smoke-data/local.json'),DEMO_PASSWORD:'Smoke-demo-password-2026'};
+  const rta=args=>run(process.execPath,[join(temp,'smoke-app/node_modules/@gsalgadotoledo/rt-app-cli/bin/rta.mjs'),...args],{cwd:join(temp,'smoke-app'),env:dataEnv});
+  rta(['migrate','up']);rta(['seed']);
+  const status=args=>JSON.parse(run(process.execPath,[join(temp,'smoke-app/node_modules/@gsalgadotoledo/rt-app-cli/bin/rta.mjs'),...args],{cwd:join(temp,'smoke-app'),env:dataEnv}));
+  if(!status(['migrate','status','--json']).migrations.every(m=>m.state==='applied'))throw Error('Smoke migrations are not applied');
+  if(status(['migrate','up','--json']).applied.length)throw Error('Smoke migrations are not idempotent');
+  const seeds=status(['seed','status','--json']).seeds;
+  if(!seeds.some(s=>s.id==='users:demo-identities')||!seeds.every(s=>s.state==='applied'))throw Error('Smoke seeds did not run');
   run('npm',['run','lambda:build'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
   run(process.env.TF_CLI_PATH??'terraform',['-chdir=infra/aws','init','-backend=false','-input=false'],{cwd:join(temp,'smoke-app'),maxBuffer:20*1024*1024});
   run(process.env.TF_CLI_PATH??'terraform',['-chdir=infra/aws','validate'],{cwd:join(temp,'smoke-app')});
@@ -68,6 +80,6 @@ if(action==='pack'){
     console.log('Already published: '+item.name);
     continue;
   }
-  execFileSync('npm',['publish',join(output,item.file),'--access','public','--tag','next','--ignore-scripts'],{cwd:root,stdio:'inherit'});
+  execFileSync('npm',['publish',join(output,item.file),'--access','public','--tag',item.version.includes('-')?'next':'latest','--ignore-scripts'],{cwd:root,stdio:'inherit'});
  }
 }else throw Error('Usage: node scripts/release.mjs pack|verify|publish');

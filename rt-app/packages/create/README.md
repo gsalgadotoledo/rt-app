@@ -1,4 +1,7 @@
-# RT-App project generator
+# @gsalgadotoledo/rt-app-create
+
+New projects: `npm create @gsalgadotoledo/rt-app my-app` (package `@gsalgadotoledo/create-rt-app`). This package is the generator library and templates used by that command, the Service Manager and `rt-app-create` (bin) for scripted use.
+
 
 The desktop wizard and CLI share this generator and `templates/catalog.json`.
 
@@ -13,8 +16,8 @@ npm link --workspace @gsalgadotoledo/rt-app-create --ignore-scripts
 From any directory:
 
 ```sh
-create-rt-app --workspace "$HOME/Projects" --name my-app --template fullstack
-create-rt-app --list
+rt-app-create --workspace "$HOME/Projects" --name my-app --template fullstack
+rt-app-create --list
 ```
 
 The global command is a symlink to the development source. If you switch Node installations with nvm, run the link command again for that Node installation. Remove only the link with `npm unlink --global @gsalgadotoledo/rt-app-create`.
@@ -25,7 +28,7 @@ Without a global link, run `node /absolute/path/to/rt-app/packages/create/bin/cr
 
 ```sh
 npm run generator:pack
-npx --yes --package ./.rt-app/npm/rt-app-create-0.1.0.tgz create-rt-app --list
+npx --yes --package ./.rt-app/npm/rt-app-create-0.1.0.tgz rt-app-create --list
 ```
 
 The tarball contains the sanitized starter and works without the original repository. No npm publication is performed. After publishing under a scope you own, the equivalent command is `npx @gsalgadotoledo/rt-app-create --workspace ... --name ...`. The core runtime has its own `npm run core:pack` command and `@gsalgadotoledo/rt-app-core` package.

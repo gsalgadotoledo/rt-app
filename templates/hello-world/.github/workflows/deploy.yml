@@ -88,7 +88,12 @@ jobs:
           terraform -chdir=infra/aws plan -input=false -out="$RUNNER_TEMP/deploy.tfplan"
       - name: Apply saved plan
         run: terraform -chdir=infra/aws apply -input=false "$RUNNER_TEMP/deploy.tfplan"
-      - name: Migrate and publish admin, SPA and SSR
+      - name: Migrate, seed and publish admin, SPA and SSR
+        env:
+          # Optional: repository variable RT_APP_SEED_ENABLED=true and secret DEMO_PASSWORD.
+          # Only seeds declared for this environment run; demo seeds never declare prod.
+          RT_APP_SEED: ${{ vars.RT_APP_SEED_ENABLED }}
+          DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
         run: |
           terraform -chdir=infra/aws output -json deployment > "$RUNNER_TEMP/outputs.json"
           npm exec -- rta deploy "$RUNNER_TEMP/outputs.json"

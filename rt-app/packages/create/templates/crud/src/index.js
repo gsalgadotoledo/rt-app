@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { HttpError, Conflict, schemaMigration, auditCreate, auditUpdate, auditDelete, auditRestore } from '@gsalgadotoledo/rt-app-contracts';
+import { HttpError, Conflict, auditCreate, auditUpdate, auditDelete, auditRestore } from '@gsalgadotoledo/rt-app-contracts';
 import schema from './schema.json' with {type:'json'};
 import { search } from './search.js';
 import { actions } from './actions.js';
+import { migrations } from './migrations.js';
+import { seeds } from './seeds.js';
 
 // This source belongs to your application. Extend validation, hooks and endpoints here.
 export default function feature(store) {
@@ -34,7 +36,8 @@ export default function feature(store) {
     resource:schema.name + '.' + action, access:'permission', explicitGrant:true, handle});
   return {
     id:schema.name,
-    migrations:[schemaMigration(schema.name)],
+    migrations,
+    seeds,
     admin:{id:schema.name, title:schema.title, group:'application', resource:schema.name+'.list',
       path:'/'+schema.name, component:schema.name, fields:['id',...schema.fields.map(f=>f.name),'version'],
       actions:['list','read','create','edit','delete','restore',...schema.actions]},

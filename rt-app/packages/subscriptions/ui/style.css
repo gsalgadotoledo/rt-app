@@ -19,3 +19,43 @@
 .subscriptions-admin .tabs{flex-wrap:wrap}
 .plan-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:12px}.plan-toolbar h2{margin:0}.subscription-plan small{display:block;color:var(--muted);font-size:12px;line-height:1.6;margin-top:5px}.plan-product{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;grid-column:1/-1;min-width:0;border:1px solid var(--line);padding:16px}.plan-product input{min-width:0;width:100%}@media(max-width:640px){.plan-product{grid-template-columns:1fr}.subscriptions-admin .tabs{gap:4px}}
 .currency-picker{position:relative;min-width:0;display:flex;flex-direction:column;gap:6px}.currency-trigger{display:flex!important;justify-content:space-between;align-items:center;gap:10px;text-align:left;white-space:normal!important;width:100%}.currency-popup{position:absolute;z-index:30;top:100%;left:0;width:100%;min-width:min(280px,80vw);border:1px solid var(--line);background:var(--surface);padding:8px;box-shadow:0 8px 24px #0003}.currency-options{max-height:240px;overflow:auto;margin-top:6px}.currency-options button{display:flex;gap:10px;align-items:center;text-align:left;width:100%;border:0!important;background:transparent;white-space:normal!important}.currency-options button.highlighted,.currency-options button:hover{background:var(--hover)}.currency-options button[aria-selected=true]{color:var(--accent)}.currency-options button strong{min-width:3ch}.currency-options button span{flex:1}.currency-popup input{width:100%;min-width:0}
+
+/* Overview, credit statement and sandbox: theme tokens only. */
+.subscriptions-overview,.credit-statement,.credit-sandbox{display:grid;gap:16px}
+.overview-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+.overview-stats article{display:flex;flex-direction:column;gap:4px;padding:14px;border:1px solid var(--line);background:var(--surface);min-width:0}
+.overview-stats small{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.overview-stats strong{font-size:24px;line-height:1.2;overflow-wrap:anywhere}
+.overview-stats span{color:var(--muted);font-size:12px}
+.overview-split>div{display:flex;justify-content:space-between;gap:12px}
+.overview-split p{margin:0;display:flex;flex-direction:column}
+.overview-split p:last-child{text-align:right}
+.subscriptions-admin .positive{color:var(--accent)}
+.subscriptions-admin .negative{color:var(--danger)}
+.overview-chart-head{display:flex;justify-content:space-between;align-items:end;gap:12px;flex-wrap:wrap}
+.overview-chart-head h3{margin:0}
+.overview-chart{margin:0;border:1px solid var(--line);padding:12px;background:var(--surface)}
+.overview-chart svg{width:100%;height:auto;display:block}
+.overview-chart text{fill:var(--muted);font-size:10px}
+.overview-chart .grid{stroke:var(--line);stroke-width:1}
+.overview-chart .bar-new{fill:var(--accent)}
+.overview-chart .bar-canceled{fill:var(--danger)}
+.overview-chart .customers-line{fill:none;stroke:var(--text);stroke-width:2}
+.overview-chart .customers-dot{fill:var(--text)}
+.overview-chart figcaption{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:8px}
+.overview-chart .legend::before{content:"";display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px}
+.overview-chart .legend.customers::before{background:var(--text);height:2px;vertical-align:3px}
+.overview-chart .legend.new::before{background:var(--accent)}
+.overview-chart .legend.canceled::before{background:var(--danger)}
+.ledger-table td{vertical-align:top}
+.ledger-table .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.ledger-table small{color:var(--muted)}
+.ledger-table tr.pending td{opacity:.65;font-style:italic}
+.ledger-kind{display:inline-block;border:1px solid var(--line);padding:1px 6px;font-size:11px;white-space:nowrap}
+.ledger-kind.usage,.ledger-kind.expiry{color:var(--danger)}
+.ledger-kind.allowance,.ledger-kind.purchase,.ledger-kind.grant{color:var(--accent)}
+.credit-rates{border:1px solid var(--line);padding:14px;margin:16px 0;min-width:0}
+.credit-rates legend{font-weight:600;padding:0 6px}
+.credit-pack{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:12px}
+.credit-rates td input{min-width:70px;width:100%}
+.sandbox-actions{display:flex;gap:8px;flex-wrap:wrap;grid-column:1/-1}

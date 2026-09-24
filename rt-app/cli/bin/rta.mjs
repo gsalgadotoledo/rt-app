@@ -64,6 +64,9 @@ try {
   } else if(command==='module') {
     const {runModuleCommand}=await import('../module-tools.mjs');
     await runModuleCommand(args);
+  } else if(command==='migrate'||command==='seed') {
+    // Module migrations/seeds against the database selected by RT_APP_MODE (json, dynamodb-local or aws).
+    run(process.execPath,[join(root,`apps/server/dist/${command}.js`),...args]);
   } else if(command==='mcp') {
     run(process.execPath,[join(root,'apps/mcp/index.mjs')]);
   } else if(command==='cloud'||command==='aws-bootstrap') {
@@ -90,6 +93,8 @@ try {
   } else if(command==='tools') {
     console.log(JSON.stringify({name:'RT-App',tools:[
       {command:'rta create crud <name>',description:'Copy an editable CRUD package into packages/, register local/Lambda endpoints and admin UI. Explicit permissions; no public access.',options:['--fields name:string,price:number,active:boolean,notes:string?','--title Products','--actions publish,archive','--spec ./crud.json','--dry-run','--json']},
+      {command:'rta migrate [status|up|down]',description:'Show, apply or revert module migrations on the RT_APP_MODE database. down refuses irreversible migrations; one runner at a time',options:['--to <id>','--step <n>','--json']},
+      {command:'rta seed [status|run]',description:'Run module seeds allowed in this environment (demo seeds: local, develop, stage). Requires DEMO_PASSWORD; deployed environments also CONFIRM_DEMO_SEED=yes',options:['--module <id>','--rerun','--json']},
       {command:'rta module list',description:'Discover documented module actions. Invoke: rta module <name> @input.json'},
       {command:'rta mcp',description:'Start the project MCP stdio server; running API required'},
       {command:'rta desktop',description:'Open the local service manager desktop window'},
@@ -134,6 +139,6 @@ try {
   } else if(command==='desktop') {
     const {desktopCommand}=await import('@gsalgadotoledo/rt-app-service-manager/cli');
     await desktopCommand(root);
-  } else if(command==='help') console.log('RT-App CLI\n  rta build\n  rta check\n  rta admin\n  rta deploy <outputs.json>\n  rta module list\n  rta module <action> [@input.json]\n  rta mcp\n  rta cloud\n  rta aws-bootstrap\n  rta create crud <name> [--fields name:string] [--actions publish] [--spec file] [--dry-run] [--json]\n  rta dev [--no-build] [--no-mail]\n  rta mail [--install-only]\n  rta desktop\n  rta services <status|daemon|start|stop|restart|logs|shutdown> [service|all] [--json]\n  rta install [--multi-environment]\n  rta urls [--json]\n  rta workspaces [--json]\n  rta run <workspace> <script>\n  rta tools --json');
+  } else if(command==='help') console.log('RT-App CLI\n  rta build\n  rta check\n  rta admin\n  rta deploy <outputs.json>\n  rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]\n  rta seed [status|run] [--module <id>] [--rerun] [--json]\n  rta module list\n  rta module <action> [@input.json]\n  rta mcp\n  rta cloud\n  rta aws-bootstrap\n  rta create crud <name> [--fields name:string] [--actions publish] [--spec file] [--dry-run] [--json]\n  rta dev [--no-build] [--no-mail]\n  rta mail [--install-only]\n  rta desktop\n  rta services <status|daemon|start|stop|restart|logs|shutdown> [service|all] [--json]\n  rta install [--multi-environment]\n  rta urls [--json]\n  rta workspaces [--json]\n  rta run <workspace> <script>\n  rta tools --json');
   else throw new Error(`Unknown command: ${command}`);
 } catch(e){console.error(e.message);process.exitCode=1;}

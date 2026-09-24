@@ -1,10 +1,10 @@
 {
   "name": "@gsalgadotoledo/rt-app-create",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0",
   "type": "module",
   "description": "RT-App project templates and generator",
   "bin": {
-    "create-rt-app": "bin/create.mjs"
+    "rt-app-create": "bin/create.mjs"
   },
   "exports": {
     ".": "./index.mjs",
@@ -46,7 +46,7 @@
   "license": "UNLICENSED",
   "publishConfig": {
     "access": "public",
-    "tag": "next"
+    "tag": "latest"
   },
   "repository": {
     "type": "git",

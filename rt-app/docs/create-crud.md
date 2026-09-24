@@ -39,6 +39,8 @@ For an agent or a larger schema, use `rta create crud --spec ./products.json --j
 
 `packages/products/` contains its own backend, field schema, search implementation, custom-action handlers, React admin UI, README and colocated tests. Backend JavaScript is native ESM; admin UI is TSX. The files are copied from `rt-app/packages/create/templates/crud/`, and subsequent changes belong to your application. Edit those files directly; do not regenerate to change an existing module.
 
+Each generated package owns `src/migrations.js` and `src/seeds.js`: append migrations there (`rta migrate up`) and adjust the example records (`rta seed --module <name>`; local, develop and stage only). See [migrations.md](migrations.md).
+
 The command also updates `modules.json`, `packages/index.js` and `packages/admin.js`. The registries contain static imports, not runtime discovery. Keep the two generated registries intact. Local server, Lambda, migrations and installer use the same module factories with the selected database. The admin shell loads the application UI registry through Vite (`RT_APP_PROJECT_ROOT` can specify another application root); core does not depend on your module.
 
 After generating, install workspace links and commit the resulting lockfile along with the source. Restart local processes. For cloud, deploy through the existing build/migration pipeline.

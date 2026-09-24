@@ -12,6 +12,7 @@ export interface PanelProps {
 export function ResourcePanel({ api, manifest, user }: PanelProps) {
   const [detailTab,setDetailTab]=useState("edit");
   const [trash,setTrash]=useState(false);
+  const [confirmTrash,setConfirmTrash]=useState(false);
   const [items, setItems] = useState<any[]>([]),
     [filters, setFilters] = useState<Record<string, string>>({}),
     [cursor, setCursor] = useState<string>(),
@@ -93,9 +94,10 @@ export function ResourcePanel({ api, manifest, user }: PanelProps) {
       setBusy(false);
     }
   }
-  async function remove(item: any) {
-    if (!confirm("Move this record to trash?"))
+  async function remove(item: any, confirmed = false) {
+    if (!confirmed && !confirm("Move this record to trash?"))
       return;
+    setConfirmTrash(false);
     setBusy(true);
     try {
       await api(
@@ -130,13 +132,22 @@ export function ResourcePanel({ api, manifest, user }: PanelProps) {
       setBusy(false);
     }
   }
+  const detailTrash=mode==="edit"&&detailTab==="edit"&&selected&&!trash&&(tasks||allowed("users.delete"));
+  useEffect(()=>setConfirmTrash(false),[selected?.id,mode,detailTab]);
   return (
     <section>
       {mode!=="list"&&<nav className="admin-breadcrumb" aria-label="Record breadcrumb"><button onClick={()=>{setMode("list");void load();}}>{manifest.title}</button><span aria-hidden="true">/</span><span aria-current="page">{mode==="create"?"New record":selected?.name??selected?.title??selected?.id}</span></nav>}
+      {detailTrash ? <div className="record-list-summary record-actions">
+        {confirmTrash ? <>
+          <span className="badge">Move this record to trash?</span>
+          <button className="danger" disabled={busy} onClick={()=>void remove(selected,true)}>Confirm</button>
+          <button disabled={busy} onClick={()=>setConfirmTrash(false)}>Cancel</button>
+        </> : <button disabled={busy||(users&&(selected.role==="owner"||selected.id===user.id))} onClick={()=>setConfirmTrash(true)}>Move to trash</button>}
+      </div> : <>
       <div className="record-list-summary">
         <span className="badge">{items.length} on this page</span>
       </div>
-      {supportsTrash && <button className="trash-link" disabled={busy} onClick={()=>{const next=!trash;setTrash(next);setSelected(undefined);setMode("list");void load(undefined,next);}}>{trash?"← Active records":"Trash"}</button>}
+      {supportsTrash && <button className="trash-link" disabled={busy} onClick={()=>{const next=!trash;setTrash(next);setSelected(undefined);setMode("list");void load(undefined,next);}}>{trash?"← Active records":"Trash"}</button>}</>}
       <nav className="tabs">
         <button
           className={mode === "list" ? "active" : ""}
@@ -336,7 +347,6 @@ export function ResourcePanel({ api, manifest, user }: PanelProps) {
               Save
             </button>
           </fieldset></form>}
-          {detailTab==="edit"&&selected&&!trash&&(tasks||allowed("users.delete"))&&<button disabled={busy||(users&&(selected.role==="owner"||selected.id===user.id))} onClick={()=>void remove(selected)}>Move to trash</button>}
           {detailTab==="permissions"&&users &&
             selected &&
             user.role === "owner" &&

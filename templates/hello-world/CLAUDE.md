@@ -23,3 +23,4 @@
 - Read AGENTS.md and rt-app/AGENTS.md for formatting and module publication conventions.
 - Module actions: rta module list; rta module subscriptions_settings_get; rta module subscriptions_plan_archive @input.json. Payloads use params/query/body. Read the action descriptions before mutation.
 - MCP: node apps/mcp/index.mjs (stdio, start the API first). Set RT_APP_PROJECT_ROOT when launched outside this project; remote API uses RT_APP_API_URL and RT_APP_ADMIN_TOKEN.
+- Data changes: each module keeps `src/migrations.js` (append-only, `rta migrate up`) and `src/seeds.js` (example data, `rta seed`; never prod). See docs/migrations.md in @gsalgadotoledo/rt-app-framework.

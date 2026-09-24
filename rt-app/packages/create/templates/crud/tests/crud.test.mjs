@@ -30,3 +30,16 @@ test('CRUD validation, persistence and optimistic concurrency',async()=>{
   assert.equal(restored.createdBy,'test');
   assert.equal((await find('list').handle(context({}))).items.length,1);
 });
+
+test('module migrations and example seeds run through the shared runners',async()=>{
+  const {MigrationRunner,SeedRunner}=await import('@gsalgadotoledo/rt-app-migrations');
+  const store=new MemoryStore(),module=feature(store);
+  assert.deepEqual(await new MigrationRunner({store,features:[module]}).up(),[schema.name+':001']);
+  assert.deepEqual(await new SeedRunner({store,features:[module]}).run(),[schema.name+':examples']);
+  assert.deepEqual(await new SeedRunner({store,features:[module]}).run({rerun:true}),[schema.name+':examples']);
+  const list=module.endpoints.find(e=>e.resource===schema.name+'.list');
+  const {items}=await list.handle({request:{body:{},query:{}},params:{},actor:{id:'test'}});
+  assert.equal(items.length,12,'seeds are idempotent');
+  for(const field of schema.fields)assert.equal(typeof items[0][field.name],field.type);
+  assert.deepEqual(await new SeedRunner({store,features:[module],environment:'prod'}).run(),[],'never in production');
+});

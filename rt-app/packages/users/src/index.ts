@@ -1,5 +1,7 @@
 import type { NoSQL as Store } from "@gsalgadotoledo/rt-app-nosql";
 import { migrations } from "./migrations.js";
+import { seeds, DEMO_USERS } from "./seeds.js";
+export { DEMO_USERS };
 import admin from "./admin.json" with { type: "json" };
 import {
   randomUUID,
@@ -68,6 +70,12 @@ export class Users {
     const index = await this.store.get("EMAIL", email);
     return index ? this.get(index.data.id) : undefined;
   }
+  /** Demo identities that exist in this store, in declaration order. */
+  async demoUsers() {
+    const rows = await Promise.all(DEMO_USERS.map((user) => this.byEmail(user.email)));
+    return rows.filter((row): row is Row => Boolean(row));
+  }
+
   async bootstrapOwner(input: Data) {
     if ((await this.store.list("USERS")).items.length)
       throw new HttpError(409, "The application already has users");
@@ -162,6 +170,7 @@ export class Users {
     return {
       id: "users",
       migrations,
+      seeds: seeds(this),
       admin: admin,
       endpoints: [
         {

@@ -116,10 +116,16 @@ import {
   type Feature,
   type Endpoint,
   type Request,
+  type Environment,
   HttpError,
-  migrate,
 } from "@gsalgadotoledo/rt-app-contracts";
-import { Users } from "@gsalgadotoledo/rt-app-users";
+import {
+  MigrationRunner,
+  SeedRunner,
+  ENVIRONMENTS,
+  type RunnerOptions,
+} from "@gsalgadotoledo/rt-app-migrations";
+import { Users, DEMO_USERS } from "@gsalgadotoledo/rt-app-users";
 import { Auth, type Mailer, SesMailer } from "@gsalgadotoledo/rt-app-auth";
 import { JwtTokens } from "@gsalgadotoledo/rt-app-jwt";
 import { ACL } from "@gsalgadotoledo/rt-app-acl";
@@ -149,7 +155,14 @@ export function createApplication(options: {
   infraDriver?: InfraDriver;
   managedByTerraform?: boolean;
   awsConnected?: boolean;
+  /** Selects which seeds may run. Defaults to RT_APP_ENVIRONMENT, then "local". */
+  environment?: Environment;
 }) {
+  const environment = (options.environment ??
+    process.env.RT_APP_ENVIRONMENT ??
+    "local") as Environment;
+  if (!ENVIRONMENTS.includes(environment))
+    throw new Error("Unknown RT_APP_ENVIRONMENT: " + environment);
   const billingMode =
     process.env.SUBSCRIPTIONS_PROVIDER ??
     (options.localAdminAccess ? "local" : "none");
@@ -467,11 +480,31 @@ export function createApplication(options: {
     users,
     auth,
     admin,
-    migrate: async () => {
-      await migrate(options.store, features);
-    },
+    environment,
+    /** Migration runner over every enabled module: status, up and down. */
+    migrations: (runner: MigrationRunnerOptions = {}) =>
+      new MigrationRunner({
+        environment,
+        ...runner,
+        store: options.store,
+        features,
+      }),
+    /** Apply all pending module migrations. Safe to call on every deployment. */
+    migrate: async () =>
+      new MigrationRunner({ environment, store: options.store, features }).up(),
+    /** Seed runner over every enabled module; users is shared with seeds of other modules. */
+    seeds: (runner: MigrationRunnerOptions = {}) =>
+      new SeedRunner({
+        environment,
+        ...runner,
+        services: { users, ...runner.services },
+        store: options.store,
+        features,
+      }),
   };
 }
+
+export type MigrationRunnerOptions = Omit<RunnerOptions, "store" | "features">;
 export type ComponentOptions = Pick<
   Parameters<typeof createApplication>[0],
   | "choiceProvider"
@@ -512,6 +545,8 @@ export function createProductionApplication(
     modules,
     managedByTerraform: true,
     awsConnected: true,
+    // Unset in a deployed process means production: demo seeds stay disabled.
+    environment: (process.env.RT_APP_ENVIRONMENT ?? "prod") as Environment,
     adminPasswordVerifier: process.env.ADMIN_PASSWORD_VERIFIER,
     store: new NoSQLRegistry()
       .register(
@@ -533,41 +568,16 @@ export function createProductionApplication(
     tasks: process.env.ENABLE_TASKS !== "false",
   });
 }
+/**
+ * Run every module seed allowed in the application's environment with DEMO_PASSWORD.
+ * Seeds are idempotent and forced to re-run, preserving existing passwords. Returns demo emails.
+ */
 export async function seedDemo(
   app: ReturnType<typeof createApplication>,
   password: string,
 ) {
-  const definitions = [
-    { email: "owner@example.test", name: "Owner", role: "owner" as const },
-    { email: "ana@example.test", name: "Ana", role: "user" as const },
-    { email: "leo@example.test", name: "Leo", role: "user" as const },
-  ];
-  for (const def of definitions) {
-    let user = await app.users.byEmail(def.email);
-    if (!user) user = await app.users.create({ ...def, password }, def.role);
-    if (app.features.some((f) => f.id === "tasks")) {
-      const id = `welcome-${user.data.id}`;
-      if (!(await app.users.store.get("TASKS", id)))
-        await app.users.store.transact([
-          {
-            row: {
-              pk: "TASKS",
-              sk: id,
-              version: 1,
-              data: {
-                id,
-                title: "Explore my first task in RT-App",
-                done: false,
-                ownerId: user.data.id,
-                createdAt: new Date().toISOString(),
-              },
-            },
-            expected: null,
-          },
-        ]);
-    }
-  }
-  return definitions.map((d) => d.email);
+  await app.seeds({ secrets: { DEMO_PASSWORD: password } }).run({ rerun: true });
+  return DEMO_USERS.map((user) => user.email);
 }
 
 /** Load once per Lambda environment; no plaintext secret in Terraform state or function configuration. */

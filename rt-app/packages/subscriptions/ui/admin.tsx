@@ -2,10 +2,13 @@ import {CurrencyPicker} from './currency.js';
 import {formatMoney, majorAmount, currencyDecimals, currencyStep} from '@gsalgadotoledo/rt-app-subscriptions/currency';
 import "./style.css";
 import {PlansEditor} from "./plans.js";
+import {SubscriptionsOverview} from "./overview.js";
+import {CreditStatement, CreditRatesEditor, CreditSandbox} from "./credits.js";
 import React, { useEffect, useRef, useState } from "react";
 import type { Api } from "@gsalgadotoledo/rt-app-admin-ui";
 export default function SubscriptionsAdmin({ api }: { api: Api }) {
-  const [tab, setTab] = useState("accounts"),
+  const [tab, setTab] = useState("overview"),
+    [detailTab, setDetailTab] = useState("balance"),
     [settings, setSettings] = useState<any>(),
     [accounts, setAccounts] = useState<any>({ items: [] }),
     [detail, setDetail] = useState<any>(),
@@ -50,6 +53,8 @@ export default function SubscriptionsAdmin({ api }: { api: Api }) {
   async function open(userId: string) {
     setDetail(await api(path + "/accounts/" + encodeURIComponent(userId)));
   }
+  // Products across all plans, for credit forms and the sandbox.
+  const products = [...new Map((settings?.values.plans ?? []).flatMap((p: any) => p.products).map((p: any) => [p.id, p])).values()] as any[];
   function changePlan(index: number, field: string, value: any) {
     setSettings((s: any) => ({
       ...s,
@@ -64,7 +69,7 @@ export default function SubscriptionsAdmin({ api }: { api: Api }) {
   return (
     <section className="subscriptions-admin">
       <nav className="tabs">
-        {["accounts", "plans", "settings"].map((t) => (
+        {["overview", "accounts", "plans", "settings"].map((t) => (
           <button
             key={t.charAt(0).toUpperCase()+t.slice(1)}
             className={tab === t ? "active" : ""}
@@ -79,11 +84,19 @@ export default function SubscriptionsAdmin({ api }: { api: Api }) {
       </nav>
       {error && <p role="alert">{error}</p>}
       {message && <p role="status">{message}</p>}
+      {tab === "overview" && <SubscriptionsOverview api={api} />}
       {tab === "accounts" &&
         (detail ? (
           <>
             <button onClick={() => setDetail(undefined)}>← Users</button>
             <h2>{detail.account.email ?? detail.account.userId}</h2>
+            <nav className="tabs">
+              {[["balance", "Balance"], ["account", "Account"]].map(([id, label]) => (
+                <button key={id} className={detailTab === id ? "active" : ""} onClick={() => setDetailTab(id)}>{label}</button>
+              ))}
+            </nav>
+            {detailTab === "balance" && <CreditStatement api={api} userId={detail.account.userId} products={products} onChange={() => void load()} />}
+            {detailTab === "account" && <>
             <p>
               {detail.account.plan?.name} · {detail.account.status} · Credits
               used: {detail.account.totalConsumed ?? 0}
@@ -209,6 +222,7 @@ export default function SubscriptionsAdmin({ api }: { api: Api }) {
                 Next usage page
               </button>
             )}
+            </>}
           </>
         ) : (
           <>
@@ -224,7 +238,7 @@ export default function SubscriptionsAdmin({ api }: { api: Api }) {
                   <th>User</th>
                   <th>Plan</th>
                   <th>Status</th>
-                  <th>Credits used</th>
+                  <th>Credits used / available</th>
                   <th>Courtesy resets</th>
                 </tr>
               </thead>
@@ -232,13 +246,13 @@ export default function SubscriptionsAdmin({ api }: { api: Api }) {
                 {accounts.items.map((a: any) => (
                   <tr key={a.userId}>
                     <td>
-                      <button onClick={() => void action(() => open(a.userId))}>
+                      <button onClick={() => void action(async () => { setDetailTab("balance"); await open(a.userId); })}>
                         {a.email ?? a.userId}
                       </button>
                     </td>
                     <td>{a.plan ?? "No plan"}{a.source === "admin" && <small> · Admin assigned</small>}</td>
                     <td>{a.status ?? "none"}</td>
-                    <td>{a.totalConsumed}</td>
+                    <td>{a.totalConsumed} / {a.creditsAvailable}</td>
                     <td>{a.courtesyResets}</td>
                   </tr>
                 ))}
@@ -309,12 +323,16 @@ export default function SubscriptionsAdmin({ api }: { api: Api }) {
               </label>
             </>
           ) : null}
-
+          <CreditRatesEditor
+            credits={settings.values.credits}
+            onChange={(credits) => setSettings({ ...settings, values: { ...settings.values, credits } })}
+          />
           <button className="primary" disabled={busy}>
             Save configuration
           </button>
         </form>
       )}
+      {settings && tab === "settings" && <CreditSandbox api={api} rates={settings.values.credits.rates} products={products} />}
       {settings && tab === "plans" && <PlansEditor settings={settings} setSettings={setSettings} api={api} busy={busy} onAction={action} />}
     </section>
   );
@@ -340,7 +358,7 @@ function AdminGrant({plans, busy, onGrant}: {plans: any[]; busy: boolean; onGran
     <label>Recorded value (not a charge)<input required type="number" min={0} max={10000000} step={currencyStep(currency)} value={value} onChange={e => setValue(e.target.value)} /></label>
     <CurrencyPicker value={currency} onChange={setCurrency}/>
     <label>Reason<input required maxLength={300} value={reason} onChange={e => setReason(e.target.value)} /></label>
-    <p>{kind === "plan" ? `Valid for ${plans.find(p => p.id === target)?.periodDays ?? 0} days. Replaces the current administrative assignment; existing Stripe billing continues.` : `Additional credits do not expire. Active plan and daily/weekly limits still apply. Value per credit: ${(Number(value) / (credits || 1)).toFixed(4)} ${currency.toUpperCase()}.`} No currency conversion is performed.</p>
+    <p>{kind === "plan" ? `Valid for ${plans.find(p => p.id === target)?.periodDays ?? 0} days. Replaces the current administrative assignment; existing Stripe billing continues.` : `Additional credits do not expire and are used after the weekly plan allowance; an active plan is still required. Value per credit: ${(Number(value) / (credits || 1)).toFixed(4)} ${currency.toUpperCase()}.`} No currency conversion is performed.</p>
     <button disabled={busy || !target || !reason.trim()}>Assign {kind === "plan" ? "plan" : "credits"}</button>
   </form>;
 }

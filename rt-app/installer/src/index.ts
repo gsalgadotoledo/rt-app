@@ -90,6 +90,8 @@ export async function inspectInstallation(config: InstallationConfig) {
 export interface InstallHost {
   applicationModules?(): Promise<string[]>;
   migrateApplication?(modules?: string[]): Promise<void>;
+  /** Run module seeds allowed in RT_APP_ENVIRONMENT. Called only when RT_APP_SEED=true. */
+  seedApplication?(secrets: Record<string, string | undefined>, modules?: string[]): Promise<string[]>;
   run(
     command: "npm" | "terraform",
     args: string[],
@@ -109,6 +111,26 @@ export interface InstallHost {
   save(result: object): Promise<void>;
   progress(message: string): void;
 }
+/**
+ * Opt-in seeding after migrations (repository variable RT_APP_SEED_ENABLED → RT_APP_SEED=true).
+ * Only seeds declared for this environment run; secrets are passed through, never logged.
+ * Returns the seed ids that ran, or [] when seeding is disabled.
+ */
+export async function seedEnvironment(
+  host: Pick<InstallHost, "seedApplication" | "progress">,
+  environment: "develop" | "stage" | "prod",
+  env: NodeJS.ProcessEnv,
+  modules?: string[],
+) {
+  if (env.RT_APP_SEED !== "true") return [];
+  if (!host.seedApplication)
+    throw new Error("RT_APP_SEED=true requires a host that can seed the application");
+  host.progress(environment + ": seeding");
+  const seeded = await host.seedApplication({ DEMO_PASSWORD: env.DEMO_PASSWORD }, modules);
+  host.progress(environment + ": seeded " + (seeded.length ? seeded.join(", ") : "nothing new"));
+  return seeded;
+}
+
 export async function publishEnvironment(
   config: InstallationConfig,
   environment: "develop" | "stage" | "prod",
@@ -193,9 +215,12 @@ export async function publishEnvironment(
     AWS_CREDENTIALS_SECRET_ARN: outputs.AwsCredentialsSecretArn,
     NOSQL_PROVIDER: "dynamodb",
     INFRA_PROVIDER: "aws",
+    // Seeds decide where they may run from this value; demo seeds never list prod.
+    RT_APP_ENVIRONMENT: environment,
   });
   if (host.migrateApplication) await host.migrateApplication(modules);
   else await createProductionApplication(modules).migrate();
+  await seedEnvironment(host, environment, env, modules);
   delete process.env.JWT_SECRET;
   delete process.env.ADMIN_PASSWORD_VERIFIER;
   const shared = environmentVariables(publicConfig({

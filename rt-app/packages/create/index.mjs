@@ -40,7 +40,7 @@ export async function createProject({workspace,name,templateId='fullstack',backe
   for(const crud of spec.crud??[])await generator.generate(target,crud);
   if(spec.kind==='electron'){
    const dir=join(target,'apps/desktop');await mkdir(dir,{recursive:true});
-   await save('apps/desktop/package.json',{name:'@app/desktop',private:true,type:'module',scripts:{dev:'electron .'},main:'main.mjs',dependencies:{electron:'44.4.4','@gsalgadotoledo/rt-app-config':'0.1.0-alpha.0'}});
+   await save('apps/desktop/package.json',{name:'@app/desktop',private:true,type:'module',scripts:{dev:'electron .'},main:'main.mjs',dependencies:{electron:'44.4.4','@gsalgadotoledo/rt-app-config':'0.1.0'}});
    await writeFile(join(dir,'main.mjs'),`import {app,BrowserWindow} from 'electron';\nimport {publicConfig} from '@gsalgadotoledo/rt-app-config';\nawait app.whenReady();\nconst window=new BrowserWindow({width:1100,height:760,webPreferences:{contextIsolation:true,nodeIntegration:false,sandbox:true}});\nwindow.webContents.setWindowOpenHandler(()=>({action:'deny'}));\nawait window.loadURL(publicConfig().urls.spa);\napp.on('window-all-closed',()=>app.quit());\n`);
    settings.services.extra.push({id:'desktop',label:'Electron app',command:['npm','run','dev','-w','@app/desktop'],cwd:'.',ports:[],dependencies:['spa']});
   }

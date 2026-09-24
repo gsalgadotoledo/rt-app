@@ -82,8 +82,9 @@ for (const multiEnvironment of [false,true]) test(`installer provisions ${multiE
   });
   t.mock.method(DynamoDBDocumentClient.prototype, "send", async (command) => {
     const input = command.input;
+    const first = input.TransactItems?.[0];
     const store = table(
-      input.TableName ?? input.TransactItems?.[0]?.Put.TableName,
+      input.TableName ?? (first?.Put ?? first?.Delete)?.TableName,
     );
     if (command.constructor.name === "GetCommand")
       return { Item: await store.get(input.Key.pk, input.Key.sk) };
@@ -93,10 +94,18 @@ for (const multiEnvironment of [false,true]) test(`installer provisions ${multiE
       };
     if (command.constructor.name === "TransactWriteCommand") {
       await store.transact(
-        input.TransactItems.map((item) => ({
-          row: item.Put.Item,
-          expected: item.Put.ExpressionAttributeValues?.[":v"] ?? null,
-        })),
+        input.TransactItems.map((item) =>
+          item.Delete
+            ? {
+                row: { ...item.Delete.Key, version: item.Delete.ExpressionAttributeValues?.[":v"], data: {} },
+                expected: item.Delete.ExpressionAttributeValues?.[":v"] ?? null,
+                delete: true,
+              }
+            : {
+                row: item.Put.Item,
+                expected: item.Put.ExpressionAttributeValues?.[":v"] ?? null,
+              },
+        ),
       );
       return {};
     }

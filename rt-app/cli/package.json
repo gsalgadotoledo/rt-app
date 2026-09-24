@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-cli",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -19,26 +19,26 @@
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-infra": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-users": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-infra": "0.1.0",
+    "@gsalgadotoledo/rt-app-users": "0.1.0",
     "@aws-sdk/client-cloudformation": "^3.700.0",
     "@aws-sdk/client-sts": "^3.700.0",
     "@aws-sdk/client-secrets-manager": "^3.700.0",
-    "@gsalgadotoledo/rt-app-framework": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-installer": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-myadmin": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-mail-local": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-config": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-service-manager": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-framework": "0.1.0",
+    "@gsalgadotoledo/rt-app-installer": "0.1.0",
+    "@gsalgadotoledo/rt-app-myadmin": "0.1.0",
+    "@gsalgadotoledo/rt-app-mail-local": "0.1.0",
+    "@gsalgadotoledo/rt-app-config": "0.1.0",
+    "@gsalgadotoledo/rt-app-service-manager": "0.1.0",
     "@aws-sdk/client-iam": "^3.700.0",
-    "@gsalgadotoledo/rt-app-create": "0.1.0-alpha.0"
+    "@gsalgadotoledo/rt-app-create": "0.1.0"
   },
   "devDependencies": {
     "typescript": "^5.7.2",
     "@types/node": "^22.0.0",
-    "@gsalgadotoledo/rt-app-json": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-dynamodb": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-auth": "0.1.0-alpha.0"
+    "@gsalgadotoledo/rt-app-json": "0.1.0",
+    "@gsalgadotoledo/rt-app-dynamodb": "0.1.0",
+    "@gsalgadotoledo/rt-app-auth": "0.1.0"
   },
   "bin": {
     "rta": "bin/rta.mjs",
@@ -47,7 +47,7 @@
   "license": "UNLICENSED",
   "publishConfig": {
     "access": "public",
-    "tag": "next"
+    "tag": "latest"
   },
   "repository": {
     "type": "git",

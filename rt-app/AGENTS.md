@@ -3,7 +3,8 @@
 ## Structure
 - packages/contracts defines Feature, Endpoint, Context, Actor, AdminManifest and ToolExposure.
 - A Feature declares id, endpoints, migrations and optional admin metadata. Module classes receive adapters through constructors; do not create a parallel runtime or require inheritance.
-- packages/nosql defines the storage interface; JsonStore and DynamoDB adapters implement it. Module migrations belong to their package.
+- packages/nosql defines the storage interface; JsonStore and DynamoDB adapters implement it.
+- Module migrations and seeds belong to their package (`src/migrations.ts|js`, `src/seeds.ts|js`) and are declared on the Feature. packages/migrations runs them through Umzug (`rta migrate`, `rta seed`). Append migrations with a new `module:NNN` id; never edit an applied one. Write through the store contract so steps run on every engine. Demo seeds never declare prod. Read docs/migrations.md.
 - core-ts exports createRTApp and RTAppManager for the component registry. RTAppModule requires init and optionally dispose; RTAppBaseModule is an optional abstract lifecycle base. RTAppModuleConfig declares dependsOn, bindings and preload. RTAppComponentModule.create creates per-view instances with dispose. Domain Feature modules use composition and do not have to extend this base. core-go and core-python follow their language's native composition conventions. Inspect their exported interfaces before adding providers.
 - admin hosts shared React UI. cli hosts command adapters. Application configuration stays in main.js and rt-app.settings.json.
 
@@ -14,7 +15,7 @@ Enabled modules register automatically in GET /admin/tools. The catalog is owner
 
 CLI/MCP require the running API. RT_APP_API_URL overrides the project's local API port; RT_APP_ADMIN_TOKEN authenticates remote admin calls. Remote URLs require HTTPS. Do not bypass the route ACL or create a second JSON database writer. Never print tokens. Keep stdout exclusively for MCP protocol; diagnostics go to stderr.
 
-Subscriptions expose settings, plan creation/update/archive/unarchive/version/history/restore/publication, account lookup/grants/resets, local simulation and maintenance. Products are entries in plan.products. Read settings first and pass its version on edits. Stripe publication is a separate explicit action. Keep monetary values in integer minor units and preserve history.
+Subscriptions keep a per-user credit statement (weekly plan allowance that expires, non-expiring additional credits, usage); log movements with `recordCredits` and model usage with `consumeUsage` (rates in settings). Read docs/subscriptions.md before changing consumption. Subscriptions expose settings, plan creation/update/archive/unarchive/version/history/restore/publication, account lookup/grants/resets, local simulation and maintenance. Products are entries in plan.products. Read settings first and pass its version on edits. Stripe publication is a separate explicit action. Keep monetary values in integer minor units and preserve history.
 
 ## Readability
 Separate methods/functions with a blank line. Add a short purpose comment to public operations and section comments for distinct responsibilities. Use multiline declarations for complex settings and handlers. Explain transactional boundaries and side effects. Avoid duplicated business logic in entry points, decorative comments and compressed multi-operation lines.

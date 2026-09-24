@@ -43,11 +43,14 @@
     "postcss": "8.5.28"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-cli": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-framework": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-core": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-myadmin": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-config": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-infra": "0.1.0-alpha.0"
+    "@gsalgadotoledo/rt-app-cli": "0.1.0",
+    "@gsalgadotoledo/rt-app-framework": "0.1.0",
+    "@gsalgadotoledo/rt-app-core": "0.1.0",
+    "@gsalgadotoledo/rt-app-myadmin": "0.1.0",
+    "@gsalgadotoledo/rt-app-config": "0.1.0",
+    "@gsalgadotoledo/rt-app-infra": "0.1.0"
+  },
+  "devDependencies": {
+    "@faker-js/faker": "10.6.0"
   }
 }

@@ -13,6 +13,10 @@ export const host: InstallHost = {
     const application = await import(pathToFileURL(resolve("main.js")).href);
     await application.createProductionApplication().migrate();
   },
+  async seedApplication(secrets) {
+    const application = await import(pathToFileURL(resolve("main.js")).href);
+    return application.createProductionApplication().seeds({ secrets }).run();
+  },
   async bindInstallation(identity) {
     await mkdir(".rt-app", { recursive: true, mode: 0o700 });
     const path = ".rt-app/identity.json";

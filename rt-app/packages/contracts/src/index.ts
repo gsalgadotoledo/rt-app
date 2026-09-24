@@ -73,20 +73,70 @@ export interface AdminManifest {
   fields: string[];
   actions: string[];
 }
-export interface Migration {
+/** Deployment stage a migration or seed runs in. `local` covers memory, JSON and DynamoDB Local. */
+export type Environment = "local" | "develop" | "stage" | "prod";
+
+/**
+ * Engine-agnostic helpers handed to every migration and seed.
+ * Write through `store` (the NoSQL contract), so the same step runs on DynamoDB, JSON or memory.
+ */
+export interface MigrationContext {
+  store: Store;
+  provider: string;
+  environment: Environment;
+  /** Insert rows that do not exist yet; existing rows are left untouched. Returns inserted keys. */
+  ensureRows(rows: Array<Pick<Row, "pk" | "sk" | "data"> & { ttl?: number }>): Promise<string[]>;
+  log(message: string): void;
+}
+
+export interface MigrationStep {
+  checksum: string;
+  up?(context: MigrationContext): Promise<void>;
+  down?(context: MigrationContext): Promise<void>;
+  /** @deprecated Use `up`. Kept for migrations written before 0.1.0. */
+  run?(store: Store): Promise<void>;
+}
+
+/**
+ * A module-owned, versioned change. `id` is permanent (`module:NNN`) and its checksum must never change
+ * once applied. `providers` overrides the generic steps for one storage engine only.
+ * @example { id: "catalog:002", checksum: "catalog-currency-v1", up: async ({ensureRows}) => { ... } }
+ */
+export interface Migration extends Partial<MigrationStep> {
   id: string;
   checksum: string;
-  run?(store: Store): Promise<void>;
-  providers?: Record<
-    string,
-    { checksum: string; run(store: Store): Promise<void> }
-  >;
+  description?: string;
+  providers?: Record<string, MigrationStep>;
 }
+
+export interface SeedContext extends MigrationContext {
+  /** Read a required secret such as DEMO_PASSWORD. Throws when it is missing; never logs the value. */
+  secret(name: string): string;
+  /** Services other modules share with seeds, e.g. `service("users")`. Throws when absent. */
+  service<T>(id: string): T;
+  /** Deterministic @faker-js/faker instance (optional peer dependency) seeded from the seed id. */
+  faker(): Promise<any>;
+}
+
+/**
+ * Example or reference data owned by a module. Seeds must be idempotent: they may run again when
+ * `version` changes or when forced. By default they never run in `prod`.
+ */
+export interface Seed {
+  id: string;
+  description?: string;
+  /** Bump to re-run a changed seed on environments that already applied it. Defaults to "1". */
+  version?: string;
+  environments?: Environment[];
+  run(context: SeedContext): Promise<void>;
+}
+
 export interface Feature {
   id: string;
   endpoints: Endpoint[];
   admin?: AdminManifest;
   migrations: Migration[];
+  seeds?: Seed[];
 }
 export const text = (value: unknown, field: string, max = 200): string => {
   if (typeof value !== "string" || !value.trim() || value.length > max)
@@ -130,8 +180,9 @@ export function filtered(
     ),
   );
 }
+/** First migration of every document module: records its schema version once. */
 export function schemaMigration(module: string): Migration {
-  const run = async (store: Store) => {
+  const up = async ({ store }: MigrationContext) => {
     const existing = await store.get("SCHEMA", module);
     if (existing) return;
     await store.transact([
@@ -146,59 +197,12 @@ export function schemaMigration(module: string): Migration {
       },
     ]);
   };
-  const implementation = { checksum: module + "-document-v1", run };
   return {
     id: module + ":001",
-    checksum: implementation.checksum,
-    providers: { dynamodb: implementation, memory: implementation, json: implementation },
+    checksum: module + "-document-v1",
+    description: "Register the " + module + " document schema",
+    up,
   };
-}
-export async function migrate(store: Store, features: Feature[]) {
-  // Validate the complete plan before writing anything.
-  const plan = features
-    .flatMap((f) => f.migrations)
-    .map((migration) => {
-      const implementation = migration.providers
-        ? migration.providers[store.provider]
-        : migration.run
-          ? { checksum: migration.checksum, run: migration.run }
-          : undefined;
-      if (!implementation)
-        throw new Error(
-          "Unsupported migration " + migration.id + " for " + store.provider,
-        );
-      return { migration, implementation };
-    });
-  if (new Set(plan.map((p) => p.migration.id)).size !== plan.length)
-    throw new Error("Duplicate migration id");
-  for (const { migration, implementation } of plan) {
-    const record = await store.get("MIGRATIONS", migration.id);
-    if (record) {
-      if (
-        record.data.checksum !== implementation.checksum ||
-        (record.data.provider && record.data.provider !== store.provider)
-      )
-        throw new Error(`Migration changed: ${migration.id}`);
-      continue;
-    }
-    // Migrations must be restartable/idempotent. Run this command as one deployment job.
-    await implementation.run(store);
-    await store.transact([
-      {
-        row: {
-          pk: "MIGRATIONS",
-          sk: migration.id,
-          version: 1,
-          data: {
-            checksum: implementation.checksum,
-            provider: store.provider,
-            appliedAt: new Date().toISOString(),
-          },
-        },
-        expected: null,
-      },
-    ]);
-  }
 }
 
 /** Search bounded pages, keeping the cursor when more data remains to inspect. */

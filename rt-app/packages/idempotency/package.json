@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-idempotency",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -39,14 +39,14 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-core": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-nosql": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-contracts": "0.1.0-alpha.0"
+    "@gsalgadotoledo/rt-app-core": "0.1.0",
+    "@gsalgadotoledo/rt-app-nosql": "0.1.0",
+    "@gsalgadotoledo/rt-app-contracts": "0.1.0"
   },
   "license": "UNLICENSED",
   "publishConfig": {
     "access": "public",
-    "tag": "next"
+    "tag": "latest"
   },
   "repository": {
     "type": "git",

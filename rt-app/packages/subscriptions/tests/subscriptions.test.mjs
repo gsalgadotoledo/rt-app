@@ -191,7 +191,7 @@ test('admin plans grant entitlements without billing and expire; credit grants a
   assert.equal((await service.me(user.id)).active,false);
   await assert.rejects(service.consume(user.id,'api',1,'expired'),/inactive/);
 });
-test('extra credits cover period exhaustion but not daily limits; consumption remains atomic', async t => {
+test('additional credits continue after the plan allowance (period, day or week); consumption remains atomic', async t => {
   const {service,store}=await fixture(t); await seedUser(store);
   const config=await service.settings();
   config.values.plans[0].products[0].credits=10;
@@ -202,9 +202,12 @@ test('extra credits cover period exhaustion but not daily limits; consumption re
   assert.equal(result.filter(x=>x.status==='fulfilled').length,1);
   assert.equal((await service.me(user.id)).creditBalance.api,10);
   await service.consume(user.id,'api',10,'last');
-  await assert.rejects(service.consume(user.id,'api',1,'over'),/limit/);
+  await assert.rejects(service.consume(user.id,'api',1,'over'),/period limit reached\. Add credits/);
+  // Top-ups are not bound by the daily/weekly windows of the plan allowance.
   await service.grant(user.id,{kind:'credits',productId:'api',credits:200,valueMinor:0,currency:'usd',reason:'Extra',requestId:'more'},'root');
-  await assert.rejects(service.consume(user.id,'api',71,'daily'),/day limit/);
+  const receipt=await service.consume(user.id,'api',150,'daily');
+  assert.deepEqual([receipt.fromAllowance,receipt.fromBalance],[0,150]);
+  assert.equal((await service.me(user.id)).creditBalance.api,50);
 });
 test('user search includes unsubscribed users and excludes secrets and deleted users',async t=>{
   const {service,store}=await fixture(t); await seedUser(store);

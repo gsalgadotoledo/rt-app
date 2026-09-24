@@ -38,6 +38,45 @@ For direct composition: `await app.subscriptions.consume(userId, 'api', 10, requ
 
 Daily/weekly windows are fixed intervals anchored to the subscription's period start. Courtesy resets zero selected counters, keep the scheduled boundaries and never reactivate unpaid subscriptions. Each reset requires a reason and persisted idempotency key. Plan changes preserve existing counters inside the same billing period. Unpaid plans renew lazily; canceled ones expire. Existing plan snapshots retain limits until plan change or paid synchronization.
 
+## Credits: weekly allowance, top-ups and the statement
+
+Each plan product grants its `weeklyLimit` as a **weekly allowance**. The daily limit and the period credits also cap it. Whatever is not used by the end of the week **expires**. When the allowance runs out, consumption continues from **additional credits** (top-ups, purchases, administrator assignments), which never expire. Without them the request fails with 429 `… limit reached. Add credits or wait for the reset.`
+
+Every movement is recorded in the user's statement (`SUB_LEDGER#<userId>`) in the same transaction as the account change:
+
+| Kind | Credits | Written by |
+| --- | --- | --- |
+| allowance / expiry | + weekly allowance / − unused part | system, on the first write after a window closes (shown as *pending* until then) |
+| usage | − credits, split `fromAllowance` / `fromBalance` | `consume`, `consumeUsage`, metered endpoints |
+| purchase / grant / adjustment | ± credits, optional money (`amountMinor`, `currency`) | `recordCredits`, admin |
+| plan | 0, with price for paid periods | plan start, change, renewal, cancellation, admin assignment |
+| reset | + allowance restored | courtesy reset |
+
+Each entry stores the credits available right after it. The account keeps running totals: credits in and out, expired, money paid per currency, and the value recorded for admin assignments, which is not a charge.
+
+```ts
+// Log a credit (+) or debit (−); idempotent per requestId. Debits use the allowance first.
+await app.subscriptions.recordCredits(userId, {
+  requestId: "stripe-pi_123", productId: "api", credits: 1000,
+  kind: "purchase", reason: "Top-up", amountMinor: 1000, currency: "usd",
+});
+
+// Price a model request with the configured rates and charge it atomically.
+await app.subscriptions.consumeUsage(userId, "api", { rateId: "standard", inputTokens: 1200, outputTokens: 300 }, requestId);
+```
+
+**Rates** live in Settings → Credits. Each model or function sets credits per 1,000 input and output tokens, with an optional minimum per request. The result is rounded up to whole credits. The pack price (e.g. 1,000 credits = USD 10) sets the money value of a credit. The **credit sandbox** in Settings prices any token count for a model and previews how the charge splits for a given user, and can charge it to that user for testing. `POST /subscriptions/admin/credits/estimate` never writes.
+
+## Overview
+
+Subscriptions opens on **Overview**:
+- customers with an active plan, and how many of them pay;
+- projected monthly revenue per currency (the monthly equivalent of active paid plans billed by the payment provider; subscriptions ending this period and admin assignments are excluded);
+- new and canceled subscriptions today and this month;
+- a monthly chart.
+
+New and canceled subscriptions are counted per day in `SUB_STATS` when they happen. A payment problem is neither new nor canceled. The customer line uses a daily snapshot saved when the overview is opened, so there is no history before the first visit.
+
 ## Recovery and notifications
 
 Billing requests persist their key and plan snapshot before calling Stripe. Retry pending operations from the profile; never issue a new key to bypass a pending payment. Operations older than 23 hours require manual Stripe reconciliation because provider idempotency keys expire. There is no automatic operator reconciliation screen yet.
@@ -52,7 +91,7 @@ Tests use isolated JSON stores and Stripe SDK signature generation; live Stripe 
 
 Subscriptions → Accounts lists all non-deleted users, including those without a subscription. Search and cursor pagination process one bounded user-storage page per request; continue to search subsequent pages. Select a user to assign any configured plan or additional product credits.
 
-Plan assignments grant the same product entitlements for the plan's period, with fresh limits, without charging Stripe. They temporarily override entitlement selection, preserve underlying billing, and expire without automatic renewal. Existing Stripe recurring charges continue. User-initiated plan changes are blocked during the override. Additional credits do not expire, require an active plan containing the product, and are consumed after its period credits; daily/weekly limits still apply. Courtesy resets do not refund spent additional credits.
+Plan assignments grant the same product entitlements for the plan's period, with fresh limits, without charging Stripe. They temporarily override entitlement selection, preserve underlying billing, and expire without automatic renewal. Existing Stripe recurring charges continue. User-initiated plan changes are blocked during the override. Additional credits do not expire, require an active plan containing the product, and are consumed once the plan allowance (the tightest of its daily, weekly and period windows) is used up. Daily/weekly limits bound the plan allowance only, not additional credits. Courtesy resets do not refund spent additional credits.
 
 Each assignment records administrator, reason, date, currency and nominal value in minor units in `SUB_GRANTS#<userId>`. This is an administrative ledger, not a paid invoice or foreign-exchange conversion. Account updates and receipts are atomic and request IDs prevent duplicate grants. Both JSON and DynamoDB adapters use the same service. Administrative grant endpoints remain owner-only behind the admin proxy.
 

@@ -1,6 +1,6 @@
 # Releases
 
-All npm packages use `@gsalgadotoledo/rt-app-*`, version `0.1.0-alpha.0`, tag `next`. The GitHub repository is private; npm packages are public when published. Public visibility grants no license: all rights remain reserved.
+All npm packages use `@gsalgadotoledo/rt-app-*`, version `0.1.0`, tag `latest` (`next` for prereleases). The GitHub repository is public; npm packages are public when published. Public visibility grants no license: all rights remain reserved.
 
 ## Validate and publish
 ```sh

@@ -1,5 +1,6 @@
 import type { NoSQL as Store } from "@gsalgadotoledo/rt-app-nosql";
 import { migrations } from "./migrations.js";
+import { seeds } from "./seeds.js";
 import admin from "./admin.json" with { type: "json" };
 import { randomUUID } from "node:crypto";
 import {
@@ -47,6 +48,7 @@ export function tasksFeature(store: Store): Feature {
   return {
     id: "tasks",
     migrations,
+    seeds,
     admin: admin,
     endpoints: [
       {method:"POST",path:"/tasks/:id/restore",resource:"tasks.restore",access:"authenticated",handle:c=>edit(c,false,true)},

@@ -9,3 +9,4 @@ Read CLAUDE.md for project layout and runtime constraints, and node_modules/@gsa
 - Each published action must have a stable namespaced name, short description and parameter example. Publication is explicit, discovery is automatic.
 - Tests belong to their owning module/app. Build and run affected tests before delivery.
 - Preserve compact forms: modest field spacing, semibold labels, regular values, muted descriptions, accessible keyboard controls.
+- Data changes live in the owning module: `src/migrations.js` (append-only, `rta migrate up`) and `src/seeds.js` (example data, `rta seed`; never prod). Never edit an applied migration.

@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-config",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0",
   "type": "module",
   "exports": {
     ".": {
@@ -19,7 +19,7 @@
   "license": "UNLICENSED",
   "publishConfig": {
     "access": "public",
-    "tag": "next"
+    "tag": "latest"
   },
   "repository": {
     "type": "git",

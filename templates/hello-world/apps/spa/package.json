@@ -8,13 +8,13 @@
     "dev": "vite"
   },
   "dependencies": {
-    "@gsalgadotoledo/rt-app-auth": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-config": "0.1.0-alpha.0",
+    "@gsalgadotoledo/rt-app-auth": "0.1.0",
+    "@gsalgadotoledo/rt-app-config": "0.1.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.18.4",
-    "@gsalgadotoledo/rt-app-observer": "0.1.0-alpha.0",
-    "@gsalgadotoledo/rt-app-subscriptions": "0.1.0-alpha.0"
+    "@gsalgadotoledo/rt-app-observer": "0.1.0",
+    "@gsalgadotoledo/rt-app-subscriptions": "0.1.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
