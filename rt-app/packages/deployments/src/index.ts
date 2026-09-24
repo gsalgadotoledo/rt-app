@@ -16,6 +16,14 @@ import {
   type DeploySource,
   type Role,
 } from "@gsalgadotoledo/rt-app-deploy";
+import * as render from "@gsalgadotoledo/rt-app-deploy-render";
+import * as railway from "@gsalgadotoledo/rt-app-deploy-railway";
+import * as flyio from "@gsalgadotoledo/rt-app-deploy-flyio";
+import * as digitalocean from "@gsalgadotoledo/rt-app-deploy-digitalocean";
+import * as heroku from "@gsalgadotoledo/rt-app-deploy-heroku";
+import * as vercel from "@gsalgadotoledo/rt-app-deploy-vercel";
+import * as neon from "@gsalgadotoledo/rt-app-deploy-neon";
+import * as supabase from "@gsalgadotoledo/rt-app-deploy-supabase";
 
 /**
  * Application-side deployment workbench shared by `rta deploy`, `rta github`, the local admin
@@ -27,10 +35,22 @@ import {
 // Providers
 // ---------------------------------------------------------------------------
 
-/** Provider packages shipped with RT-App, one per provider, loaded explicitly by name. */
-export const PROVIDER_PACKAGES = ["render", "railway", "flyio", "digitalocean", "heroku", "vercel", "neon", "supabase"].map(
-  (id) => `@gsalgadotoledo/rt-app-deploy-${id}`,
-);
+/**
+ * Provider packages shipped with RT-App. Static imports keep them inside any bundle (the
+ * Service Manager app, a Lambda): a dynamic import by name would silently drop them.
+ */
+const BUNDLED: Record<string, any> = {
+  "@gsalgadotoledo/rt-app-deploy-render": render,
+  "@gsalgadotoledo/rt-app-deploy-railway": railway,
+  "@gsalgadotoledo/rt-app-deploy-flyio": flyio,
+  "@gsalgadotoledo/rt-app-deploy-digitalocean": digitalocean,
+  "@gsalgadotoledo/rt-app-deploy-heroku": heroku,
+  "@gsalgadotoledo/rt-app-deploy-vercel": vercel,
+  "@gsalgadotoledo/rt-app-deploy-neon": neon,
+  "@gsalgadotoledo/rt-app-deploy-supabase": supabase,
+};
+
+export const PROVIDER_PACKAGES = Object.keys(BUNDLED);
 
 /**
  * AWS runs through the existing Terraform pipeline (`rta install`, the GitHub deploy workflow),
@@ -60,7 +80,7 @@ export const awsProvider: DeployProvider = {
 };
 
 /** Registry with AWS and every provider package that can be imported (all ship with the CLI). */
-export async function loadRegistry(importer: (name: string) => Promise<any> = (name) => import(name)) {
+export async function loadRegistry(importer: (name: string) => Promise<any> = async (name) => BUNDLED[name]) {
   const registry = new ProviderRegistry().register(awsProvider);
   for (const name of PROVIDER_PACKAGES) {
     try {
