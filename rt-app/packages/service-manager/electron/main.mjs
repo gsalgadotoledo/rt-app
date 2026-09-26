@@ -67,7 +67,7 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    }
    if(background)void tray.startAll();
   }
- }catch(error){dialog.showErrorBox('RT-App Service Manager',error.message);app.quit();}
+ }catch(error){console.error(error?.stack??error);dialog.showErrorBox('RT-App Service Manager',error.message);app.quit();}
  });
  app.on('window-all-closed',()=>{});
  app.on('will-quit',()=>tray?.destroy());
