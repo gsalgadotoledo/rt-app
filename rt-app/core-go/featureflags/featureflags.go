@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"slices"
 	"time"
+	"unicode/utf16"
 
 	"rt.local/core-go/apperr"
 	"rt.local/core-go/nosql"
@@ -213,15 +214,11 @@ func validDefinition(def Definition) bool {
 	return true
 }
 
-// utf16Len is JavaScript's String.prototype.length: code points above U+FFFF are surrogate
-// pairs (utf16.RuneLen, which needs Go 1.23; this module supports Go 1.22).
+// utf16Len is JavaScript's String.prototype.length: UTF-16 code units.
 func utf16Len(s string) int {
 	n := 0
 	for _, r := range s {
-		n++
-		if r > 0xFFFF {
-			n++
-		}
+		n += utf16.RuneLen(r)
 	}
 	return n
 }
