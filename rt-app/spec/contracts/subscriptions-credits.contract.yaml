@@ -1,0 +1,343 @@
+contract: 1
+module: subscriptions-credits
+title: Subscriptions credit settings and request pricing
+description: |
+  Credit settings validation and request pricing (TypeScript: packages/subscriptions/src/index.ts
+  validateCredits, defaults.credits, Subscriptions.estimate; src/currency.ts). The subject is built
+  from init.credits: raw credit settings validated with validateCredits (instance creation fails
+  with that error when invalid); without it the defaults apply. Methods (positional args):
+
+    defaults()                     -> defaults.credits (a fresh copy)
+    validateCredits(input)         -> normalized CreditSettings or error
+    estimate({rateId, inputTokens, outputTokens?}) -> pricing with the instance's settings
+                                      (userId/productId account previews are out of scope)
+    validCurrency(code)            -> boolean: lowercase ISO code from the catalog in currency.ts
+    currencyDecimals(code)         -> 0 | 2 | 3 (case-insensitive; unknown codes give 2)
+    validMinorAmount(amount, code) -> boolean: safe integer >= 0; isk/ugx (any case) also a multiple of 100
+
+  validateCredits, checked in this order (every error is status 400):
+    1. currency = lower(String(pack.currency ?? "")) must be valid           -> "Invalid currency"
+    2. pack.amountMinor: safe integer 0..1e9                                 -> "Invalid numeric setting"
+       and validMinorAmount(amountMinor, currency)                           -> "Invalid amount for currency"
+    3. rates: a list of at most 50                                           -> "Use at most 50 credit rates"
+    4. per rate, in list order and field order:
+       id ^[a-zA-Z0-9_-]{1,100}$                                             -> "Invalid identifier"
+       name = String(name ?? "").trim() cut to 80 UTF-16 code units
+       inputPer1k, outputPer1k: rate(n)                                      -> "Invalid credit rate"
+       minimum (default 0): safe integer 0..1e9                              -> "Invalid numeric setting"
+    5. an empty name or a repeated id                                        -> "Duplicate or unnamed credit rates"
+    6. pack.credits: safe integer 1..1e9                                     -> "Invalid numeric setting"
+  Output: {pack: {credits, amountMinor, currency}, rates: [{id, name, inputPer1k, outputPer1k, minimum}]};
+  other fields are dropped. rate(n) accepts a JSON number (not boolean/string) with 0 <= n <= 1e6
+  and at most 4 decimals: abs(n * 1e4 - round(n * 1e4)) <= 1e-6 in float64 (so 0.57, whose
+  n * 1e4 is 5699.999999999999, is valid; 0.12345 is not). round() is JavaScript Math.round.
+
+  estimate(input): rate = the settings rate with id rateId, else 404 "Credit rate not found".
+    inputTokens and outputTokens (default 0) are safe integers 0..1e10, else 400 "Invalid numeric setting".
+    exact = (inputTokens / 1000) * inputPer1k + (outputTokens / 1000) * outputPer1k   (float64, this order)
+    credits = max(minimum, ceil(jsround(exact * 1e6) / 1e6))
+    valueMinor = jsround(credits * pack.amountMinor / pack.credits)
+    exactCredits = jsround(exact * 1e4) / 1e4
+    result {rate, inputTokens, outputTokens, exactCredits, credits, valueMinor, currency: pack.currency}
+  jsround is JavaScript Math.round: floor(x + 0.5), so halves round up (0.5 -> 1, 2.5 -> 3), unlike
+  Python round() or Go math.RoundToEven.
+subject: subscriptions-credits
+init: {}
+cases:
+  # --- defaults ---------------------------------------------------------------------------------
+  - name: default credit settings
+    call: defaults
+    args: []
+    expect:
+      value:
+        pack: { credits: 1000, amountMinor: 1000, currency: usd }
+        rates:
+          - { id: standard, name: Standard model, inputPer1k: 1, outputPer1k: 3, minimum: 1 }
+          - { id: advanced, name: Advanced model, inputPer1k: 5, outputPer1k: 15, minimum: 1 }
+
+  - name: the defaults are valid settings
+    steps:
+      - { call: defaults, args: [], expect: { value: { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: [ { id: standard, name: Standard model, inputPer1k: 1, outputPer1k: 3, minimum: 1 }, { id: advanced, name: Advanced model, inputPer1k: 5, outputPer1k: 15, minimum: 1 } ] } } }
+      - { call: validateCredits, args: [ { $ref: "0.value" } ], expect: { value: { $ref: "0.value" } } }
+
+  # --- validateCredits --------------------------------------------------------------------------
+  - name: validation normalizes currency case, trims names and drops unknown fields
+    call: validateCredits
+    args:
+      - pack: { credits: 500, amountMinor: 999, currency: EUR, extra: 1 }
+        rates:
+          - { id: fast_model-1, name: "  Fast model  ", inputPer1k: 0.25, outputPer1k: 1.5, minimum: 2, color: red }
+          - { id: B, name: 42, inputPer1k: 0, outputPer1k: 1000000 }
+        other: true
+    expect:
+      value:
+        pack: { credits: 500, amountMinor: 999, currency: eur }
+        rates:
+          - { id: fast_model-1, name: Fast model, inputPer1k: 0.25, outputPer1k: 1.5, minimum: 2 }
+          - { id: B, name: "42", inputPer1k: 0, outputPer1k: 1000000, minimum: 0 }
+
+  - name: an empty rate list is valid
+    call: validateCredits
+    args: [ { pack: { credits: 1, amountMinor: 0, currency: usd }, rates: [] } ]
+    expect: { value: { pack: { credits: 1, amountMinor: 0, currency: usd }, rates: [] } }
+
+  - name: currency errors come first
+    tags: [ validation, currency ]
+    steps:
+      - { call: validateCredits, args: [ null ], expect: { error: { status: 400, message: Invalid currency } } }
+      - { call: validateCredits, args: [ {} ], expect: { error: { status: 400, message: Invalid currency } } }
+      - { call: validateCredits, args: [ { pack: { credits: 0, amountMinor: -1, currency: zzz } } ], expect: { error: { status: 400, message: Invalid currency } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: 840 }, rates: [] } ], expect: { error: { status: 400, message: Invalid currency } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: " usd" }, rates: [] } ], expect: { error: { status: 400, message: Invalid currency } } }
+
+  - name: the pack amount must be a whole number of minor units
+    tags: [ validation, currency ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 1, currency: usd }, rates: [] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: -1, currency: usd }, rates: [] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1.5, currency: usd }, rates: [] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: "100", currency: usd }, rates: [] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1000000001, currency: usd }, rates: [] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1000000000, currency: usd }, rates: [] } ], expect: { value: { pack: { credits: 1, amountMinor: 1000000000, currency: usd }, rates: [] } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 150, currency: isk }, rates: [] } ], expect: { error: { status: 400, message: Invalid amount for currency } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 150, currency: UGX }, rates: [] } ], expect: { error: { status: 400, message: Invalid amount for currency } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 200, currency: ISK }, rates: [] } ], expect: { value: { pack: { credits: 1, amountMinor: 200, currency: isk }, rates: [] } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: jpy }, rates: [] } ], expect: { value: { pack: { credits: 1, amountMinor: 1, currency: jpy }, rates: [] } } }
+
+  - name: rates must be a list of at most 50
+    tags: [ validation ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd } } ], expect: { error: { status: 400, message: Use at most 50 credit rates } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: { a: 1 } } ], expect: { error: { status: 400, message: Use at most 50 credit rates } } }
+      - call: validateCredits
+        args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { $repeat: { count: 51, item: { id: "r{i}", name: "Rate {i}", inputPer1k: 1, outputPer1k: 1 } } } ] } ]
+        expect: { error: { status: 400, message: Use at most 50 credit rates } }
+      - call: validateCredits
+        args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { $repeat: { count: 50, item: { id: "r{i}", name: "Rate {i}", inputPer1k: 1, outputPer1k: 1 } } } ] } ]
+        expect: { value: { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: { $length: 50 } } }
+
+  - name: rate ids are identifiers of 1 to 100 characters
+    tags: [ validation ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: "bad id", name: x, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid identifier } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: "", name: x, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid identifier } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { name: x, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid identifier } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: 7, name: x, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid identifier } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: "ñ", name: x, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid identifier } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: { $text: { repeat: a, count: 101 } }, name: x, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid identifier } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: { $text: { repeat: a, count: 100 } }, name: x, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { value: { $partial: { rates: [ { $partial: { id: { $length: 100 } } } ] } } } }
+
+  - name: rate names are required, trimmed and cut to 80 UTF-16 code units
+    tags: [ validation, unicode ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: "   ", inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Duplicate or unnamed credit rates } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Duplicate or unnamed credit rates } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: { $text: { repeat: "x", count: 100 } }, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { value: { $partial: { rates: [ { $partial: { name: { $text: { repeat: "x", count: 80 } } } } ] } } } }
+      - call: validateCredits
+        args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: { $text: { repeat: "😀", count: 50 } }, inputPer1k: 1, outputPer1k: 1 } ] } ]
+        expect: { value: { $partial: { rates: [ { $partial: { name: { $text: { repeat: "😀", count: 40 } } } } ] } } }
+        note: 40 emoji are 80 UTF-16 code units
+      - call: validateCredits
+        args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: { $text: { repeat: "é", count: 90 } }, inputPer1k: 1, outputPer1k: 1 } ] } ]
+        expect: { value: { $partial: { rates: [ { $partial: { name: { $text: { repeat: "é", count: 80 } } } } ] } } }
+
+  - name: rate names are cut after trimming, so a cut can end in a space
+    tags: [ validation, edge, quirk ]
+    call: validateCredits
+    args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: "  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbb", inputPer1k: 1, outputPer1k: 1 } ] } ]
+    expect: { value: { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ", inputPer1k: 1, outputPer1k: 1, minimum: 0 } ] } }
+
+  - name: the 80-code-unit cut can split a surrogate pair
+    tags: [ validation, unicode, quirk ]
+    note: 79 ASCII letters then an emoji; the cut keeps only the high surrogate
+    call: validateCredits
+    args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀", inputPer1k: 1, outputPer1k: 1 } ] } ]
+    expect: { value: { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\ud83d", inputPer1k: 1, outputPer1k: 1, minimum: 0 } ] } }
+
+  - name: rate ids must be unique
+    tags: [ validation ]
+    call: validateCredits
+    args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1, outputPer1k: 1 }, { id: a, name: B, inputPer1k: 2, outputPer1k: 2 } ] } ]
+    expect: { error: { status: 400, message: Duplicate or unnamed credit rates } }
+
+  - name: rate ids are case-sensitive
+    tags: [ validation, edge ]
+    call: validateCredits
+    args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1, outputPer1k: 1 }, { id: A, name: B, inputPer1k: 2, outputPer1k: 2 } ] } ]
+    expect: { value: { $partial: { rates: { $length: 2 } } } }
+
+  - name: rates are non-negative numbers up to 1e6 with at most 4 decimals
+    tags: [ validation, float ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: -1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1, outputPer1k: 1000000.0001 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: "1", outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: true, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 0.00001, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 0.0001, outputPer1k: 1000000 } ] } ], expect: { value: { $partial: { rates: [ { id: a, name: A, inputPer1k: 0.0001, outputPer1k: 1000000, minimum: 0 } ] } } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 0.1234, outputPer1k: 2.675 } ] } ], expect: { value: { $partial: { rates: [ { id: a, name: A, inputPer1k: 0.1234, outputPer1k: 2.675, minimum: 0 } ] } } } }
+
+  - name: rates have at most 4 decimals, tolerant of float64 noise
+    tags: [ validation, float ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 0.57, outputPer1k: 1 } ] } ], expect: { value: { $partial: { rates: [ { id: a, name: A, inputPer1k: 0.57, outputPer1k: 1, minimum: 0 } ] } } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 0.07, outputPer1k: 1.11 } ] } ], expect: { value: { $partial: { rates: [ { id: a, name: A, inputPer1k: 0.07, outputPer1k: 1.11, minimum: 0 } ] } } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1.005, outputPer1k: 1 } ] } ], expect: { value: { $partial: { rates: [ { id: a, name: A, inputPer1k: 1.005, outputPer1k: 1, minimum: 0 } ] } } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 0.12345, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 0.58, outputPer1k: 0.29 } ] } ], expect: { value: { $partial: { rates: [ { id: a, name: A, inputPer1k: 0.58, outputPer1k: 0.29, minimum: 0 } ] } } } }
+
+  - name: the per-request minimum is a whole number of credits
+    tags: [ validation ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1, outputPer1k: 1, minimum: -1 } ] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1, outputPer1k: 1, minimum: 0.5 } ] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1, outputPer1k: 1, minimum: 1000000001 } ] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1, outputPer1k: 1, minimum: null } ] } ], expect: { value: { $partial: { rates: [ { $partial: { minimum: 0 } } ] } } } }
+
+  - name: pack credits are checked last and must be at least 1
+    tags: [ validation ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 0, amountMinor: 1, currency: usd }, rates: [] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { amountMinor: 1, currency: usd }, rates: [] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1000000001, amountMinor: 1, currency: usd }, rates: [] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 0, amountMinor: 1, currency: usd }, rates: [ { id: a, name: A, inputPer1k: 1, outputPer1k: 1 }, { id: a, name: B, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Duplicate or unnamed credit rates } } }
+      - { call: validateCredits, args: [ { pack: { credits: 0, amountMinor: 1, currency: usd }, rates: [ { id: a, name: "", inputPer1k: -1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1000000000, amountMinor: 1, currency: usd }, rates: [] } ], expect: { value: { pack: { credits: 1000000000, amountMinor: 1, currency: usd }, rates: [] } } }
+
+  - name: rates are validated in list order, fields in declaration order
+    tags: [ validation ]
+    steps:
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: ok, name: A, inputPer1k: 1, outputPer1k: 1, minimum: -1 }, { id: "bad id", name: B, inputPer1k: 1, outputPer1k: 1 } ] } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: "bad id", name: A, inputPer1k: -1, outputPer1k: 1, minimum: -1 } ] } ], expect: { error: { status: 400, message: Invalid identifier } } }
+      - { call: validateCredits, args: [ { pack: { credits: 1, amountMinor: 1, currency: usd }, rates: [ { id: ok, name: A, inputPer1k: 1, outputPer1k: -1, minimum: -1 } ] } ], expect: { error: { status: 400, message: Invalid credit rate } } }
+
+  - name: invalid stored settings fail when the subject is built
+    tags: [ validation ]
+    init: { credits: { pack: { credits: 1, amountMinor: 1, currency: xyz }, rates: [] } }
+    create: { error: { status: 400, message: Invalid currency } }
+
+  # --- estimate ---------------------------------------------------------------------------------
+  - name: estimate prices a request with the default standard rate
+    call: estimate
+    args: [ { rateId: standard, inputTokens: 1000, outputTokens: 500 } ]
+    expect:
+      value:
+        rate: { id: standard, name: Standard model, inputPer1k: 1, outputPer1k: 3, minimum: 1 }
+        inputTokens: 1000
+        outputTokens: 500
+        exactCredits: 2.5
+        credits: 3
+        valueMinor: 3
+        currency: usd
+
+  - name: estimate applies the per-request minimum and defaults output tokens to 0
+    steps:
+      - call: estimate
+        args: [ { rateId: advanced, inputTokens: 0 } ]
+        expect: { value: { rate: { $partial: { id: advanced } }, inputTokens: 0, outputTokens: 0, exactCredits: 0, credits: 1, valueMinor: 1, currency: usd } }
+      - call: estimate
+        args: [ { rateId: standard, inputTokens: 1, outputTokens: null } ]
+        expect: { value: { rate: { $partial: { id: standard } }, inputTokens: 1, outputTokens: 0, exactCredits: 0.001, credits: 1, valueMinor: 1, currency: usd } }
+      - call: estimate
+        args: [ { rateId: advanced, inputTokens: 12345, outputTokens: 6789 } ]
+        expect: { value: { rate: { $partial: { id: advanced } }, inputTokens: 12345, outputTokens: 6789, exactCredits: 163.56, credits: 164, valueMinor: 164, currency: usd } }
+
+  - name: estimate rejects unknown rates and invalid token counts
+    tags: [ validation ]
+    steps:
+      - { call: estimate, args: [ { rateId: premium, inputTokens: 1 } ], expect: { error: { status: 404, message: Credit rate not found } } }
+      - { call: estimate, args: [ { inputTokens: 1 } ], expect: { error: { status: 404, message: Credit rate not found } } }
+      - { call: estimate, args: [ { rateId: premium, inputTokens: -1 } ], expect: { error: { status: 404, message: Credit rate not found } }, note: the rate is looked up before the tokens are checked }
+      - { call: estimate, args: [ { rateId: standard, inputTokens: -1 } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: estimate, args: [ { rateId: standard, inputTokens: 1.5 } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: estimate, args: [ { rateId: standard, inputTokens: "10" } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: estimate, args: [ { rateId: standard } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: estimate, args: [ { rateId: standard, inputTokens: 10000000001 } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: estimate, args: [ { rateId: standard, inputTokens: 1, outputTokens: -5 } ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+
+  - name: estimate handles the largest token counts
+    tags: [ edge ]
+    call: estimate
+    args: [ { rateId: advanced, inputTokens: 10000000000, outputTokens: 10000000000 } ]
+    expect: { value: { rate: { $partial: { id: advanced } }, inputTokens: 10000000000, outputTokens: 10000000000, exactCredits: 200000000, credits: 200000000, valueMinor: 200000000, currency: usd } }
+
+  - name: estimate uses the stored settings, with float tolerance and half-up rounding
+    tags: [ float ]
+    init:
+      credits:
+        pack: { credits: 2, amountMinor: 1, currency: USD }
+        rates:
+          - { id: tiny, name: Tiny, inputPer1k: 0.0001, outputPer1k: 0, minimum: 0 }
+          - { id: noisy, name: Noisy, inputPer1k: 1.1, outputPer1k: 0 }
+          - { id: flat, name: Flat, inputPer1k: 0, outputPer1k: 0, minimum: 5 }
+    steps:
+      - call: estimate
+        args: [ { rateId: standard, inputTokens: 1 } ]
+        expect: { error: { status: 404, message: Credit rate not found } }
+        note: stored settings replace the defaults
+      - call: estimate
+        args: [ { rateId: noisy, inputTokens: 50000 } ]
+        expect: { value: { rate: { id: noisy, name: Noisy, inputPer1k: 1.1, outputPer1k: 0, minimum: 0 }, inputTokens: 50000, outputTokens: 0, exactCredits: 55, credits: 55, valueMinor: 28, currency: usd } }
+        note: exact is 55.00000000000001; rounding to 6 decimals before ceil gives 55, not 56; 27.5 rounds up
+      - call: estimate
+        args: [ { rateId: flat, inputTokens: 1000000 } ]
+        expect: { value: { rate: { $partial: { id: flat } }, inputTokens: 1000000, outputTokens: 0, exactCredits: 0, credits: 5, valueMinor: 3, currency: usd } }
+        note: 2.5 minor units round half up to 3
+      - call: estimate
+        args: [ { rateId: tiny, inputTokens: 1 } ]
+        expect: { value: { rate: { $partial: { id: tiny } }, inputTokens: 1, outputTokens: 0, exactCredits: 0, credits: 0, valueMinor: 0, currency: usd } }
+        note: exact 1e-7 rounds to 0 credits at 6 decimals; with minimum 0 the request is free
+      - call: estimate
+        args: [ { rateId: tiny, inputTokens: 5000 } ]
+        expect: { value: { rate: { $partial: { id: tiny } }, inputTokens: 5000, outputTokens: 0, exactCredits: 0.0005, credits: 1, valueMinor: 1, currency: usd } }
+        note: 0.5 minor units round half up to 1
+      - call: estimate
+        args: [ { rateId: tiny, inputTokens: 10000004 } ]
+        expect: { value: { rate: { $partial: { id: tiny } }, inputTokens: 10000004, outputTokens: 0, exactCredits: 1, credits: 1, valueMinor: 1, currency: usd } }
+        note: exact 1.0000004 rounds to 1.000000 at 6 decimals, so no extra credit
+      - call: estimate
+        args: [ { rateId: tiny, inputTokens: 10000005 } ]
+        note: exact 1.0000005 rounds to 1.000001 at 6 decimals, so the ceil charges 2
+        expect: { value: { rate: { id: tiny, name: Tiny, inputPer1k: 0.0001, outputPer1k: 0, minimum: 0 }, inputTokens: 10000005, outputTokens: 0, exactCredits: 1, credits: 2, valueMinor: 1, currency: usd } }
+      - call: estimate
+        args: [ { rateId: tiny, inputTokens: 10000015 } ]
+        expect: { value: { rate: { id: tiny, name: Tiny, inputPer1k: 0.0001, outputPer1k: 0, minimum: 0 }, inputTokens: 10000015, outputTokens: 0, exactCredits: 1, credits: 2, valueMinor: 1, currency: usd } }
+
+  # --- currency helpers -------------------------------------------------------------------------
+  - name: validCurrency accepts lowercase catalog codes only
+    tags: [ currency ]
+    steps:
+      - { call: validCurrency, args: [ usd ], expect: { value: true } }
+      - { call: validCurrency, args: [ xcg ], expect: { value: true } }
+      - { call: validCurrency, args: [ USD ], expect: { value: false } }
+      - { call: validCurrency, args: [ "" ], expect: { value: false } }
+      - { call: validCurrency, args: [ zzz ], expect: { value: false } }
+      - { call: validCurrency, args: [ 840 ], expect: { value: false } }
+      - { call: validCurrency, args: [ null ], expect: { value: false } }
+
+  - name: currencyDecimals follows Stripe minor units
+    tags: [ currency ]
+    steps:
+      - { call: currencyDecimals, args: [ usd ], expect: { value: 2 } }
+      - { call: currencyDecimals, args: [ JPY ], expect: { value: 0 } }
+      - { call: currencyDecimals, args: [ krw ], expect: { value: 0 } }
+      - { call: currencyDecimals, args: [ kwd ], expect: { value: 3 } }
+      - { call: currencyDecimals, args: [ TND ], expect: { value: 3 } }
+      - { call: currencyDecimals, args: [ isk ], expect: { value: 2 } }
+      - { call: currencyDecimals, args: [ ugx ], expect: { value: 2 } }
+      - { call: currencyDecimals, args: [ zzz ], expect: { value: 2 } }
+
+  - name: validMinorAmount needs a non-negative safe integer, in hundreds for isk and ugx
+    tags: [ currency ]
+    steps:
+      - { call: validMinorAmount, args: [ 0, usd ], expect: { value: true } }
+      - { call: validMinorAmount, args: [ 9007199254740991, usd ], expect: { value: true } }
+      - { call: validMinorAmount, args: [ 9007199254740992, usd ], expect: { value: false } }
+      - { call: validMinorAmount, args: [ -1, usd ], expect: { value: false } }
+      - { call: validMinorAmount, args: [ 1.5, usd ], expect: { value: false } }
+      - { call: validMinorAmount, args: [ "100", usd ], expect: { value: false } }
+      - { call: validMinorAmount, args: [ 150, isk ], expect: { value: false } }
+      - { call: validMinorAmount, args: [ 200, ISK ], expect: { value: true } }
+      - { call: validMinorAmount, args: [ 150, ugx ], expect: { value: false } }
+      - { call: validMinorAmount, args: [ 150, zzz ], expect: { value: true } }

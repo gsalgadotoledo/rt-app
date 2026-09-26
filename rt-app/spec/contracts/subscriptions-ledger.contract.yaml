@@ -1,0 +1,671 @@
+contract: 1
+module: subscriptions-ledger
+title: Subscriptions credit ledger (pure functions)
+description: |
+  The pure part of the subscriptions credit ledger (TypeScript: packages/subscriptions/src/ledger.ts).
+  The subject is a stateless object; each method is one exported function, same name, positional args.
+  Wire null means "argument not given" (TypeScript undefined, Python None, Go nil).
+
+    emptyTotals()                              -> {creditsIn:0, creditsOut:0, expired:0, paidMinor:{}, grantedValueMinor:{}}
+    LEDGER(userId)                             -> "SUB_LEDGER#" + userId   (partition key; Python: ledger / LEDGER)
+    ledgerKey(at, seed, sequence=0)            -> sort key string
+    ledgerWrite(userId, entry, seed, sequence=0) -> {entry, write}
+    applyTotals(totals|null, entry)            -> new totals (inputs are never mutated)
+    rollover(previous|null, current|null, used, now) -> {entries, state|null}
+
+  ledgerKey = pad15(str(at)) + "-" + pad10(str(sequence)) + "-" + hex(sha256(utf8(seed)))[0:16].
+    padN left-pads with "0" to N characters and never truncates; str() is JavaScript Number→String
+    (integers as plain digits; 1.5 -> "1.5"; -1 -> "-1" so the pad gives "0000000000000-1";
+    >= 1e21 uses exponent form "1e+21"). Seeds are UTF-8; a lone UTF-16 surrogate is encoded as
+    U+FFFD (EF BF BD) like Node's Buffer. Keys order by code point (see polyglot.md): chronological
+    for 0 <= at < 1e15 and 0 <= sequence < 1e10 only.
+  ledgerWrite: id = ledgerKey(entry.at, seed, sequence); entry' = entry with id (a given id is
+    replaced); write = {row: {pk: LEDGER(userId), sk: id, version: 1, data: entry'}, expected: null}
+    (conditional create). Other entry fields are copied unchanged, unknown fields included.
+  applyTotals: start from a deep copy of totals (emptyTotals() when null; unknown fields are kept).
+    kind "expiry": expired += -credits (any sign). Otherwise credits > 0: creditsIn += credits,
+    else creditsOut += -credits (0 adds 0). Money: only when amountMinor is truthy (non-zero) AND
+    currency is a non-empty string; the bucket is grantedValueMinor when kind == "grant" or
+    source == "admin", else paidMinor; bucket[currency] = (bucket[currency] or 0) + amountMinor.
+    Currencies are case-sensitive keys. Negative and decimal amounts are added as given.
+  rollover(previous, current, used, now): `used` is a table {productId: {"<start>": credits}}
+    (start rendered with Number→String); a missing product or start means 0. It is the allowance
+    consumed in that settled window. Algorithm (step = weekSeconds*1000):
+      continuing = previous and current and previous.key == current.key
+      following(s) = s + step when current is null, else
+        min(s + step, current.periodStart + (floor((s - current.periodStart) / current.periodMs) + 1) * current.periodMs)
+      for (productId, w) in previous.products (JavaScript property order, see below):
+        next = the current product with that id when continuing, else none
+        skip when next and next.start == w.start
+        closedAt = next ? min(following(w.start), next.start) : min(w.start + step, now)
+        skipped = 0; if next: s = closedAt; while s < next.start and skipped < 520: skipped++, s = following(s)
+        unused = max(0, w.allowance - used[productId][w.start]); expired = unused + skipped * w.allowance
+        if expired > 0: expiry entry {at: closedAt, kind: "expiry", credits: -expired, productId,
+          reason: skipped > 0 ? "<name>: unused allowance of <skipped+1> weeks expired"
+                  : next ? "<name>: unused weekly allowance expired" : "<name>: allowance ended with the plan",
+          details: {unused, skippedWeeks: skipped}, seed: "expiry:<previous.key>:<productId>:<w.start>:<now>"}
+      state = current ? {key, products: {id: {start, allowance: weeklyLimit, name, weekSeconds}}} : null
+      for product in current.products (array order):
+        skip when continuing and previous.products[id].start == product.start
+        allowance entry {at: (previous and not continuing) ? max(product.start, now) : product.start,
+          kind: "allowance", credits: weeklyLimit (0 included), productId, reason: "<name>: weekly allowance",
+          seed: "allowance:<current.key>:<id>:<product.start>:<now>"}
+    Order of `entries` (V8 sort with the reference comparator; ports must reproduce it exactly):
+    stable ascending by `at`; within the same `at`, expiry entries come first in REVERSE generation
+    order, then allowance entries in generation order. Expiries are generated in JavaScript own-key
+    order of previous.products: array-index keys ("0".."4294967294", canonical decimal) ascending
+    numerically, then the other keys in the order they appear in the JSON object.
+  Numbers are IEEE-754 float64 (JavaScript Number): 0.1 + 0.2 credits is 0.30000000000000004,
+  never a decimal type. Timestamps are epoch milliseconds. Errors: none of these functions validate
+  input; validation happens in the service (see subscriptions-credits).
+subject: subscriptions-ledger
+init: {}
+cases:
+  # --- partition and sort keys -----------------------------------------------------------------
+  - name: LEDGER is the per-user statement partition
+    steps:
+      - { call: LEDGER, args: [ alice ], expect: { value: "SUB_LEDGER#alice" } }
+      - { call: LEDGER, args: [ "" ], expect: { value: "SUB_LEDGER#" } }
+      - { call: LEDGER, args: [ "usuario-ñ" ], expect: { value: "SUB_LEDGER#usuario-ñ" } }
+
+  - name: emptyTotals has zero counters and empty currency maps
+    call: emptyTotals
+    args: []
+    expect: { value: { creditsIn: 0, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+
+  - name: ledgerKey pads time to 15 and sequence to 10, then 16 hex chars of sha256(seed)
+    steps:
+      - call: ledgerKey
+        args: [ 0, "", 0 ]
+        expect: { value: "000000000000000-0000000000-e3b0c44298fc1c14" }
+      - call: ledgerKey
+        args: [ 1788220800000, abc, 7 ]
+        expect: { value: "001788220800000-0000000007-ba7816bf8f01cfea" }
+
+  - name: ledgerKey sequence defaults to 0
+    steps:
+      - { call: ledgerKey, args: [ 1788220800000, "usage:r1" ], expect: { value: 001788220800000-0000000000-dad77a0b08c85599 } }
+      - { call: ledgerKey, args: [ 1788220800000, "usage:r1", null ], expect: { value: { $ref: "0.value" } } }
+      - { call: ledgerKey, args: [ 1788220800000, "usage:r1", 0 ], expect: { value: { $ref: "0.value" } } }
+
+  - name: ledgerKey orders writes within the same millisecond by sequence
+    note: the keys differ only in the zero-padded sequence, so 9 < 10 < 11 in code point order
+    steps:
+      - { call: ledgerKey, args: [ 1788220800000, "plan:k1", 9 ], expect: { value: 001788220800000-0000000009-0c770aa9955ee863 } }
+      - { call: ledgerKey, args: [ 1788220800000, "allowance:own:pro:api:1788220800000:1788220800000", 10 ], expect: { value: 001788220800000-0000000010-aeb066f294f05dba } }
+      - { call: ledgerKey, args: [ 1788220800000, "usage:r1", 11 ], expect: { value: 001788220800000-0000000011-dad77a0b08c85599 } }
+      - { call: ledgerKey, args: [ 1788220800001, "usage:r0", 1 ], expect: { value: 001788220800001-0000000001-659a94a3b7da17cf } }
+
+  - name: ledgerKey hashes seeds as UTF-8
+    tags: [ edge, unicode ]
+    steps:
+      - { call: ledgerKey, args: [ 1, "ñ", 1 ], expect: { value: 000000000000001-0000000001-024bb90888ca89a1 } }
+      - { call: ledgerKey, args: [ 1, "😀 credits", 1 ], expect: { value: 000000000000001-0000000001-5347e23b1d792671 } }
+      - { call: ledgerKey, args: [ 1, "expiry:own:starter:api:0:604800005", 1 ], expect: { value: 000000000000001-0000000001-72ae9e5127b3ba79 } }
+      - { call: ledgerKey, args: [ 1, { $text: { repeat: "seed-", count: 2000 } }, 1 ], expect: { value: 000000000000001-0000000001-478b6dd51242e9bb } }
+
+  - name: ledgerKey encodes a lone surrogate in the seed as U+FFFD
+    tags: [ edge, unicode, quirk ]
+    steps:
+      - { call: ledgerKey, args: [ 1, "a\ud800b", 1 ], expect: { value: 000000000000001-0000000001-05087813392efc16 } }
+      - { call: ledgerKey, args: [ 1, "a�b", 1 ], expect: { value: { $ref: "0.value" } } }
+
+  - name: ledgerKey with very large timestamps and sequences
+    tags: [ edge, time ]
+    steps:
+      - { call: ledgerKey, args: [ 253402300799999, s, 1 ], note: "9999-12-31T23:59:59.999Z still fits 15 digits", expect: { value: 253402300799999-0000000001-043a718774c572bd } }
+      - { call: ledgerKey, args: [ 999999999999999, s, 9999999999 ], expect: { value: 999999999999999-9999999999-043a718774c572bd } }
+      - { call: ledgerKey, args: [ 9007199254740991, s, 1 ], note: "16 digits: no truncation, the key gets longer (ordering breaks)", expect: { value: 9007199254740991-0000000001-043a718774c572bd } }
+      - { call: ledgerKey, args: [ 1000000000000000, s, 10000000000 ], expect: { value: 1000000000000000-10000000000-043a718774c572bd } }
+
+  - name: ledgerKey renders non-integer and negative numbers with JavaScript Number to String
+    tags: [ edge, quirk ]
+    steps:
+      - { call: ledgerKey, args: [ -1, s, 0 ], expect: { value: 0000000000000-1-0000000000-043a718774c572bd } }
+      - { call: ledgerKey, args: [ 1.5, s, 2.5 ], expect: { value: 0000000000001.5-00000002.5-043a718774c572bd } }
+      - { call: ledgerKey, args: [ 1e+21, s, 0 ], expect: { value: 00000000001e+21-0000000000-043a718774c572bd } }
+      - { call: ledgerKey, args: [ 0.000001, s, 0 ], expect: { value: 00000000.000001-0000000000-043a718774c572bd } }
+      - { call: ledgerKey, args: [ 1e-7, s, 0 ], expect: { value: 000000000001e-7-0000000000-043a718774c572bd } }
+
+  # --- entry writes ----------------------------------------------------------------------------
+  - name: ledgerWrite builds the entry with its key and a conditional create
+    steps:
+      - { call: ledgerKey, args: [ 1788220800000, "usage:job-1", 3 ], expect: { value: 001788220800000-0000000003-d6c8afc5ac96ab24 } }
+      - call: ledgerWrite
+        args:
+          - alice
+          - { at: 1788220800000, kind: usage, source: api, credits: -30, productId: api, reason: Batch export, requestId: job-1, fromAllowance: 30, fromBalance: 0, available: 70, details: { rows: 1200, dryRun: false, format: csv } }
+          - "usage:job-1"
+          - 3
+        expect:
+          value:
+            entry: { id: { $ref: "0.value" }, at: 1788220800000, kind: usage, source: api, credits: -30, productId: api, reason: Batch export, requestId: job-1, fromAllowance: 30, fromBalance: 0, available: 70, details: { rows: 1200, dryRun: false, format: csv } }
+            write:
+              row:
+                pk: "SUB_LEDGER#alice"
+                sk: { $ref: "0.value" }
+                version: 1
+                data: { id: { $ref: "0.value" }, at: 1788220800000, kind: usage, source: api, credits: -30, productId: api, reason: Batch export, requestId: job-1, fromAllowance: 30, fromBalance: 0, available: 70, details: { rows: 1200, dryRun: false, format: csv } }
+              expected: null
+
+  - name: ledgerWrite replaces a given id, keeps unknown fields and defaults the sequence to 0
+    tags: [ edge ]
+    steps:
+      - { call: ledgerKey, args: [ 5, "grant:g1", 0 ], expect: { value: 000000000000005-0000000000-4abfbe07ca6291fc } }
+      - call: ledgerWrite
+        args: [ bob, { id: forged, at: 5, kind: grant, source: admin, credits: 250, reason: Courtesy, amountMinor: 0, currency: usd, actorId: root, extra: kept }, "grant:g1" ]
+        expect:
+          value:
+            entry: { id: { $ref: "0.value" }, at: 5, kind: grant, source: admin, credits: 250, reason: Courtesy, amountMinor: 0, currency: usd, actorId: root, extra: kept }
+            write: { row: { pk: "SUB_LEDGER#bob", sk: { $ref: "0.value" }, version: 1, data: { id: { $ref: "0.value" }, at: 5, kind: grant, source: admin, credits: 250, reason: Courtesy, amountMinor: 0, currency: usd, actorId: root, extra: kept } }, expected: null }
+
+  - name: ledgerWrite with a minimal plan entry
+    call: ledgerWrite
+    args: [ carol, { at: 1788220800000, kind: plan, source: user, credits: 0, planId: pro, reason: "Plan started: Pro" }, "plan:op-1", 1 ]
+    expect: { value: { entry: { at: 1788220800000, kind: plan, source: user, credits: 0, planId: pro, reason: "Plan started: Pro", id: 001788220800000-0000000001-22685753e366d241 }, write: { row: { pk: SUB_LEDGER#carol, sk: 001788220800000-0000000001-22685753e366d241, version: 1, data: { at: 1788220800000, kind: plan, source: user, credits: 0, planId: pro, reason: "Plan started: Pro", id: 001788220800000-0000000001-22685753e366d241 } }, expected: null } } }
+
+  # --- running totals --------------------------------------------------------------------------
+  - name: applyTotals starts from empty totals when none are stored
+    call: applyTotals
+    args: [ null, { id: k, at: 0, kind: allowance, source: system, credits: 500, reason: w } ]
+    expect: { value: { creditsIn: 500, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+
+  - name: applyTotals folds every kind by the sign of its credits, expiries apart
+    steps:
+      - call: applyTotals
+        args: [ null, { id: k1, at: 0, kind: allowance, source: system, credits: 500, reason: w } ]
+        expect: { value: { creditsIn: 500, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "0.value" }, { id: k2, at: 1, kind: plan, source: user, credits: 0, reason: p } ]
+        expect: { value: { creditsIn: 500, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "1.value" }, { id: k3, at: 2, kind: usage, source: api, credits: -80, reason: u } ]
+        expect: { value: { creditsIn: 500, creditsOut: 80, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "2.value" }, { id: k4, at: 3, kind: expiry, source: system, credits: -420, reason: e } ]
+        expect: { value: { creditsIn: 500, creditsOut: 80, expired: 420, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "3.value" }, { id: k5, at: 4, kind: grant, source: admin, credits: 250, reason: g } ]
+        expect: { value: { creditsIn: 750, creditsOut: 80, expired: 420, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "4.value" }, { id: k6, at: 5, kind: purchase, source: billing, credits: 300, reason: t } ]
+        expect: { value: { creditsIn: 1050, creditsOut: 80, expired: 420, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "5.value" }, { id: k7, at: 6, kind: adjustment, source: admin, credits: -5, reason: a } ]
+        expect: { value: { creditsIn: 1050, creditsOut: 85, expired: 420, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "6.value" }, { id: k8, at: 7, kind: adjustment, source: api, credits: 5, reason: a } ]
+        expect: { value: { creditsIn: 1055, creditsOut: 85, expired: 420, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "7.value" }, { id: k9, at: 8, kind: reset, source: admin, credits: 1000, reason: r } ]
+        expect: { value: { creditsIn: 2055, creditsOut: 85, expired: 420, paidMinor: {}, grantedValueMinor: {} } }
+
+  - name: a positive expiry lowers the expired total
+    tags: [ edge, quirk ]
+    call: applyTotals
+    args: [ { creditsIn: 0, creditsOut: 0, expired: 100, paidMinor: {}, grantedValueMinor: {} }, { id: k, at: 0, kind: expiry, source: system, credits: 30, reason: e } ]
+    expect: { value: { creditsIn: 0, creditsOut: 0, expired: 70, paidMinor: {}, grantedValueMinor: {} } }
+
+  - name: applyTotals keeps unknown fields of the stored totals
+    tags: [ edge ]
+    call: applyTotals
+    args: [ { creditsIn: 1, creditsOut: 2, expired: 3, paidMinor: { usd: 10 }, grantedValueMinor: { eur: 5 }, consumed: 90 }, { id: k, at: 0, kind: usage, source: api, credits: -1, reason: u } ]
+    expect: { value: { creditsIn: 1, creditsOut: 3, expired: 3, paidMinor: { usd: 10 }, grantedValueMinor: { eur: 5 }, consumed: 90 } }
+
+  - name: money goes to paidMinor for purchases and paid plans, to grantedValueMinor for grants and admin entries
+    tags: [ currency ]
+    steps:
+      - call: applyTotals
+        args: [ null, { id: k1, at: 0, kind: purchase, source: billing, credits: 300, reason: t, amountMinor: 300, currency: usd } ]
+        expect: { value: { creditsIn: 300, creditsOut: 0, expired: 0, paidMinor: { usd: 300 }, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "0.value" }, { id: k2, at: 1, kind: plan, source: billing, credits: 0, reason: p, amountMinor: 2000, currency: usd } ]
+        expect: { value: { creditsIn: 300, creditsOut: 0, expired: 0, paidMinor: { usd: 2300 }, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "1.value" }, { id: k3, at: 2, kind: grant, source: admin, credits: 250, reason: g, amountMinor: 1500, currency: eur } ]
+        expect: { value: { creditsIn: 550, creditsOut: 0, expired: 0, paidMinor: { usd: 2300 }, grantedValueMinor: { eur: 1500 } } }
+      - call: applyTotals
+        args: [ { $ref: "2.value" }, { id: k4, at: 3, kind: plan, source: admin, credits: 0, reason: assigned, amountMinor: 2000, currency: usd } ]
+        expect: { value: { creditsIn: 550, creditsOut: 0, expired: 0, paidMinor: { usd: 2300 }, grantedValueMinor: { eur: 1500, usd: 2000 } } }
+        note: source admin wins over kind
+      - call: applyTotals
+        args: [ { $ref: "3.value" }, { id: k5, at: 4, kind: purchase, source: admin, credits: 10, reason: t, amountMinor: 7, currency: jpy } ]
+        expect: { value: { creditsIn: 560, creditsOut: 0, expired: 0, paidMinor: { usd: 2300 }, grantedValueMinor: { eur: 1500, usd: 2000, jpy: 7 } } }
+      - call: applyTotals
+        args: [ { $ref: "4.value" }, { id: k6, at: 5, kind: grant, source: api, credits: 1, reason: g, amountMinor: 3, currency: usd } ]
+        expect: { value: { creditsIn: 561, creditsOut: 0, expired: 0, paidMinor: { usd: 2300 }, grantedValueMinor: { eur: 1500, usd: 2003, jpy: 7 } } }
+        note: kind grant wins over a non-admin source
+
+  - name: money is ignored without a non-zero amount and a currency
+    tags: [ currency, edge ]
+    steps:
+      - call: applyTotals
+        args: [ null, { id: k1, at: 0, kind: purchase, source: billing, credits: 1, reason: t, amountMinor: 0, currency: usd } ]
+        expect: { value: { creditsIn: 1, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ null, { id: k2, at: 0, kind: purchase, source: billing, credits: 1, reason: t, amountMinor: 100 } ]
+        expect: { value: { creditsIn: 1, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ null, { id: k3, at: 0, kind: purchase, source: billing, credits: 1, reason: t, amountMinor: 100, currency: "" } ]
+        expect: { value: { creditsIn: 1, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ null, { id: k4, at: 0, kind: purchase, source: billing, credits: 1, reason: t, currency: usd } ]
+        expect: { value: { creditsIn: 1, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+
+  - name: currencies are case-sensitive buckets and amounts are added as given
+    tags: [ currency, edge, quirk ]
+    steps:
+      - call: applyTotals
+        args: [ { creditsIn: 0, creditsOut: 0, expired: 0, paidMinor: { usd: 500 }, grantedValueMinor: {} }, { id: k1, at: 0, kind: purchase, source: billing, credits: 1, reason: t, amountMinor: 100, currency: USD } ]
+        expect: { value: { creditsIn: 1, creditsOut: 0, expired: 0, paidMinor: { usd: 500, USD: 100 }, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "0.value" }, { id: k2, at: 1, kind: adjustment, source: billing, credits: -1, reason: refund, amountMinor: -200, currency: usd } ]
+        expect: { value: { creditsIn: 1, creditsOut: 1, expired: 0, paidMinor: { usd: 300, USD: 100 }, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "1.value" }, { id: k3, at: 2, kind: purchase, source: user, credits: 1, reason: t, amountMinor: 0.5, currency: usd } ]
+        expect: { value: { creditsIn: 2, creditsOut: 1, expired: 0, paidMinor: { usd: 300.5, USD: 100 }, grantedValueMinor: {} } }
+
+  - name: decimal credits follow IEEE-754 double arithmetic
+    tags: [ float ]
+    steps:
+      - call: applyTotals
+        args: [ null, { id: k1, at: 0, kind: grant, source: api, credits: 0.1, reason: a } ]
+        expect: { value: { creditsIn: 0.1, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "0.value" }, { id: k2, at: 1, kind: grant, source: api, credits: 0.2, reason: a } ]
+        expect: { value: { creditsIn: 0.30000000000000004, creditsOut: 0, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "1.value" }, { id: k3, at: 2, kind: usage, source: api, credits: -0.25, reason: u } ]
+        expect: { value: { creditsIn: 0.30000000000000004, creditsOut: 0.25, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "2.value" }, { id: k4, at: 3, kind: usage, source: api, credits: -0.1, reason: u } ]
+        expect: { value: { creditsIn: 0.30000000000000004, creditsOut: 0.35, expired: 0, paidMinor: {}, grantedValueMinor: {} } }
+      - call: applyTotals
+        args: [ { $ref: "3.value" }, { id: k5, at: 4, kind: expiry, source: system, credits: -0.7, reason: e } ]
+        expect: { value: { creditsIn: 0.30000000000000004, creditsOut: 0.35, expired: 0.7, paidMinor: {}, grantedValueMinor: {} } }
+
+  - name: zero credits count as a debit of zero
+    tags: [ edge ]
+    call: applyTotals
+    args: [ { creditsIn: 3, creditsOut: 4, expired: 5, paidMinor: {}, grantedValueMinor: {} }, { id: k, at: 0, kind: grant, source: admin, credits: 0, reason: z } ]
+    expect: { value: { creditsIn: 3, creditsOut: 4, expired: 5, paidMinor: {}, grantedValueMinor: {} } }
+
+  - name: totals beyond 2^53 lose integer precision like float64
+    tags: [ edge, float ]
+    call: applyTotals
+    args: [ { creditsIn: 9007199254740991, creditsOut: 0, expired: 0, paidMinor: { usd: 9007199254740991 }, grantedValueMinor: {} }, { id: k, at: 0, kind: purchase, source: billing, credits: 2, reason: t, amountMinor: 2, currency: usd } ]
+    expect: { value: { creditsIn: 9007199254740992, creditsOut: 0, expired: 0, paidMinor: { usd: 9007199254740992 }, grantedValueMinor: {} } }
+
+  # --- allowance windows -----------------------------------------------------------------------
+  # W = 604800000 (one week in ms), D = 86400000 (one day), P30 = 2592000000 (30-day period).
+  - name: nothing settled and no entitlement produces nothing
+    call: rollover
+    args: [ null, null, {}, 1788220800000 ]
+    expect: { value: { entries: [], state: null } }
+
+  - name: the first window grants its allowance at the window start
+    call: rollover
+    args:
+      - null
+      - { key: "own:starter", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 0 } ] }
+      - {}
+      - 1000
+    expect:
+      value:
+        entries:
+          - { at: 0, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:starter:api:0:1000" }
+        state: { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+
+  - name: the same window settles nothing
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:starter", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 0 } ] }
+      - { api: { "0": 120 } }
+      - 5000
+    expect: { value: { entries: [], state: { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } } } }
+
+  - name: the next window expires the unused allowance and grants a new one
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:starter", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 604800000 } ] }
+      - { api: { "0": 120 } }
+      - 604800005
+    expect:
+      value:
+        entries:
+          - { at: 604800000, kind: expiry, credits: -380, productId: api, reason: "API credits: unused weekly allowance expired", details: { unused: 380, skippedWeeks: 0 }, seed: "expiry:own:starter:api:0:604800005" }
+          - { at: 604800000, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:starter:api:604800000:604800005" }
+        state: { key: "own:starter", products: { api: { start: 604800000, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+
+  - name: used is read only for the settled window start
+    tags: [ edge ]
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:starter", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 604800000 } ] }
+      - { api: { "604800000": 400 }, other: { "0": 500 } }
+      - 604800000
+    expect:
+      value:
+        entries:
+          - { at: 604800000, kind: expiry, credits: -500, productId: api, reason: "API credits: unused weekly allowance expired", details: { unused: 500, skippedWeeks: 0 }, seed: "expiry:own:starter:api:0:604800000" }
+          - { at: 604800000, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:starter:api:604800000:604800000" }
+        state: { $any: true }
+
+  - name: a fully used or overused allowance expires nothing
+    tags: [ edge ]
+    steps:
+      - call: rollover
+        args:
+          - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+          - { key: "own:starter", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 604800000 } ] }
+          - { api: { "0": 500 } }
+          - 604800000
+        expect: { value: { entries: [ { at: 604800000, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:starter:api:604800000:604800000" } ], state: { $any: true } } }
+      - call: rollover
+        args:
+          - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+          - { key: "own:starter", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 604800000 } ] }
+          - { api: { "0": 650 } }
+          - 604800000
+        expect: { value: { entries: [ { at: 604800000, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:starter:api:604800000:604800000" } ], state: { $any: true } } }
+
+  - name: negative usage makes the expiry larger than the allowance
+    tags: [ edge, quirk ]
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:starter", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 604800000 } ] }
+      - { api: { "0": -100 } }
+      - 604800000
+    expect:
+      value:
+        entries:
+          - { $partial: { kind: expiry, credits: -600, details: { unused: 600, skippedWeeks: 0 } } }
+          - { $partial: { kind: allowance, credits: 500 } }
+        state: { $any: true }
+
+  - name: idle weeks are folded into one expiry
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:starter", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 1814400000 } ] }
+      - { api: { "0": 0 } }
+      - 1814401000
+    expect:
+      value:
+        entries:
+          - { at: 604800000, kind: expiry, credits: -1500, productId: api, reason: "API credits: unused allowance of 3 weeks expired", details: { unused: 500, skippedWeeks: 2 }, seed: "expiry:own:starter:api:0:1814401000" }
+          - { at: 1814400000, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:starter:api:1814400000:1814401000" }
+        state: { key: "own:starter", products: { api: { start: 1814400000, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+
+  - name: the idle walk stops after 520 skipped weeks
+    tags: [ edge ]
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:starter", periodStart: 0, periodMs: 1000000000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 362880000000 } ] }
+      - { api: { "0": 100 } }
+      - 362880000000
+    expect:
+      value:
+        entries:
+          - { at: 604800000, kind: expiry, credits: -260400, productId: api, reason: "API credits: unused allowance of 521 weeks expired", details: { unused: 400, skippedWeeks: 520 }, seed: "expiry:own:starter:api:0:362880000000" }
+          - { $partial: { at: 362880000000, kind: allowance, credits: 500 } }
+        state: { $any: true }
+
+  - name: weekly windows restart at the period boundary
+    tags: [ period ]
+    note: 10-day period; the week that started on day 7 is cut at day 10
+    call: rollover
+    args:
+      - { key: "own:short", products: { api: { start: 604800000, allowance: 70, name: API, weekSeconds: 604800 } } }
+      - { key: "own:short", periodStart: 0, periodMs: 864000000, products: [ { id: api, name: API, weeklyLimit: 70, weekSeconds: 604800, start: 864000000 } ] }
+      - { api: { "604800000": 20 } }
+      - 864000001
+    expect:
+      value:
+        entries:
+          - { at: 864000000, kind: expiry, credits: -50, productId: api, reason: "API: unused weekly allowance expired", details: { unused: 50, skippedWeeks: 0 }, seed: "expiry:own:short:api:604800000:864000001" }
+          - { at: 864000000, kind: allowance, credits: 70, productId: api, reason: "API: weekly allowance", seed: "allowance:own:short:api:864000000:864000001" }
+        state: { key: "own:short", products: { api: { start: 864000000, allowance: 70, name: API, weekSeconds: 604800 } } }
+
+  - name: idle weeks across period boundaries count the cut windows too
+    tags: [ period ]
+    note: 10-day period, windows 0-7, 7-10, 10-17, 17-20, 20-27 (days)
+    call: rollover
+    args:
+      - { key: "own:short", products: { api: { start: 0, allowance: 70, name: API, weekSeconds: 604800 } } }
+      - { key: "own:short", periodStart: 0, periodMs: 864000000, products: [ { id: api, name: API, weeklyLimit: 70, weekSeconds: 604800, start: 1728000000 } ] }
+      - { api: { "0": 70 } }
+      - 1728000000
+    expect:
+      value:
+        entries:
+          - { at: 604800000, kind: expiry, credits: -210, productId: api, reason: "API: unused allowance of 4 weeks expired", details: { unused: 0, skippedWeeks: 3 }, seed: "expiry:own:short:api:0:1728000000" }
+          - { at: 1728000000, kind: allowance, credits: 70, productId: api, reason: "API: weekly allowance", seed: "allowance:own:short:api:1728000000:1728000000" }
+        state: { $any: true }
+
+  - name: a renewal re-anchors windows that started before the new period
+    tags: [ period ]
+    note: the period renewed on day 30; the week that started on day 28 closes on day 30
+    call: rollover
+    args:
+      - { key: "own:pro", products: { api: { start: 2419200000, allowance: 5000, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:pro", periodStart: 2592000000, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 5000, weekSeconds: 604800, start: 2592000000 } ] }
+      - { api: { "2419200000": 1000 } }
+      - 2600000000
+    expect:
+      value:
+        entries:
+          - { at: 2592000000, kind: expiry, credits: -4000, productId: api, reason: "API credits: unused weekly allowance expired", details: { unused: 4000, skippedWeeks: 0 }, seed: "expiry:own:pro:api:2419200000:2600000000" }
+          - { at: 2592000000, kind: allowance, credits: 5000, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:pro:api:2592000000:2600000000" }
+        state: { key: "own:pro", products: { api: { start: 2592000000, allowance: 5000, name: API credits, weekSeconds: 604800 } } }
+
+  - name: a window start that moves backwards closes at the new start
+    tags: [ edge, quirk ]
+    note: the expiry is dated before the window it closes started
+    call: rollover
+    args:
+      - { key: "own:pro", products: { api: { start: 604800000, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:pro", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 0 } ] }
+      - {}
+      - 700000000
+    expect: { value: { entries: [ { at: 0, kind: expiry, credits: -500, productId: api, reason: "API credits: unused weekly allowance expired", details: { unused: 500, skippedWeeks: 0 }, seed: expiry:own:pro:api:604800000:700000000 }, { at: 0, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", seed: allowance:own:pro:api:0:700000000 } ], state: { key: own:pro, products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } } } }
+
+  - name: a plan change mid-window closes the old allowance now and opens the new one now
+    tags: [ plan-change ]
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:pro", periodStart: 259200000, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 5000, weekSeconds: 604800, start: 259200000 } ] }
+      - { api: { "0": 100 } }
+      - 259200000
+    expect:
+      value:
+        entries:
+          - { at: 259200000, kind: expiry, credits: -400, productId: api, reason: "API credits: allowance ended with the plan", details: { unused: 400, skippedWeeks: 0 }, seed: "expiry:own:starter:api:0:259200000" }
+          - { at: 259200000, kind: allowance, credits: 5000, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:pro:api:259200000:259200000" }
+        state: { key: "own:pro", products: { api: { start: 259200000, allowance: 5000, name: API credits, weekSeconds: 604800 } } }
+
+  - name: after a key change the new allowance is dated no earlier than now
+    tags: [ plan-change, edge ]
+    note: an administrator assignment whose counters started earlier (start 0) is granted at now
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "admin:pro", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 5000, weekSeconds: 604800, start: 0 } ] }
+      - { api: { "0": 500 } }
+      - 172800000
+    expect:
+      value:
+        entries:
+          - { at: 172800000, kind: allowance, credits: 5000, productId: api, reason: "API credits: weekly allowance", seed: "allowance:admin:pro:api:0:172800000" }
+        state: { key: "admin:pro", products: { api: { start: 0, allowance: 5000, name: API credits, weekSeconds: 604800 } } }
+
+  - name: a key change after idle weeks expires only the last settled window
+    tags: [ plan-change, edge, quirk ]
+    note: without a continuing window there is no idle walk; the closed window is dated at its natural end
+    call: rollover
+    args:
+      - { key: "own:starter", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 } } }
+      - { key: "own:pro", periodStart: 1814400000, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 5000, weekSeconds: 604800, start: 1814400000 } ] }
+      - { api: { "0": 0 } }
+      - 1900000000
+    expect:
+      value:
+        entries:
+          - { at: 604800000, kind: expiry, credits: -500, productId: api, reason: "API credits: allowance ended with the plan", details: { unused: 500, skippedWeeks: 0 }, seed: "expiry:own:starter:api:0:1900000000" }
+          - { at: 1900000000, kind: allowance, credits: 5000, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:pro:api:1814400000:1900000000" }
+        state: { $any: true }
+
+  - name: an ended plan expires its allowance now and leaves no state
+    tags: [ expiry ]
+    steps:
+      - call: rollover
+        args:
+          - { key: "admin:pro", products: { api: { start: 0, allowance: 5000, name: API credits, weekSeconds: 604800 } } }
+          - null
+          - { api: { "0": 50 } }
+          - 172800000
+        expect:
+          value:
+            entries:
+              - { at: 172800000, kind: expiry, credits: -4950, productId: api, reason: "API credits: allowance ended with the plan", details: { unused: 4950, skippedWeeks: 0 }, seed: "expiry:admin:pro:api:0:172800000" }
+            state: null
+      - call: rollover
+        args:
+          - { key: "admin:pro", products: { api: { start: 0, allowance: 5000, name: API credits, weekSeconds: 604800 } } }
+          - null
+          - { api: { "0": 50 } }
+          - 3024000000
+        expect:
+          value:
+            entries:
+              - { at: 604800000, kind: expiry, credits: -4950, productId: api, reason: "API credits: allowance ended with the plan", details: { unused: 4950, skippedWeeks: 0 }, seed: "expiry:admin:pro:api:0:3024000000" }
+            state: null
+        note: long after the window ended, it is dated at its natural end
+
+  - name: a product removed from the same plan ends with the plan, a product added starts at its window
+    tags: [ plan-change ]
+    call: rollover
+    args:
+      - { key: "own:team", products: { api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 }, img: { start: 0, allowance: 20, name: Images, weekSeconds: 604800 } } }
+      - { key: "own:team", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 500, weekSeconds: 604800, start: 0 }, { id: video, name: Video, weeklyLimit: 3, weekSeconds: 86400, start: 0 } ] }
+      - { img: { "0": 5 } }
+      - 3600000
+    expect:
+      value:
+        entries:
+          - { at: 0, kind: allowance, credits: 3, productId: video, reason: "Video: weekly allowance", seed: "allowance:own:team:video:0:3600000" }
+          - { at: 3600000, kind: expiry, credits: -15, productId: img, reason: "Images: allowance ended with the plan", details: { unused: 15, skippedWeeks: 0 }, seed: "expiry:own:team:img:0:3600000" }
+        state:
+          key: "own:team"
+          products:
+            api: { start: 0, allowance: 500, name: API credits, weekSeconds: 604800 }
+            video: { start: 0, allowance: 3, name: Video, weekSeconds: 86400 }
+
+  - name: a zero allowance is still granted and never expires
+    tags: [ edge ]
+    call: rollover
+    args:
+      - { key: "own:free", products: { api: { start: 0, allowance: 0, name: API, weekSeconds: 604800 } } }
+      - { key: "own:free", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API, weeklyLimit: 0, weekSeconds: 604800, start: 604800000 } ] }
+      - {}
+      - 604800000
+    expect:
+      value:
+        entries:
+          - { at: 604800000, kind: allowance, credits: 0, productId: api, reason: "API: weekly allowance", seed: "allowance:own:free:api:604800000:604800000" }
+        state: { $any: true }
+
+  - name: decimal allowances expire with float64 arithmetic
+    tags: [ float, edge ]
+    call: rollover
+    args:
+      - { key: "own:x", products: { api: { start: 0, allowance: 0.3, name: API, weekSeconds: 604800 } } }
+      - { key: "own:x", periodStart: 0, periodMs: 2592000000, products: [ { id: api, name: API, weeklyLimit: 0.3, weekSeconds: 604800, start: 1209600000 } ] }
+      - { api: { "0": 0.1 } }
+      - 1209600000
+    expect:
+      value:
+        entries:
+          - { at: 604800000, kind: expiry, credits: -0.5, productId: api, reason: "API: unused allowance of 2 weeks expired", details: { unused: 0.19999999999999998, skippedWeeks: 1 }, seed: "expiry:own:x:api:0:1209600000" }
+          - { at: 1209600000, kind: allowance, credits: 0.3, productId: api, reason: "API: weekly allowance", seed: "allowance:own:x:api:1209600000:1209600000" }
+        state: { $any: true }
+
+  - name: several products are ordered by time, expiries first in reverse key order, then allowances
+    tags: [ ordering, quirk ]
+    note: previous.products key order b, a, 10, 2 generates expiries 2, 10, b, a (array-index keys first)
+    call: rollover
+    args:
+      - key: "own:multi"
+        products:
+          b: { start: 0, allowance: 5, name: B, weekSeconds: 604800 }
+          a: { start: 0, allowance: 5, name: A, weekSeconds: 604800 }
+          "10": { start: 0, allowance: 5, name: Ten, weekSeconds: 604800 }
+          "2": { start: 0, allowance: 5, name: Two, weekSeconds: 604800 }
+      - key: "own:multi"
+        periodStart: 0
+        periodMs: 2592000000
+        products:
+          - { id: b, name: B, weeklyLimit: 7, weekSeconds: 604800, start: 604800000 }
+          - { id: a, name: A, weeklyLimit: 7, weekSeconds: 604800, start: 604800000 }
+          - { id: "10", name: Ten, weeklyLimit: 7, weekSeconds: 604800, start: 604800000 }
+          - { id: "2", name: Two, weeklyLimit: 7, weekSeconds: 604800, start: 604800000 }
+      - {}
+      - 604800005
+    expect:
+      value:
+        entries:
+          - { $partial: { kind: expiry, productId: a, at: 604800000 } }
+          - { $partial: { kind: expiry, productId: b, at: 604800000 } }
+          - { $partial: { kind: expiry, productId: "10", at: 604800000 } }
+          - { $partial: { kind: expiry, productId: "2", at: 604800000 } }
+          - { $partial: { kind: allowance, productId: b, at: 604800000 } }
+          - { $partial: { kind: allowance, productId: a, at: 604800000 } }
+          - { $partial: { kind: allowance, productId: "10", at: 604800000 } }
+          - { $partial: { kind: allowance, productId: "2", at: 604800000 } }
+        state: { $any: true }
+
+  - name: entries with different times are sorted by time across products
+    tags: [ ordering ]
+    call: rollover
+    args:
+      - { key: "own:multi", products: { day: { start: 0, allowance: 10, name: Daily, weekSeconds: 86400 }, week: { start: 0, allowance: 70, name: Weekly, weekSeconds: 604800 } } }
+      - { key: "own:multi", periodStart: 0, periodMs: 2592000000, products: [ { id: week, name: Weekly, weeklyLimit: 70, weekSeconds: 604800, start: 604800000 }, { id: day, name: Daily, weeklyLimit: 10, weekSeconds: 86400, start: 604800000 } ] }
+      - { day: { "0": 4 }, week: { "0": 60 } }
+      - 604800000
+    expect:
+      value:
+        entries:
+          - { at: 86400000, kind: expiry, credits: -66, productId: day, reason: "Daily: unused allowance of 7 weeks expired", details: { unused: 6, skippedWeeks: 6 }, seed: "expiry:own:multi:day:0:604800000" }
+          - { at: 604800000, kind: expiry, credits: -10, productId: week, reason: "Weekly: unused weekly allowance expired", details: { unused: 10, skippedWeeks: 0 }, seed: "expiry:own:multi:week:0:604800000" }
+          - { at: 604800000, kind: allowance, credits: 70, productId: week, reason: "Weekly: weekly allowance", seed: "allowance:own:multi:week:604800000:604800000" }
+          - { at: 604800000, kind: allowance, credits: 10, productId: day, reason: "Daily: weekly allowance", seed: "allowance:own:multi:day:604800000:604800000" }
+        state: { $any: true }
+
+  - name: real epoch timestamps near the year 2026 and 9999
+    tags: [ time ]
+    steps:
+      - call: rollover
+        args:
+          - { key: "own:pro", products: { api: { start: 1788220800000, allowance: 5000, name: API credits, weekSeconds: 604800 } } }
+          - { key: "own:pro", periodStart: 1788220800000, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 5000, weekSeconds: 604800, start: 1788825600000 } ] }
+          - { api: { "1788220800000": 1234 } }
+          - 1788825600123
+        expect:
+          value:
+            entries:
+              - { at: 1788825600000, kind: expiry, credits: -3766, productId: api, reason: "API credits: unused weekly allowance expired", details: { unused: 3766, skippedWeeks: 0 }, seed: "expiry:own:pro:api:1788220800000:1788825600123" }
+              - { at: 1788825600000, kind: allowance, credits: 5000, productId: api, reason: "API credits: weekly allowance", seed: "allowance:own:pro:api:1788825600000:1788825600123" }
+            state: { $any: true }
+      - call: rollover
+        args:
+          - { key: "own:pro", products: { api: { start: 253401696000000, allowance: 5000, name: API credits, weekSeconds: 604800 } } }
+          - { key: "own:pro", periodStart: 253400000000000, periodMs: 2592000000, products: [ { id: api, name: API credits, weeklyLimit: 5000, weekSeconds: 604800, start: 253402300800000 } ] }
+          - {}
+          - 253402300800000
+        expect: { value: { entries: [ { at: 253402300800000, kind: expiry, credits: -5000, productId: api, reason: "API credits: unused weekly allowance expired", details: { unused: 5000, skippedWeeks: 0 }, seed: expiry:own:pro:api:253401696000000:253402300800000 }, { at: 253402300800000, kind: allowance, credits: 5000, productId: api, reason: "API credits: weekly allowance", seed: allowance:own:pro:api:253402300800000:253402300800000 } ], state: { key: own:pro, products: { api: { start: 253402300800000, allowance: 5000, name: API credits, weekSeconds: 604800 } } } } }

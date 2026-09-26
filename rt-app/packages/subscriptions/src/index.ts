@@ -196,9 +196,12 @@ const write = (
   row: { pk, sk, version: (old?.version ?? 0) + 1, data },
   expected: old?.version ?? null,
 });
-/** Non-negative rate with at most 4 decimals, so estimates are reproducible. */
+/**
+ * Non-negative rate with at most 4 decimals, so estimates are reproducible. The decimal check
+ * tolerates float64 noise: 0.57 * 1e4 is 5699.999999999999, and 0.57 is a valid rate.
+ */
 const rate = (n: unknown) => {
-  if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > 1e6 || Math.round(n * 1e4) !== n * 1e4)
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 0 || n > 1e6 || Math.abs(n * 1e4 - Math.round(n * 1e4)) > 1e-6)
     throw new HttpError(400, "Invalid credit rate");
   return n;
 };
