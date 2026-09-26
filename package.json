@@ -19,6 +19,10 @@
     "release:verify": "node rt-app/scripts/release.mjs verify",
     "release:publish": "node rt-app/scripts/release.mjs publish",
     "release:check": "npm run check:architecture && npm run build && npm run prepare:templates && npm run test:coverage && npm run release:pack && npm run release:verify",
+    "contracts": "node rt-app/packages/conformance/bin/rta-contract.mjs test --config rt-app/spec/contracts.json",
+    "contracts:show": "node rt-app/packages/conformance/bin/rta-contract.mjs show --config rt-app/spec/contracts.json",
+    "link:app": "node rt-app/scripts/link-app.mjs link",
+    "unlink:app": "node rt-app/scripts/link-app.mjs unlink",
     "test:coverage": "c8 npm test && node rt-app/scripts/check-coverage.mjs"
   },
   "engines": {

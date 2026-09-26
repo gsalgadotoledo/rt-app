@@ -1,0 +1,208 @@
+contract: 1
+module: feature-flags
+title: Feature flags
+description: |
+  Boolean flags with deterministic percentage rollouts and explicit subjects, stored in a NoSQL
+  store under partition FLAGS. Keys: ^[a-z][a-z0-9._-]{0,79}$. Unknown or disabled flags are off.
+  Rollout bucket: first 4 bytes (big-endian uint32) of sha256(key + "\0" + subject) / 2^32 * 100;
+  the flag is on when bucket < rollout. Errors: 400 for invalid input, 409 for stale versions.
+  String limits count UTF-16 code units (JavaScript `length`), not characters.
+subject: feature-flags
+init: { rows: [] }
+cases:
+  # --- reading ---------------------------------------------------------------
+  - name: unknown flags read as null
+    call: get
+    args: [ checkout ]
+    expect: { value: null }
+
+  - name: keys must be lowercase identifiers
+    tags: [ edge, validation ]
+    steps:
+      - { call: get, args: [ Bad Key ], expect: { error: { status: 400, message: Invalid flag key } } }
+      - { call: get, args: [ 1checkout ], expect: { error: { status: 400, message: Invalid flag key } } }
+      - { call: get, args: [ "" ], expect: { error: { status: 400, message: Invalid flag key } } }
+      - { call: get, args: [ check/out ], expect: { error: { status: 400, message: Invalid flag key } } }
+      - { call: get, args: [ "a-long-key-.............................................................................x" ], expect: { error: { status: 400, message: Invalid flag key } } }
+      - { call: get, args: [ "a.b_c-d9" ], expect: { value: null } }
+
+  - name: the longest valid key has 80 characters
+    tags: [ edge, validation ]
+    call: get
+    args: [ "k2345678901234567890123456789012345678901234567890123456789012345678901234567890" ]
+    expect: { value: null }
+
+  # --- saving ----------------------------------------------------------------
+  - name: create returns version 1 with audit fields and unique subjects
+    call: save
+    args: [ new-checkout, { description: New checkout UI, enabled: true, public: true, rollout: 25, subjects: [ vip, vip, beta ] }, null, owner-1 ]
+    expect:
+      value:
+        key: new-checkout
+        description: New checkout UI
+        enabled: true
+        public: true
+        rollout: 25
+        subjects: [ vip, beta ]
+        version: 1
+        updatedAt: { $type: iso-date }
+        updatedBy: owner-1
+
+  - name: updates need the current version
+    tags: [ concurrency ]
+    steps:
+      - call: save
+        args: [ f, { description: "", enabled: false, public: false, rollout: 0, subjects: [] }, null, a ]
+        expect: { value: { $partial: { version: 1 } } }
+      - call: save
+        args: [ f, { description: "", enabled: true, public: false, rollout: 0, subjects: [] }, null, a ]
+        expect: { error: { status: 409 } }
+        note: creating an existing flag
+      - call: save
+        args: [ f, { description: "", enabled: true, public: false, rollout: 0, subjects: [] }, 7, a ]
+        expect: { error: { status: 409 } }
+        note: stale version
+      - call: save
+        args: [ f, { description: v2, enabled: true, public: false, rollout: 0, subjects: [] }, 1, b ]
+        expect: { value: { $partial: { version: 2, description: v2, updatedBy: b } } }
+      - call: get
+        args: [ f ]
+        expect: { value: { $partial: { version: 2, enabled: true } } }
+
+  - name: invalid configurations are rejected
+    tags: [ edge, validation ]
+    steps:
+      - { call: save, args: [ f, { description: "", enabled: true, public: false, rollout: 101, subjects: [] }, null, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: "", enabled: true, public: false, rollout: -1, subjects: [] }, null, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: "", enabled: "yes", public: false, rollout: 0, subjects: [] }, null, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: "", enabled: true, public: 1, rollout: 0, subjects: [] }, null, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: 5, enabled: true, public: false, rollout: 0, subjects: [] }, null, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: "", enabled: true, public: false, rollout: "50", subjects: [] }, null, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: "", enabled: true, public: false, rollout: 0, subjects: vip }, null, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: "", enabled: true, public: false, rollout: 0, subjects: [ 1 ] }, null, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: "", enabled: true, public: false, rollout: 0, subjects: [] }, 0, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ f, { description: "", enabled: true, public: false, rollout: 0, subjects: [] }, 1.5, a ], expect: { error: { status: 400, message: Invalid flag configuration } } }
+      - { call: save, args: [ Bad, { description: "", enabled: true, public: false, rollout: 0, subjects: [] }, null, a ], expect: { error: { status: 400, message: Invalid flag key } } }
+      - { call: get, args: [ f ], expect: { value: null }, note: nothing was stored }
+
+  - name: limits on description and subjects
+    tags: [ edge, validation ]
+    steps:
+      - call: save
+        args: [ f, { description: { $text: { repeat: x, count: 401 } }, enabled: true, public: false, rollout: 0, subjects: [] }, null, a ]
+        expect: { error: { status: 400, message: Invalid flag configuration } }
+        note: at most 400 characters
+      - call: save
+        args: [ f, { description: "", enabled: true, public: false, rollout: 0, subjects: [ { $repeat: { count: 101, item: "s{i}" } } ] }, null, a ]
+        expect: { error: { status: 400, message: Invalid flag configuration } }
+        note: at most 100 subjects
+      - call: save
+        args: [ f, { description: "", enabled: true, public: false, rollout: 0, subjects: [ { $text: { repeat: s, count: 121 } } ] }, null, a ]
+        expect: { error: { status: 400, message: Invalid flag configuration } }
+        note: subjects have at most 120 characters
+      - call: save
+        args: [ f, { description: { $text: { repeat: x, count: 400 } }, enabled: true, public: false, rollout: 0, subjects: [ { $repeat: { count: 100, item: "s{i}" } } ] }, null, a ]
+        expect: { value: { $partial: { subjects: { $length: 100 }, description: { $length: 400 } } } }
+
+  - name: lengths count UTF-16 code units, like JavaScript
+    tags: [ edge, unicode ]
+    steps:
+      - call: save
+        args: [ f, { description: { $text: { repeat: "😀", count: 201 } }, enabled: true, public: false, rollout: 0, subjects: [] }, null, a ]
+        expect: { error: { status: 400, message: Invalid flag configuration } }
+        note: 201 emoji are 402 UTF-16 units (limit 400); code-point counting would accept it
+      - call: save
+        args: [ f, { description: { $text: { repeat: "😀", count: 200 } }, enabled: true, public: false, rollout: 0, subjects: [ { $text: { repeat: "é", count: 120 } } ] }, null, a ]
+        expect: { value: { $partial: { version: 1 } } }
+      - call: enabled
+        args: [ f, { $text: { repeat: "😀", count: 61 } } ]
+        expect: { error: { status: 400, message: Invalid flag subject } }
+        note: 61 emoji are 122 UTF-16 units (limit 120)
+
+  - name: fractional rollouts are allowed
+    tags: [ edge ]
+    call: save
+    args: [ f, { description: "", enabled: true, public: false, rollout: 12.5, subjects: [] }, null, a ]
+    expect: { value: { $partial: { rollout: 12.5 } } }
+
+  # --- evaluation --------------------------------------------------------------
+  - name: unknown and disabled flags are off
+    init:
+      rows: [ { pk: FLAGS, sk: off, version: 1, data: { key: off, description: "", enabled: false, public: true, rollout: 100, subjects: [ vip ], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a } } ]
+    steps:
+      - { call: enabled, args: [ missing ], expect: { value: false } }
+      - { call: enabled, args: [ "off", vip ], expect: { value: false } }
+
+  - name: listed subjects are always on, even at rollout 0
+    init:
+      rows: [ { pk: FLAGS, sk: beta, version: 1, data: { key: beta, description: "", enabled: true, public: false, rollout: 0, subjects: [ vip ], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a } } ]
+    steps:
+      - { call: enabled, args: [ beta, vip ], expect: { value: true } }
+      - { call: enabled, args: [ beta, someone ], expect: { value: false } }
+      - { call: enabled, args: [ beta ], expect: { value: false } }
+
+  - name: public evaluation only sees public flags
+    tags: [ security ]
+    init:
+      rows: [ { pk: FLAGS, sk: internal, version: 1, data: { key: internal, description: "", enabled: true, public: false, rollout: 100, subjects: [], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a } } ]
+    steps:
+      - { call: enabled, args: [ internal, "", false ], expect: { value: true } }
+      - { call: enabled, args: [ internal, "", true ], expect: { value: false } }
+
+  - name: full rollout is on without a subject; partial rollout needs one
+    init:
+      rows:
+        - { pk: FLAGS, sk: all, version: 1, data: { key: all, description: "", enabled: true, public: true, rollout: 100, subjects: [], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a } }
+        - { pk: FLAGS, sk: half, version: 1, data: { key: half, description: "", enabled: true, public: true, rollout: 50, subjects: [], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a } }
+    steps:
+      - { call: enabled, args: [ all ], expect: { value: true } }
+      - { call: enabled, args: [ half ], expect: { value: false } }
+
+  - name: rollout buckets are deterministic across languages
+    tags: [ hashing ]
+    init:
+      rows:
+        - { pk: FLAGS, sk: half, version: 1, data: { key: half, description: "", enabled: true, public: true, rollout: 50, subjects: [], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a } }
+        - { pk: FLAGS, sk: tiny, version: 1, data: { key: tiny, description: "", enabled: true, public: true, rollout: 3.7, subjects: [], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a } }
+    steps:
+      - { call: enabled, args: [ half, alice ], expect: { value: false } }
+      - { call: enabled, args: [ half, bob ], expect: { value: true } }
+      - { call: enabled, args: [ half, carol ], expect: { value: true } }
+      - { call: enabled, args: [ half, dave ], expect: { value: false } }
+      - { call: enabled, args: [ half, erin ], expect: { value: false } }
+      - { call: enabled, args: [ half, "user-1" ], expect: { value: false } }
+      - { call: enabled, args: [ half, "user-2" ], expect: { value: true } }
+      - { call: enabled, args: [ half, "josé" ], expect: { value: false } }
+      - { call: enabled, args: [ half, "用户" ], expect: { value: false } }
+      - { call: enabled, args: [ half, "😀" ], expect: { value: true } }
+      - { call: enabled, args: [ tiny, "user-1" ], expect: { value: false } }
+      - { call: enabled, args: [ tiny, "user-7" ], expect: { value: false } }
+      - { call: enabled, args: [ tiny, "user-42" ], expect: { value: false } }
+      - { call: enabled, args: [ tiny, "user-3" ], expect: { value: true } }
+      - { call: enabled, args: [ tiny, "user-74" ], expect: { value: true } }
+
+  - name: subjects longer than 120 characters are rejected
+    tags: [ edge, validation ]
+    steps:
+      - call: enabled
+        args: [ f, "sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss" ]
+        expect: { error: { status: 400, message: Invalid flag subject } }
+      - call: enabled
+        args: [ f, 42 ]
+        expect: { error: { status: 400, message: Invalid flag subject } }
+      - call: enabled
+        args: [ Bad Key ]
+        expect: { error: { status: 400, message: Invalid flag key } }
+
+  - name: list returns definitions with versions
+    init:
+      rows:
+        - { pk: FLAGS, sk: b, version: 3, data: { key: b, description: B, enabled: true, public: false, rollout: 10, subjects: [], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a } }
+        - { pk: FLAGS, sk: a, version: 1, data: { key: a, description: A, enabled: false, public: true, rollout: 0, subjects: [ x ], updatedAt: "2026-01-02T00:00:00.000Z", updatedBy: b } }
+    call: list
+    args: []
+    expect:
+      value:
+        items:
+          - { key: a, description: A, enabled: false, public: true, rollout: 0, subjects: [ x ], updatedAt: "2026-01-02T00:00:00.000Z", updatedBy: b, version: 1 }
+          - { key: b, description: B, enabled: true, public: false, rollout: 10, subjects: [], updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: a, version: 3 }

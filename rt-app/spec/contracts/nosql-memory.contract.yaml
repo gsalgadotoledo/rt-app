@@ -1,0 +1,158 @@
+contract: 1
+module: nosql-memory
+title: In-memory NoSQL store
+description: |
+  Reference store for tests and local development. Rows are {pk, sk, version, data, ttl?}.
+  transact() applies version-guarded writes atomically: expected null means "must not exist",
+  a number means "must have exactly this version". list() returns one partition sorted by sk
+  in Unicode code point order (the order DynamoDB uses), 50 rows per page, with an opaque cursor.
+subject: nosql-memory
+init: { rows: [] }
+cases:
+  - name: missing rows read as null
+    call: get
+    args: [USERS, alice]
+    expect: { value: null }
+
+  - name: create then read
+    steps:
+      - call: transact
+        args: [[{ row: { pk: USERS, sk: alice, version: 1, data: { name: Alice, tags: [a, b], nested: { n: 1.5 } } }, expected: null }]]
+        expect: { value: null }
+      - call: get
+        args: [USERS, alice]
+        expect: { value: { pk: USERS, sk: alice, version: 1, data: { name: Alice, tags: [a, b], nested: { n: 1.5 } } } }
+
+  - name: creating an existing row conflicts
+    tags: [edge, concurrency]
+    init: { rows: [{ pk: USERS, sk: alice, version: 1, data: {} }] }
+    call: transact
+    args: [[{ row: { pk: USERS, sk: alice, version: 1, data: {} }, expected: null }]]
+    expect: { error: { status: 409, message: "Conflict: refresh and try again" } }
+
+  - name: updates need the current version
+    tags: [concurrency]
+    init: { rows: [{ pk: USERS, sk: alice, version: 1, data: { n: 1 } }] }
+    steps:
+      - call: transact
+        args: [[{ row: { pk: USERS, sk: alice, version: 3, data: { n: 3 } }, expected: 2 }]]
+        expect: { error: { status: 409 } }
+        note: stale version
+      - call: transact
+        args: [[{ row: { pk: USERS, sk: alice, version: 2, data: { n: 2 } }, expected: 1 }]]
+        expect: { value: null }
+      - call: get
+        args: [USERS, alice]
+        expect: { value: { pk: USERS, sk: alice, version: 2, data: { n: 2 } } }
+
+  - name: transactions are all or nothing
+    tags: [edge, concurrency]
+    init: { rows: [{ pk: A, sk: taken, version: 1, data: {} }] }
+    steps:
+      - call: transact
+        args:
+          - - { row: { pk: A, sk: new, version: 1, data: {} }, expected: null }
+            - { row: { pk: A, sk: taken, version: 1, data: {} }, expected: null }
+        expect: { error: { status: 409 } }
+      - call: get
+        args: [A, new]
+        expect: { value: null }
+        note: the first write must not be committed
+
+  - name: the same key twice in one transaction is rejected
+    tags: [edge]
+    call: transact
+    args:
+      - - { row: { pk: A, sk: x, version: 1, data: {} }, expected: null }
+        - { row: { pk: A, sk: x, version: 1, data: {} }, expected: null }
+    expect: { error: { message: Duplicate transaction key } }
+
+  - name: delete needs the current version
+    init: { rows: [{ pk: A, sk: x, version: 4, data: {} }] }
+    steps:
+      - call: transact
+        args: [[{ row: { pk: A, sk: x, version: 4, data: {} }, expected: 3, delete: true }]]
+        expect: { error: { status: 409 } }
+      - call: transact
+        args: [[{ row: { pk: A, sk: x, version: 4, data: {} }, expected: 4, delete: true }]]
+        expect: { value: null }
+      - call: get
+        args: [A, x]
+        expect: { value: null }
+
+  - name: list returns one partition sorted by sort key
+    init:
+      rows:
+        - { pk: P, sk: b, version: 1, data: {} }
+        - { pk: P, sk: a, version: 1, data: {} }
+        - { pk: Q, sk: a, version: 1, data: {} }
+        - { pk: P, sk: B, version: 1, data: {} }
+        - { pk: P, sk: aa, version: 1, data: {} }
+    call: list
+    args: [P]
+    expect:
+      value:
+        items:
+          - { pk: P, sk: B, version: 1, data: {} }
+          - { pk: P, sk: a, version: 1, data: {} }
+          - { pk: P, sk: aa, version: 1, data: {} }
+          - { pk: P, sk: b, version: 1, data: {} }
+
+  - name: sort keys use Unicode code point order
+    tags: [edge, unicode]
+    init:
+      rows:
+        - { pk: P, sk: "😀", version: 1, data: {} }
+        - { pk: P, sk: "�", version: 1, data: {} }
+        - { pk: P, sk: "é", version: 1, data: {} }
+        - { pk: P, sk: "z", version: 1, data: {} }
+    call: list
+    args: [P]
+    expect:
+      value:
+        items:
+          - { pk: P, sk: "z", version: 1, data: {} }
+          - { pk: P, sk: "é", version: 1, data: {} }
+          - { pk: P, sk: "�", version: 1, data: {} }
+          - { pk: P, sk: "😀", version: 1, data: {} }
+    note: JavaScript string comparison uses UTF-16 units and would put 😀 before U+FFFD
+
+  - name: an empty partition has no items and no cursor
+    call: list
+    args: [NOTHING]
+    expect: { value: { items: [] } }
+
+  - name: pages hold 50 rows and the cursor continues
+    tags: [pagination]
+    init:
+      rows:
+        - $repeat: { count: 60, item: { pk: P, sk: "row-{i:03}", version: 1, data: { i: "{i}" } } }
+    steps:
+      - call: list
+        args: [P]
+        expect: { value: { items: { $length: 50 }, cursor: { $type: string } } }
+      - call: list
+        args: [P, { $ref: "0.value.cursor" }]
+        expect:
+          value:
+            items:
+              - $repeat: { count: 10, start: 50, item: { pk: P, sk: "row-{i:03}", version: 1, data: { i: "{i}" } } }
+
+  - name: invalid cursors are rejected
+    tags: [edge, security]
+    call: list
+    args: [P, not-a-cursor]
+    expect: { error: { status: 400, message: Invalid cursor } }
+
+  - name: a cursor cannot be reused on another partition
+    tags: [edge, security]
+    init:
+      rows:
+        - $repeat: { count: 51, item: { pk: P, sk: "k{i:02}", version: 1, data: {} } }
+    steps:
+      - call: list
+        args: [P]
+        expect: { value: { items: { $length: 50 }, cursor: { $type: string } } }
+      - call: list
+        args: [OTHER, { $ref: "0.value.cursor" }]
+        expect: { error: { status: 400, message: Invalid cursor } }

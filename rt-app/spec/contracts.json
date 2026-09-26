@@ -1,0 +1,7 @@
+{
+  "contracts": ["contracts"],
+  "reference": "node",
+  "targets": {
+    "node": { "host": { "command": ["node", "hosts/node.mjs"] } }
+  }
+}

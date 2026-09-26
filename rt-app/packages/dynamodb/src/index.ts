@@ -113,6 +113,20 @@ export class DynamoStore implements Store {
   }
 }
 /** Development/test adapter only. It is NOT a durable production database. */
+/**
+ * Order strings by Unicode code point, like DynamoDB (UTF-8 bytes) and Postgres COLLATE "C".
+ * JavaScript's `<` compares UTF-16 units and puts astral characters (😀) before U+E000–U+FFFF.
+ */
+export function byCodePoint(a: string, b: string): number {
+  const x = a[Symbol.iterator](), y = b[Symbol.iterator]();
+  for (;;) {
+    const p = x.next(), q = y.next();
+    if (p.done || q.done) return p.done && q.done ? 0 : p.done ? -1 : 1;
+    const d = p.value.codePointAt(0)! - q.value.codePointAt(0)!;
+    if (d) return d;
+  }
+}
+
 export class MemoryStore implements Store {
   readonly provider = "memory";
   readonly capabilities = requiredCapabilities;
@@ -151,8 +165,8 @@ export class MemoryStore implements Store {
       }
     }
     const all = [...this.rows.values()]
-      .filter((r) => r.pk === pk && r.sk > after)
-      .sort((a, b) => (a.sk < b.sk ? -1 : 1));
+      .filter((r) => r.pk === pk && byCodePoint(r.sk, after) > 0)
+      .sort((a, b) => byCodePoint(a.sk, b.sk));
     const items = all.slice(0, 50);
     return {
       items: structuredClone(items),
