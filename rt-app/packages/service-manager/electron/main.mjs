@@ -13,6 +13,8 @@ const quit=()=>{quitting=true;app.quit();};
 const show=()=>{window?.show();window?.focus();};
 app.on('before-quit',()=>{quitting=true;});
 app.setName('RT-App Service Manager');
+// Packaged apps get the RT icon from the bundle; development runs set it on the Dock.
+if(process.platform==='darwin'&&!app.isPackaged)app.whenReady().then(()=>app.dock?.setIcon(join(app.getAppPath(),'electron/assets/icon/icon-1024.png')));
 if(!app.requestSingleInstanceLock()){app.quit();}else{
  app.on('second-instance',(_event,argv)=>{if(!argv.includes('--background'))show();});
  app.on('activate',show);
@@ -55,6 +57,8 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('deploy:info',event=>{trusted(event);if(!hub.root)throw new Error('Select a project first');return deployInfo(hub.root);});
    ipcMain.handle('deploy:connect-github',event=>{trusted(event);if(!hub.root)throw new Error('Select a project first');return connectProject(hub.root);});
    ipcMain.handle('deploy:open-admin',async event=>{trusted(event);const admin=new URL(await hub.url('admin'));admin.pathname='/settings/deployments';await shell.openExternal(admin.href);});
+   // Delete: stop the project's services, forget it, move the folder to the Trash (recoverable).
+   ipcMain.handle('projects:delete',async(event,path)=>{trusted(event);if(typeof path!=='string'||!path)throw new Error('Invalid project');const {removed}=await hub.deleteProject(path);await shell.trashItem(removed);return hub.snapshot();});
    ipcMain.handle('services:ports',(event,scope,ports)=>{trusted(event);return hub.setPorts(scope,ports);});
    window.on('close',event=>{if(!quitting){event.preventDefault();window.hide();}});
    tray=await createServiceTray({hub,show,quit});

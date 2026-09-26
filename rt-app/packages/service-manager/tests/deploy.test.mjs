@@ -96,3 +96,18 @@ test('workspace projects are listed without opening them; registered ones keep t
  assert.equal((await hub.projects()).length,1);
  assert.deepEqual((await hub.snapshot()).projects,[{path:join(ws,'beta-app'),name:'beta (opened)'}]);
 });
+
+test('deleteProject forgets a known project and refuses unknown paths',async t=>{
+ const {ServiceHub}=await import('../hub.mjs');
+ const home=await mkdtemp(join(tmpdir(),'sm-del-home-')),ws=await mkdtemp(join(tmpdir(),'sm-del-ws-'));
+ t.after(()=>Promise.all([rm(home,{recursive:true,force:true}),rm(ws,{recursive:true,force:true})]));
+ const {mkdir}=await import('node:fs/promises');
+ for(const name of ['keep','drop']){await mkdir(join(ws,name));await writeFile(join(ws,name,'rt-app.settings.json'),JSON.stringify({version:1}));await writeFile(join(ws,name,'package.json'),JSON.stringify({name}));}
+ await writeFile(join(home,'workspace.json'),JSON.stringify({path:ws}));
+ const hub=new ServiceHub({home});hub.registry=[{path:join(ws,'drop'),name:'drop'}];hub.root=join(ws,'drop');
+ await assert.rejects(hub.deleteProject(join(ws,'nope')),/Unknown project/);
+ assert.deepEqual(await hub.deleteProject(join(ws,'drop')),{removed:join(ws,'drop')});
+ assert.equal(hub.root,null);
+ assert.deepEqual(JSON.parse(await (await import('node:fs/promises')).readFile(join(home,'projects.json'),'utf8')),[]);
+ assert.deepEqual((await hub.deleteProject(join(ws,'keep'))).removed,join(ws,'keep'),'workspace projects can be deleted too');
+});

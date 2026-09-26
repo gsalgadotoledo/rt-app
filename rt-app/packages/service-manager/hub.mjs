@@ -86,6 +86,20 @@ export class ServiceHub {
   }
   return listed;
  }
+ /**
+  * Forget a project before its folder is deleted: shut down its supervisor (services stop) and
+  * remove it from the registry. The folder itself is moved to the Trash by the desktop shell.
+  * Only known projects (opened or found in the workspace) can be removed.
+  */
+ deleteProject(path){return this.exclusive(async()=>{
+  const known=(await this.projects()).find(p=>p.path===path);
+  if(!known)throw new Error('Unknown project');
+  try{await request(path,'shutdown');for(let i=0;i<100;i++){await request(path,'status');await delay(100);}}catch{}
+  this.registry=this.registry.filter(p=>p.path!==path);
+  await save(join(this.home,'projects.json'),this.registry);
+  if(this.root===path)this.root=null;
+  return {removed:known.path};
+ });}
  /** List scripts on demand; polling status never scans the source tree. */
  async commands(){
   if(!this.root) return [];

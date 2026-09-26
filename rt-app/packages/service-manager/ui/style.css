@@ -134,3 +134,49 @@
 .rt-template-prompt{margin:12px 0;border:1px solid var(--line);padding:8px 12px}
 .rt-template-prompt summary{cursor:pointer;font-weight:600}
 .rt-template-prompt pre{white-space:pre-wrap;max-height:320px;overflow:auto;font-size:12px}
+
+/* Create-project wizard: one step at a time, clickable completed steps, footer navigation. */
+ol.rt-wizard-steps{list-style:none;margin:0 0 18px;gap:6px}
+ol.rt-wizard-steps li button{background:none;border:0;padding:4px 8px;color:var(--muted);font-size:12px;display:flex;gap:6px;align-items:center;cursor:pointer}
+ol.rt-wizard-steps li button span{display:inline-grid;place-items:center;min-width:20px;height:20px;border:1px solid var(--line);border-radius:999px;font-size:11px}
+ol.rt-wizard-steps li.done button{color:var(--text)}
+ol.rt-wizard-steps li[aria-current=step] button{color:var(--accent);font-weight:600}
+ol.rt-wizard-steps li[aria-current=step] button span{border-color:var(--accent)}
+ol.rt-wizard-steps li button:disabled{cursor:default}
+.rt-wizard-nav{display:flex;justify-content:space-between;gap:10px;margin-top:20px;border-top:1px solid var(--line);padding-top:14px}
+.rt-wizard-nav .primary:only-child{margin-left:auto}
+.rt-wizard-summary{font-size:13px}
+.rt-wizard-done{border:1px solid var(--accent);padding:14px;margin-top:12px}
+.rt-wizard-done h3{margin:0 0 6px}
+.rt-project-wizard .rt-wizard-log{max-height:320px}
+
+/* Delete project: a quiet entry point and an explicit confirmation. */
+.rt-danger-link{color:var(--danger,#ff7a7a)}
+.rt-danger{border-color:var(--danger,#ff7a7a);color:var(--danger,#ff7a7a)}
+.rt-delete-confirm{border:1px solid var(--danger,#ff7a7a);padding:14px;margin:0 0 16px}
+.rt-delete-confirm p{margin:0 0 10px}
+
+/* Sidebar: the project list is the navigation. */
+.rt-sidebar-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.rt-new-project{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:5px 10px}
+.rt-new-project span{font-size:14px;line-height:1}
+.rt-project-list{display:flex;flex-direction:column;gap:2px;overflow:auto;flex:1;min-height:0}
+.rt-project-list button{display:flex;flex-direction:column;align-items:flex-start;gap:2px;text-align:left;border:0;border-left:2px solid transparent;background:none;padding:7px 10px;border-radius:0;width:100%}
+.rt-project-list button small{color:var(--muted);font-size:11px}
+.rt-project-list button:hover{background:var(--hover)}
+.rt-project-list button[aria-current=page]{border-left-color:var(--accent);background:var(--hover);color:var(--accent)}
+.rt-sidebar-empty{font-size:12px;color:var(--muted);padding:6px 10px}
+.rt-sidebar-footer{display:flex;flex-direction:column;gap:4px;border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
+.rt-sidebar-footer button{text-align:left}
+.rt-sidebar-footer button[aria-pressed=true]{color:var(--accent)}
+
+/* Open buttons: the most visible action of a running project. */
+.rt-open-bar{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 18px}
+.rt-open{display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding:10px 16px;min-width:150px;border:1px solid var(--line);font-size:14px}
+.rt-open small{font-size:11px;color:var(--muted)}
+.rt-open.live{border-color:var(--accent);background:var(--accent);color:var(--on-accent,#081719);font-weight:600}
+.rt-open.live small{color:inherit;opacity:.8}
+.rt-open:disabled{opacity:.55}
+.rt-dashboard-layout{grid-template-columns:220px minmax(0,1fr)}
+.rt-dashboard-sidebar{height:calc(100vh - 94px);position:sticky;top:0}
+@media(max-width:700px){.rt-dashboard-sidebar{height:auto;position:static}.rt-project-list{flex-direction:row;overflow-x:auto}.rt-project-list button{width:auto;min-width:140px}}

@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('rtAppServices',{
  installTools:ids=>ipcRenderer.invoke('projects:install-tools',ids),
  createProject:spec=>ipcRenderer.invoke('projects:create',spec),
  selectProject:path=>ipcRenderer.invoke('services:select-project',path),
+ deleteProject:path=>ipcRenderer.invoke('projects:delete',path),
  setPorts:(scope,ports)=>ipcRenderer.invoke('services:ports',scope,ports),
  catalogAction:(action,id)=>ipcRenderer.invoke('services:catalog',action,id),
  discover:()=>ipcRenderer.invoke('services:discover'),

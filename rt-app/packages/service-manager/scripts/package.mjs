@@ -24,6 +24,6 @@ try{
  // The app version pins the initializer it runs (npx @gsalgadotoledo/create-rt-app@<version>).
  await writeFile(join(staging,'package.json'),JSON.stringify({name:'rt-app-service-manager',productName:'RT-App Service Manager',version:JSON.parse(await readFile(join(root,'package.json'))).version,type:'module',main:'main.mjs'}));
  const version=JSON.parse(await readFile(join(root,'package.json'))).devDependencies.electron;
- const paths=await packager({dir:staging,out:join(root,'release'),name:'RT-App Service Manager',electronVersion:version,platform:process.platform,arch:process.arch,overwrite:true,asar:false,appBundleId:'dev.rtapp.services',prune:false});
+ const paths=await packager({dir:staging,out:join(root,'release'),name:'RT-App Service Manager',electronVersion:version,platform:process.platform,arch:process.arch,overwrite:true,asar:false,appBundleId:'dev.rtapp.services',icon:join(root,'electron/assets/icon/icon.icns'),prune:false});
  console.log(paths.join('\n'));
 }finally{await rm(staging,{recursive:true,force:true});}
