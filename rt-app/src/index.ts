@@ -117,6 +117,8 @@ import {
   type Endpoint,
   type Request,
   type Environment,
+  type FeatureContext,
+  type FeatureFactory,
   HttpError,
 } from "@gsalgadotoledo/rt-app-contracts";
 import {
@@ -134,6 +136,24 @@ import { contentFeature } from "@gsalgadotoledo/rt-app-content";
 import { DynamoStore } from "@gsalgadotoledo/rt-app-dynamodb";
 import { PostgresStore } from "@gsalgadotoledo/rt-app-postgres";
 import { SmtpMailer } from "@gsalgadotoledo/rt-app-mail-smtp";
+/** Default request body limit; endpoints raise it with `maxBodyBytes` (capped at 5 MiB). */
+export const DEFAULT_BODY_LIMIT = 16_384;
+const MAX_BODY_LIMIT = 5 * 1024 * 1024;
+
+/** Match an endpoint path pattern (`/items/:id`) against a request path. */
+function matchPath(pattern: string, path: string) {
+  const names: string[] = [];
+  const expression = pattern
+    .split("/")
+    .map((part) =>
+      part.startsWith(":")
+        ? (names.push(part.slice(1)), "([^/]+)")
+        : part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+    )
+    .join("/");
+  return { names, match: path.match(new RegExp(`^${expression}/?$`)) };
+}
+
 export function createApplication(options: {
   cacheAdapter?: CacheAdapter;
   choiceProvider?: ChoiceProvider;
@@ -149,7 +169,9 @@ export function createApplication(options: {
   localAdminAccess?: boolean;
   modules?: string[];
   features?: Feature[];
-  featureFactories?: Array<(store: Store) => Feature>;
+  featureFactories?: FeatureFactory[];
+  /** Clock for application modules (FeatureContext.now); tests pass a fixed one. */
+  now?: () => Date;
   store: Store;
   mailer: Mailer;
   secret: string;
@@ -238,6 +260,17 @@ export function createApplication(options: {
       options.secret,
       options.identityProvider,
     );
+  // Context handed to application modules: clock, environment and core services.
+  const coreServices: Record<string, unknown> = { users, subscriptions, observer, analytics, cache, flags };
+  const featureContext: FeatureContext = {
+    environment,
+    now: options.now ?? (() => new Date()),
+    env: Object.freeze({ ...process.env }),
+    service<T>(id: string) {
+      if (!(id in coreServices)) throw new Error("Unknown core service: " + id);
+      return coreServices[id] as T;
+    },
+  };
   let endpoints: Endpoint[] = [];
   const acl = new ACL(options.store, () => endpoints);
   const registered: Feature[] = [
@@ -257,9 +290,7 @@ export function createApplication(options: {
     auth.feature(),
     acl.feature(),
     ...(options.tasks === false ? [] : [tasksFeature(options.store)]),
-    ...(options.featureFactories ?? []).map((factory) =>
-      factory(options.store),
-    ),
+    ...(options.featureFactories ?? []).map((factory) => factory(options.store, featureContext)),
     ...(choice ? [choice.feature()] : []),
     ...(queue ? [queue.feature()] : []),
     ...(options.features ?? []),
@@ -380,16 +411,7 @@ export function createApplication(options: {
         params: Record<string, string> = {};
       for (const endpoint of endpoints) {
         if (endpoint.method !== request.method) continue;
-        const names: string[] = [];
-        const pattern = endpoint.path
-          .split("/")
-          .map((part) =>
-            part.startsWith(":")
-              ? (names.push(part.slice(1)), "([^/]+)")
-              : part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-          )
-          .join("/");
-        const match = request.path.match(new RegExp(`^${pattern}/?$`));
+        const { names, match } = matchPath(endpoint.path, request.path);
         if (match) {
           route = endpoint;
           try {
@@ -492,6 +514,14 @@ export function createApplication(options: {
         features,
       }),
     /** Apply all pending module migrations. Safe to call on every deployment. */
+    /**
+     * Body limit for a request, decided before reading the body: the matching endpoint's
+     * `maxBodyBytes`, else 16 KiB. Server and Lambda adapters call it.
+     */
+    bodyLimit: (method: string, path: string) => {
+      const endpoint = endpoints.find((e) => e.method === method && matchPath(e.path, path).match);
+      return Math.min(endpoint?.maxBodyBytes ?? DEFAULT_BODY_LIMIT, MAX_BODY_LIMIT);
+    },
     migrate: async () =>
       new MigrationRunner({ environment, store: options.store, features }).up(),
     /** Seed runner over every enabled module; users is shared with seeds of other modules. */
@@ -520,7 +550,7 @@ export type ComponentOptions = Pick<
 
 export function createProductionApplication(
   modules?: string[],
-  featureFactories: Array<(store: Store) => Feature> = [],
+  featureFactories: FeatureFactory[] = [],
   components: ComponentOptions = {},
 ) {
   const table = process.env.TABLE_NAME,
@@ -589,7 +619,7 @@ export async function seedDemo(
  */
 export function createPortableApplication(
   modules?: string[],
-  featureFactories: Array<(store: Store) => Feature> = [],
+  featureFactories: FeatureFactory[] = [],
   components: ComponentOptions = {},
   env: Record<string, string | undefined> = process.env,
 ) {
@@ -612,7 +642,7 @@ export function createPortableApplication(
 /** Load once per Lambda environment; no plaintext secret in Terraform state or function configuration. */
 export async function loadProductionApplication(
   modules?: string[],
-  featureFactories: Array<(store: Store) => Feature> = [],
+  featureFactories: FeatureFactory[] = [],
   components: ComponentOptions = {},
 ) {
   if (process.env.STRIPE_SECRET_ARN) {

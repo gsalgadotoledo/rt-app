@@ -1950,6 +1950,7 @@ export class Subscriptions {
           path: "/subscriptions/webhook",
           resource: "subscriptions.webhook",
           access: "guest",
+          maxBodyBytes: 262_144,
           handle: (c) =>
             this.webhook(
               c.request.rawBody ?? "",

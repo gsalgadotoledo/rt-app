@@ -32,6 +32,34 @@ export default function feature(store) {
     }
     return data;
   }
+  // Owned records (--owned): every signed-in user lists and changes only their own through
+  // /<name>/mine; managers keep the permission endpoints above. Others' records answer 404.
+  function mine() {
+    const route = (method, suffix, action, handle) => ({method, path:'/'+schema.name+'/mine'+suffix,
+      resource:schema.name+'.mine.'+action, access:'authenticated', handle});
+    const own = async c => { const row = await get(c.params.id); if (row.data.ownerId !== c.actor.id) throw new HttpError(404, "Record not found"); return row; };
+    return [
+      route('GET','','list',c=>search(store,pk,c.request.query,schema.fields,view,data=>data.ownerId===c.actor.id)),
+      route('GET','/:id','read',async c=>view(await own(c))),
+      route('POST','','create',async c=>{
+        const values=validate(c.request.body); const id=randomUUID();
+        const row={pk,sk:id,version:1,data:{...values,id,ownerId:c.actor.id,...auditCreate(c.actor.id)}};
+        await store.transact([{row,expected:null}]); return view(row);
+      }),
+      route('PATCH','/:id','edit',async c=>{
+        const values=validate(c.request.body,true), row=await own(c);
+        if (c.request.body.version !== row.version) throw new Conflict();
+        const next={...row,version:row.version+1,data:{...row.data,...values,...auditUpdate(c.actor.id)}};
+        await store.transact([{row:next,expected:row.version}]); return view(next);
+      }),
+      route('DELETE','/:id','delete',async c=>{
+        const row=await own(c);
+        if(c.request.body.version !== row.version) throw new Conflict();
+        const next={...row,version:row.version+1,data:{...row.data,...auditDelete(c.actor.id)}};
+        await store.transact([{row:next,expected:row.version}]); return {ok:true};
+      }),
+    ];
+  }
   const endpoint = (method, suffix, action, handle) => ({method, path:'/' + schema.name + suffix,
     resource:schema.name + '.' + action, access:'permission', explicitGrant:true, handle});
   return {
@@ -67,6 +95,7 @@ export default function feature(store) {
         const next={...row,version:row.version+1,data:{...row.data,...auditRestore(c.actor.id)}};
         await store.transact([{row:next,expected:row.version}]);return view(next);
       }),
+      ...(schema.owned ? mine() : []),
       ...schema.actions.map(action=>endpoint('POST','/:id/actions/'+action,action,async c=>{
         const row=await get(c.params.id);
         if(c.request.body.version !== row.version) throw new Conflict();

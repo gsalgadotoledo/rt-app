@@ -1,5 +1,7 @@
 import settings from './rt-app.settings.json' with {type:'json'};
-import {runtimeConfig} from '@gsalgadotoledo/rt-app-config';
+import {runtimeConfig,settingsEnv} from '@gsalgadotoledo/rt-app-config';
+// Plain `node` runs (without rta dev) still use this project's ports from rt-app.settings.json.
+Object.assign(process.env, settingsEnv(settings));
 export const runtimeSettings = () => runtimeConfig(settings);
 import { featureFactories } from "./packages/index.js";
 import configuration from "./modules.json" with {type: "json"};

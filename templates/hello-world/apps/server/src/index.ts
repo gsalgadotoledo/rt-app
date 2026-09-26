@@ -65,7 +65,8 @@ if (local) {
   }
   console.log("Local database:", mode);
 }
-const port = Number(process.env.PORT ?? 4010);
+// PORT (set by rta dev or the platform) wins; otherwise the API URL derived from the settings.
+const port = Number(process.env.PORT ?? new URL(publicConfig().urls.api).port);
 const configuredOrigins = Object.values(publicConfig().urls).flatMap(value => {
   const url = new URL(value);
   return [url.origin, ...(["localhost", "127.0.0.1"].includes(url.hostname) ? ["localhost", "127.0.0.1"].map(host=>`${url.protocol}//${host}:${url.port}`) : [])];
@@ -111,7 +112,7 @@ const server = createServer(async (req, res) => {
     let raw = "";
     for await (const chunk of req) {
       raw += chunk;
-      if (Buffer.byteLength(raw) > (url.pathname === "/subscriptions/webhook" ? 262144 : 16384)) {
+      if (Buffer.byteLength(raw) > app.bodyLimit(req.method ?? "GET", url.pathname)) {
         reply(413, { error: "Request body too large" });
         return;
       }

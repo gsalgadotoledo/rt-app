@@ -77,3 +77,22 @@ GET /products?name=Keyboard
 Filters combine with AND; global text searches fields with OR. Search accepts only declared fields plus id. It uses bounded partition queries (up to 10 storage pages), preserving an opaque continuation cursor even when a result page is empty. Changing filters restarts pagination. This is not indexed full-text search or an arbitrary SQL query engine. Large collections need explicit access patterns and DynamoDB indexes.
 
 AWS uses the existing DynamoDB application table under a separate `CRUD#products` partition. Local development uses JSON by default, with the same API and migrations; no AWS keys are required. No additional table or Terraform resource is created by scaffolding. Initial field types are scalar, without file uploads, relations, unique-field indexes or relational master/detail children. The master/detail UI means selecting a list record to edit its detail.
+
+## Records owned by each user (`--owned`)
+
+`rta create crud notes --fields "text:string" --owned` adds `/notes/mine` endpoints for any signed-in user:
+- list, read, create, edit and delete, only over their own records (`ownerId`); another user's records answer 404;
+- the permission endpoints (`/notes`, explicit grants) stay for managers and the admin.
+
+## What a module receives
+
+A feature factory gets the store and a context: `export default function feature(store, { now, environment, env, service })`.
+- `now()` is the injectable clock; tests pass a fixed one through `createApplication({ now })`.
+- `env` is a read-only view of the configuration.
+- `service("users" | "subscriptions" | "observer" | "analytics" | "cache" | "flags")` returns a core service.
+
+Factories written as `feature(store)` keep working.
+
+## Large request bodies
+
+Requests are limited to 16 KiB. An endpoint that receives large payloads (webhooks, imports) declares `maxBodyBytes` (up to 5 MiB). The server and Lambda adapters apply the limit before reading the body.

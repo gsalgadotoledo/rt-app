@@ -73,3 +73,7 @@ Para conservar la publicación actual, el frontend debe ofrecer un script `build
 que genere archivos estáticos en `dist`, incluyendo `index.html`, y usar la URL
 de API proporcionada durante el build. Un frontend con servidor propio o SSR
 requerirá adaptar también su despliegue; S3 sirve archivos estáticos.
+
+## Ports without `rta dev`
+
+`rt-app.settings.json → local.ports` also applies to processes started directly: `node apps/server/dist/index.js`, `vite` or `next`. Variables that are already set (`PORT`, `RT_APP_*_URL`) take precedence. The SPA keeps the session for the browser tab across reloads, and drops it on sign-out or on a 401.

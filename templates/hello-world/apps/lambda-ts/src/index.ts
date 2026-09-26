@@ -15,13 +15,27 @@ export function createLambdaHandler(
       "cache-control": "no-store",
       "x-content-type-options": "nosniff",
     };
+    // The application decides the body limit of each endpoint, so it is loaded first.
+    app ??= Promise.resolve().then(factory);
+    let backend;
+    try {
+      backend = await app;
+    } catch {
+      app = undefined;
+      return {
+        statusCode: 503,
+        headers,
+        body: JSON.stringify({ error: "Service temporarily unavailable" }),
+      };
+    }
     let body = {};
     let raw = "";
     try {
       raw = event.isBase64Encoded
         ? Buffer.from(event.body ?? "", "base64").toString("utf8")
         : (event.body ?? "");
-      if (Buffer.byteLength(raw) > (event.rawPath === "/subscriptions/webhook" ? 262144 : 16384))
+      // Apps without bodyLimit (custom factories, test doubles) keep the 16 KiB default.
+      if (Buffer.byteLength(raw) > (backend.bodyLimit?.(event.requestContext.http.method, event.rawPath) ?? 16384))
         return {
           statusCode: 413,
           headers,
@@ -34,18 +48,6 @@ export function createLambdaHandler(
         statusCode: 400,
         headers,
         body: JSON.stringify({ error: "Invalid JSON" }),
-      };
-    }
-    app ??= Promise.resolve().then(factory);
-    let backend;
-    try {
-      backend = await app;
-    } catch {
-      app = undefined;
-      return {
-        statusCode: 503,
-        headers,
-        body: JSON.stringify({ error: "Service temporarily unavailable" }),
       };
     }
     const result = await backend.handle({

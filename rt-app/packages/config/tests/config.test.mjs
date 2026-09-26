@@ -30,6 +30,15 @@ test('runtime selection detects Lambda, respects explicit target, never infers A
  assert.throws(()=>runtimeConfig(settings,{RT_APP_TARGET:'invalid'}),/Invalid/);
 });
 
+test('local ports from settings become URLs unless already set, and only in local', async () => {
+ const {settingsEnv}=await import('../index.js');const settings={local:{ports:{api:4120,admin:5121,spa:5122,ssr:5123,extra:1}}};
+ assert.deepEqual(settingsEnv(settings,{}),{RT_APP_API_URL:'http://127.0.0.1:4120',RT_APP_ADMIN_URL:'http://127.0.0.1:5121',RT_APP_SPA_URL:'http://127.0.0.1:5122',RT_APP_SSR_URL:'http://127.0.0.1:5123'});
+ assert.deepEqual(settingsEnv(settings,{RT_APP_API_URL:'http://127.0.0.1:9999'}).RT_APP_API_URL,undefined);
+ assert.deepEqual(settingsEnv(settings,{RT_APP_ENVIRONMENT:'stage'}),{});
+ assert.deepEqual(settingsEnv({},{}),{});
+ assert.deepEqual(settingsEnv({local:{ports:{api:0,spa:'5000',ssr:70000}}},{}),{});
+});
+
 test('portable deployments and local Postgres are explicit targets', async () => {
  const {runtimeConfig}=await import('../index.js');const settings={runtime:{local:{mode:'json'},aws:{mode:'aws'}}};
  assert.deepEqual(runtimeConfig(settings,{RT_APP_TARGET:'portable'}),{target:'portable',mode:'portable'});

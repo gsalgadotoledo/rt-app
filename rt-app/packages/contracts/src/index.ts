@@ -59,6 +59,8 @@ export interface Endpoint {
   access: "guest" | "authenticated" | "permission" | "owner";
   /** Require an explicit grant even for application owners. Admin root uses its separate ACL. */
   explicitGrant?: boolean;
+  /** Largest request body accepted, in bytes (default 16 KiB). Webhooks with large payloads raise it. */
+  maxBodyBytes?: number;
   handle(ctx: Context): Promise<any>;
 }
 export interface AdminManifest {
@@ -130,6 +132,24 @@ export interface Seed {
   environments?: Environment[];
   run(context: SeedContext): Promise<void>;
 }
+
+/**
+ * What an application module receives besides the store (second argument of a feature factory).
+ * Modules written as `feature(store)` keep working; new ones read time, configuration and core
+ * services from here instead of `process.env` or importing other packages.
+ * @example export default function feature(store, { now, env, service }) { const users = service("users"); … }
+ */
+export interface FeatureContext {
+  environment: Environment;
+  /** Injectable clock: tests pass a fixed one. */
+  now(): Date;
+  /** Read-only view of the process environment (configuration and secrets). */
+  env: Readonly<Record<string, string | undefined>>;
+  /** Core services by id: users, subscriptions, observer, analytics, cache, flags. Throws when unknown. */
+  service<T = unknown>(id: string): T;
+}
+
+export type FeatureFactory = (store: Store, context: FeatureContext) => Feature;
 
 export interface Feature {
   id: string;

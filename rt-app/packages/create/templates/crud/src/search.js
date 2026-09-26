@@ -1,6 +1,7 @@
 import { HttpError } from '@gsalgadotoledo/rt-app-contracts';
 // AND field filters, OR global text search. Bounded partition queries, not a full-text index.
-export async function search(store, pk, query, fields, view) {
+// `scope` limits results before paging (e.g. the signed-in user's own records).
+export async function search(store, pk, query, fields, view, scope = () => true) {
   const types = new Map([['id','string'],...fields.map(f=>[f.name,f.type])]);
   if(query.trash!==undefined&&!['true','false'].includes(query.trash))throw new HttpError(400,"Invalid trash filter");
   const tests=[data=>Boolean(data.deletedAt)===(query.trash==='true')];
@@ -25,7 +26,7 @@ export async function search(store, pk, query, fields, view) {
   let cursor=query.cursor;
   for(let inspected=0;inspected<10;inspected++) {
     const page=await store.list(pk,cursor);
-    const items=page.items.map(view).filter(data=>tests.every(t=>t(data)) && (!query.q || [...types.keys()].some(f=>String(data[f]??'').toLowerCase().includes(query.q.toLowerCase()))));
+    const items=page.items.map(view).filter(data=>scope(data) && tests.every(t=>t(data)) && (!query.q || [...types.keys()].some(f=>String(data[f]??'').toLowerCase().includes(query.q.toLowerCase()))));
     cursor=page.cursor;
     if(items.length||!cursor)return {items,cursor};
   }

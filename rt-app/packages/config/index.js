@@ -14,6 +14,21 @@ export function publicConfig(env = process.env) {
   }
   return Object.freeze({environment,urls:Object.freeze(urls)});
 }
+/**
+ * Local URLs from rt-app.settings.json → local.ports, for processes started without `rta dev`
+ * (a plain `node apps/server/dist/index.js`, `vite`, `next`). Variables already set win; outside
+ * local development nothing is derived.
+ * @example settingsEnv({local:{ports:{api:4120}}}, {}) → {RT_APP_API_URL:'http://127.0.0.1:4120'}
+ */
+export function settingsEnv(settings, env = process.env) {
+  if ((env.RT_APP_ENVIRONMENT ?? 'local') !== 'local') return {};
+  const ports = settings?.local?.ports ?? {}, derived = {};
+  for (const role of Object.keys(localUrls)) {
+    const key = `RT_APP_${role.toUpperCase()}_URL`, port = ports[role];
+    if (!env[key] && Number.isInteger(port) && port > 0 && port < 65536) derived[key] = `http://127.0.0.1:${port}`;
+  }
+  return derived;
+}
 export function environmentVariables(config) {
   return Object.fromEntries([['RT_APP_ENVIRONMENT',config.environment],...Object.entries(config.urls).map(([role,url])=>[`RT_APP_${role.toUpperCase()}_URL`,url])]);
 }

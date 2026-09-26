@@ -12,7 +12,7 @@ const safeName=/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const reserved=new Set(['admin','api','aws','infra','auth','acl','users','tasks','content','aws-monitor','app','constructor','prototype','__proto__']);
 export function normalize(spec) {
   if(!spec||typeof spec!=='object'||Array.isArray(spec))throw new Error('Invalid CRUD specification');
-  for(const key of Object.keys(spec))if(!['name','title','fields','actions'].includes(key))throw new Error('Unknown spec option: '+key);
+  for(const key of Object.keys(spec))if(!['name','title','fields','actions','owned'].includes(key))throw new Error('Unknown spec option: '+key);
   if(typeof spec.name!=='string'||spec.name.length>48||!safeName.test(spec.name)||reserved.has(spec.name))throw new Error('Use a unique lowercase kebab-case CRUD name (max 48 characters)');
   const title=spec.title??spec.name;
   if(typeof title!=='string'||!title.trim()||title.length>100)throw new Error('Invalid title');
@@ -24,14 +24,15 @@ export function normalize(spec) {
   });
   const actions=spec.actions??[];
   if(!Array.isArray(actions)||actions.length>10||new Set(actions).size!==actions.length||actions.some(a=>typeof a!=='string'||a.length>40||!safeName.test(a)||reserved.has(a)||['list','read','create','edit','delete','restore'].includes(a)))throw new Error('Invalid or duplicate custom action');
-  return {name:spec.name,title,fields,actions};
+  if(spec.owned!==undefined&&typeof spec.owned!=='boolean')throw new Error('owned must be true or false');
+  return {name:spec.name,title,fields,actions,...(spec.owned?{owned:true}:{})};
 }
-export const CRUD_USAGE='Usage: rta create crud <name> --fields "name:string,price:number,notes:string?" [--title Products] [--actions publish,archive] [--spec crud.json] [--dry-run] [--json]';
+export const CRUD_USAGE='Usage: rta create crud <name> --fields "name:string,price:number,notes:string?" [--title Products] [--actions publish,archive] [--owned] [--spec crud.json] [--dry-run] [--json]\n  --owned  each signed-in user manages only their own records through /<name>/mine (admin endpoints unchanged)';
 export async function parse(args) {
   if(args.includes('--help')||args.includes('-h'))return {help:CRUD_USAGE};
   let name;const options={};
   for(let i=0;i<args.length;i++){
-    const arg=args[i];if(['--json','--dry-run'].includes(arg)){if(options[arg])throw new Error('Duplicate option');options[arg]=true;continue;}
+    const arg=args[i];if(['--json','--dry-run','--owned'].includes(arg)){if(options[arg])throw new Error('Duplicate option');options[arg]=true;continue;}
     if(['--fields','--title','--actions','--spec'].includes(arg)){if(options[arg]!==undefined||!args[i+1]||args[i+1].startsWith('--'))throw new Error('Missing or duplicate '+arg);options[arg]=args[++i];continue;}
     if(arg.startsWith('-')||name)throw new Error('Unknown argument: '+arg);name=arg;
   }
@@ -44,7 +45,7 @@ export async function parse(args) {
       const match=part.trim().match(/^([a-zA-Z0-9]+):(string|number|boolean)(\?)?$/);if(!match)throw new Error('Use --fields "name:string,price:number,active:boolean,notes:string?"');
       return {name:match[1],type:match[2],required:!match[3]};
     });
-    spec={name,title:options['--title'],fields,actions:options['--actions']?options['--actions'].split(',').map(a=>a.trim()):[]};
+    spec={name,title:options['--title'],fields,actions:options['--actions']?options['--actions'].split(',').map(a=>a.trim()):[],...(options['--owned']?{owned:true}:{})};
   }
   return {spec:normalize(spec),dryRun:!!options['--dry-run']};
 }

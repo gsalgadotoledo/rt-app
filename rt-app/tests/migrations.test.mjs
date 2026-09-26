@@ -87,3 +87,38 @@ test("portable deployments need Postgres, secrets and SMTP from the environment"
   assert.equal(createPortableApplication(undefined, [], { observerOutputs: [] }, { ...env, RT_APP_ENVIRONMENT: undefined, DATABASE_SSL: undefined }).environment, "prod");
   await app.users.store.close();
 });
+
+test("application modules receive a context with clock, environment and core services", async () => {
+  let received;
+  const legacy = (store) => ({ id: "legacy", endpoints: [], migrations: [] });
+  const modern = (store, context) => {
+    received = context;
+    return { id: "clocked", endpoints: [{ method: "GET", path: "/clocked", resource: "clocked.read", access: "guest", handle: async () => ({ at: context.now().toISOString() }) }], migrations: [] };
+  };
+  const fixed = new Date("2026-01-02T03:04:05Z");
+  const app = create({ featureFactories: [legacy, modern], now: () => fixed, environment: "stage" });
+  assert.ok(app.features.some((f) => f.id === "legacy"), "factories written as feature(store) still work");
+  assert.equal(received.environment, "stage");
+  assert.equal(received.service("users"), app.users);
+  assert.equal(received.service("subscriptions"), app.subscriptions);
+  assert.throws(() => received.service("payments"), /Unknown core service: payments/);
+  assert.ok(Object.isFrozen(received.env));
+  const response = await app.handle({ method: "GET", path: "/clocked", query: {}, body: {}, headers: {}, ip: "t" });
+  assert.equal(response.body.at, "2026-01-02T03:04:05.000Z");
+});
+
+test("body limits come from the matching endpoint, capped, with a 16 KiB default", async () => {
+  const { DEFAULT_BODY_LIMIT } = await import("@gsalgadotoledo/rt-app-framework");
+  const huge = () => ({ id: "uploads", endpoints: [
+    { method: "POST", path: "/uploads/:id/parts", resource: "uploads.write", access: "guest", maxBodyBytes: 1_000_000, handle: async () => ({}) },
+    { method: "POST", path: "/uploads/unbounded", resource: "uploads.raw", access: "guest", maxBodyBytes: 50_000_000, handle: async () => ({}) },
+  ], migrations: [] });
+  const app = create({ featureFactories: [huge] });
+  assert.equal(DEFAULT_BODY_LIMIT, 16384);
+  assert.equal(app.bodyLimit("POST", "/auth/login"), 16384);
+  assert.equal(app.bodyLimit("POST", "/subscriptions/webhook"), 262144);
+  assert.equal(app.bodyLimit("POST", "/uploads/abc/parts"), 1_000_000);
+  assert.equal(app.bodyLimit("GET", "/uploads/abc/parts"), 16384, "method must match");
+  assert.equal(app.bodyLimit("POST", "/uploads/unbounded"), 5 * 1024 * 1024, "capped at 5 MiB");
+  assert.equal(app.bodyLimit("POST", "/nothing/here"), 16384);
+});

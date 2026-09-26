@@ -10,6 +10,8 @@ test("Lambda preserves original webhook bytes, normalizes signature and routes m
       return { status: 200, body: { ok: true } };
     },
     subscriptions: { maintenance: async () => ({ processed: ++maintenance }) },
+    // Like the real application: the webhook endpoint declares a 256 KiB body limit.
+    bodyLimit: (method, path) => (path === "/subscriptions/webhook" ? 262144 : 16384),
   }));
   const raw = '{ "message" : "café", "padding":"' + "x".repeat(20000) + '"}';
   const response = await handler({
@@ -25,4 +27,12 @@ test("Lambda preserves original webhook bytes, normalizes signature and routes m
   assert.deepEqual(await handler({ source: "rt-app.subscriptions" }), {
     processed: 1,
   });
+});
+
+test("Lambda rejects bodies above the endpoint limit before calling the application", async () => {
+  let called = false;
+  const handler = createLambdaHandler(() => ({ handle: async () => { called = true; return { status: 200, body: {} }; }, bodyLimit: () => 10 }));
+  const response = await handler({ rawPath: "/items", requestContext: { http: { method: "POST", sourceIp: "t" } }, headers: {}, body: '{"too":"large"}' });
+  assert.equal(response.statusCode, 413);
+  assert.equal(called, false);
 });

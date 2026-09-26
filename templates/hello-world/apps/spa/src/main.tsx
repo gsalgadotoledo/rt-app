@@ -10,13 +10,23 @@ import SecurityPanel from "@gsalgadotoledo/rt-app-auth/security";
 import AuthPanel from "@gsalgadotoledo/rt-app-auth/admin";
 import "./style.css";
 const base = browserApiUrl(__RT_APP_CONFIG__);
+// The session survives reloads and payment redirects in this tab only (sessionStorage),
+// and is dropped on sign-out or on any 401 from the API.
+const SESSION_KEY = "rt-app.session";
+function storedSession() {
+  try { return JSON.parse(sessionStorage.getItem(SESSION_KEY) ?? "null") ?? undefined; } catch { return undefined; }
+}
+function storeSession(value: any) {
+  try { value ? sessionStorage.setItem(SESSION_KEY, JSON.stringify(value)) : sessionStorage.removeItem(SESSION_KEY); } catch {}
+}
 function App() {
   useEffect(() => { document.title = branding.name; }, []);
   const [home, setHome] = useState<any>(),
-    [session, setSession] = useState<any>(),
+    [session, setSessionState] = useState<any>(storedSession),
     [profile, setProfile] = useState<any>(),
     [error, setError] = useState("");
   const route=useLocation(), navigate=useNavigate();
+  const setSession=(value:any)=>{storeSession(value);setSessionState(value);};
   useEffect(()=>{trackPage(base,'spa',route.pathname);},[route.pathname]);
   useEffect(()=>{const params=new URLSearchParams(location.search);if(params.has('setup_intent')||params.has('payment_intent')){sessionStorage.setItem('rt-app-billing-return',JSON.stringify({setupId:params.get('setup_intent'),payment:params.has('payment_intent')}));navigate('/account',{replace:true});}},[]);
   const accountOpen=route.pathname==="/account"||route.pathname==="/login";
@@ -37,6 +47,7 @@ function App() {
       body: body ? JSON.stringify(body) : undefined,
     });
     const value = await response.json();
+    if (response.status === 401 && session) { setSession(undefined); setProfile(undefined); }
     if (!response.ok) throw new Error(value.error);
     return value;
   }
