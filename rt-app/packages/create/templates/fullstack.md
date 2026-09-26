@@ -19,7 +19,7 @@ You are working on a new RT-App project generated from the **Full stack** templa
 Ask the user what the application is for, then:
 
 1. Model each business concept as a module in `packages/<name>` (`rta create crud <name> --fields ...` gives an editable start). A module owns its endpoints, `src/migrations.js`, `src/seeds.js`, admin UI and tests.
-2. Add pages to `apps/spa` (signed-in users) and `apps/ssr` (public, SEO) that call the API through `RT_APP_API_URL`.
+2. Put **customer-facing** pages in `apps/ssr`: public content, SEO, and also signed-in customer flows such as cart, checkout and account. Use `apps/spa` for **internal tools** (back office, CRM-style workspaces). Both call the API through `RT_APP_API_URL`.
 3. Grant permissions explicitly (Admin → Permissions). New endpoints are never public by default.
 
 ## Rules
