@@ -114,23 +114,20 @@ No dependency-injection framework is needed:
   - The body limit is 16 KiB: 413 `Request body too large`.
   - Responses are JSON with `cache-control: no-store`.
 
-## Plan (MVP)
+## Status
 
-1. Done: `npm run link:app` / `unlink:app` use the local core in an app without publishing.
-2. Done: `rt-app-conformance` with the contract format, host protocol, runner, `--record` and
-   `show`.
-3. Done: contracts for `nosql-memory`, `feature-flags` and `feature-flags-api`. The TypeScript
-   reference passes all 38 cases. The contract also found that MemoryStore sorted by UTF-16 units,
-   which is now fixed.
-4. Python: `rt_app` (errors, nosql MemoryStore, feature_flags, health, web with server, Lambda
-   and CLI, conformance host), plus `examples/flags-api/python`.
-5. Go: the same packages in `core-go`, plus `cmd/contract-host` and `examples/flags-api/go`.
-6. Run `npm run contracts` on every target: node, python, python-lambda, go and go-lambda.
-7. Next steps:
-   - more modules (users, auth, subscriptions ledger)
-   - DynamoDB and Postgres stores for Python and Go
-   - generator backends that use native modules instead of proxying to the Node core
-   - a Service Manager "Contracts" panel
+- **Contracts:** nosql (memory, PostgreSQL, DynamoDB), feature-flags, feature-flags-api (HTTP),
+  jwt, users, acl, auth, subscriptions-ledger, subscriptions-credits. Run them with
+  `npm run contracts:stores`: node, python and go pass all 239 cases; the Lambda targets pass the
+  HTTP API cases.
+- **Ports:** Python `rt_app` and Go `rt.local/core-go` implement every contracted module. Each has
+  server, Lambda (plus a local bridge) and CLI modes, and can fall back to the Node core.
+- **Generator:** `npm create @gsalgadotoledo/rt-app` with the Python or Go backend produces a
+  native API with a composition root. Native routes answer there; other routes use the Node core.
+- **Development:** `npm run link:app` uses this checkout in an app. The Service Manager has a
+  Contracts panel (matrix per case × language) and a Terraform tab per project.
+- **Next:** port the remaining modules (content, visits, analytics, the subscriptions service,
+  deployments…) contract by contract, then drop the Node core fallback for fully native backends.
 
 ## Subscriptions ledger and credits contracts
 
