@@ -289,3 +289,8 @@ ol.rt-wizard-steps li button:disabled{cursor:default}
 .rt-contract-case code{overflow-wrap:anywhere}
 .rt-contract-init{display:block;color:var(--muted);font-size:11px;margin:2px 0}
 .rt-contract-error{color:var(--danger,#ff7a7a)}
+
+/* Project tabs */
+.rt-project-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:4px 0 14px}
+.rt-services .rt-project-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;padding:8px 14px;font-size:13px}
+.rt-services .rt-project-tabs button[aria-selected=true]{border-bottom-color:var(--accent);color:var(--accent)}

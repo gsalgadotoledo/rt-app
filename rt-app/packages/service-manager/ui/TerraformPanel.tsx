@@ -110,7 +110,7 @@ function ValuesModal({ title, intro, rows, onSave, onClose, open }: {
  * validate, unit tests, plan and apply (only the reviewed plan, with a confirmation) and the run
  * history with its console and errors.
  */
-export function TerraformPanel({ client }: { client: TerraformClient }) {
+export function TerraformPanel({ client, project }: { client: TerraformClient; /** Only this project's stacks (its path). */ project?: string }) {
   const tf = client.terraform!;
   const [stacks, setStacks] = useState<TerraformStack[]>();
   const [selected, setSelected] = useState<string>();
@@ -127,7 +127,7 @@ export function TerraformPanel({ client }: { client: TerraformClient }) {
 
   async function loadStacks() {
     try {
-      const next = await tf.stacks();
+      const next = (await tf.stacks()).filter((s) => !project || s.projectPath === project);
       setStacks(next);
       setSelected((current) => current && next.some((s) => s.id === current) ? current : next[0]?.id);
       setGlobals(await tf.globals());
@@ -177,21 +177,21 @@ export function TerraformPanel({ client }: { client: TerraformClient }) {
   return (
     <section className="rt-machine rt-terraform" aria-label="Terraform">
       <div className="rt-services-toolbar">
-        <h2>Terraform</h2>
+        <h2>{project ? "Infrastructure" : "Terraform"}</h2>
         <button onClick={() => setModal("globals")}>Global variables{globals ? ` (${globals.filter((g) => g.present).length})` : ""}</button>
         <button onClick={() => void loadStacks()}>Rescan</button>
       </div>
       <p className="rt-wizard-note">Every folder with <code>.tf</code> files in your projects (convention: <code>infra/</code>). Values are saved on this Mac only (never in the project) and passed as <code>TF_VAR_*</code> and environment variables.</p>
       {error && <p role="alert" className="rt-services-error">{error}</p>}
       {!stacks && <p>Scanning projects…</p>}
-      {stacks && !stacks.length && <p>No Terraform found. Add an <code>infra/</code> folder with <code>.tf</code> files to a project. RT-App projects include <code>infra/stripe</code> for subscription plans.</p>}
+      {stacks && !stacks.length && <p>No Terraform found{project ? " in this project" : ""}. Add an <code>infra/</code> folder with <code>.tf</code> files{project ? "" : " to a project"}. RT-App projects include <code>infra/stripe</code> for subscription plans.</p>}
       {!!stacks?.length && (
         <div className="rt-tf-layout">
           <nav className="rt-tf-stacks" aria-label="Terraform stacks">
-            {projects.map((project) => (
-              <div key={project}>
-                <h3>{project}</h3>
-                {stacks.filter((s) => s.project === project).map((s) => (
+            {projects.map((name) => (
+              <div key={name}>
+                {!project && <h3>{name}</h3>}
+                {stacks.filter((s) => s.project === name).map((s) => (
                   <button key={s.id} aria-current={s.id === selected ? "page" : undefined} title={s.path} onClick={() => setSelected(s.id)}>
                     <span>{s.name}</span>
                     {s.lastRun && <small className={`rt-tf-state rt-tf-${s.lastRun.state}`}>{s.lastRun.command} · {s.lastRun.state}</small>}
@@ -203,7 +203,7 @@ export function TerraformPanel({ client }: { client: TerraformClient }) {
           {stack && (
             <div className="rt-tf-detail">
               <header>
-                <div><strong>{stack.project} / {stack.name}</strong><small>{stack.path.replace(/^\/Users\/[^/]+/, "~")}</small></div>
+                <div><strong>{project ? stack.name : `${stack.project} / ${stack.name}`}</strong><small>{stack.path.replace(/^\/Users\/[^/]+/, "~")}</small></div>
                 <button onClick={() => setModal("stack")}>Variables{variables ? ` (${variables.filter((v) => v.present).length}/${variables.length})` : ""}</button>
               </header>
               {missing.length > 0 && <p className="rt-tf-warning">Missing required values: {missing.map((v) => v.name).join(", ")}. <button className="rt-services-link" onClick={() => setModal("stack")}>Fill them in</button></p>}
