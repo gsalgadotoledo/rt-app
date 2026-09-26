@@ -142,6 +142,16 @@ cases:
             items:
               - $repeat: { count: 10, start: 50, item: { pk: P, sk: "row-{i:03}", version: 1, data: { i: "{i}" } } }
 
+  - name: exactly 50 rows fit in one page without a cursor
+    tags: [pagination, edge]
+    init:
+      rows:
+        - $repeat: { count: 50, item: { pk: P, sk: "r{i:02}", version: 1, data: {} } }
+    call: list
+    args: [P]
+    expect: { value: { items: { $length: 50 } } }
+    note: a cursor is returned only when another row exists
+
   - name: invalid cursors are rejected
     tags: [edge, security]
     call: list

@@ -3,6 +3,10 @@
 Rows are ``{pk, sk, version, data, ttl?}``. ``transact`` applies version-guarded writes atomically:
 ``expected=None`` means "must not exist", a number means "must have exactly this version".
 ``list`` returns one partition sorted by ``sk`` in Unicode code point order, 50 rows per page.
+
+Stores: ``MemoryStore`` (here), ``PostgresStore`` (``rt_app.nosql.postgres``, needs psycopg) and
+``DynamoStore`` (``rt_app.nosql.dynamodb``, needs boto3). The database stores are imported lazily,
+so ``from rt_app.nosql import PostgresStore`` works without loading drivers until a store is built.
 """
 from __future__ import annotations
 
@@ -11,8 +15,8 @@ import threading
 from collections.abc import Sequence
 from typing import Any, NotRequired, Protocol, TypedDict, runtime_checkable
 
-from . import _js
-from .errors import Conflict, HttpError
+from .. import _js
+from ..errors import Conflict, HttpError
 
 PAGE_SIZE = 50
 
@@ -127,4 +131,28 @@ class MemoryStore:
         return page
 
 
-__all__ = ["Row", "Write", "Page", "NoSQL", "MemoryStore", "PAGE_SIZE", "encode_cursor", "decode_cursor"]
+def __getattr__(name: str) -> Any:
+    """Lazy exports: the PostgreSQL and DynamoDB stores load only when first used."""
+    if name == "PostgresStore":
+        from .postgres import PostgresStore
+
+        return PostgresStore
+    if name == "DynamoStore":
+        from .dynamodb import DynamoStore
+
+        return DynamoStore
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "Row",
+    "Write",
+    "Page",
+    "NoSQL",
+    "MemoryStore",
+    "PostgresStore",
+    "DynamoStore",
+    "PAGE_SIZE",
+    "encode_cursor",
+    "decode_cursor",
+]

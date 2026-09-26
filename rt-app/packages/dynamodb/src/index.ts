@@ -100,17 +100,17 @@ export class DynamoStore implements Store {
         TableName: this.table,
         KeyConditionExpression: "pk = :pk",
         ExpressionAttributeValues: { ":pk": pk },
-        Limit: 50,
+        // One extra row tells whether another page exists, so a full last page has no cursor.
+        Limit: 51,
         ExclusiveStartKey: key,
         ConsistentRead: true,
       }),
     );
+    const items = (result.Items ?? []).slice(0, 50) as Row[];
     return {
-      items: (result.Items ?? []) as Row[],
-      cursor: result.LastEvaluatedKey
-        ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString(
-            "base64url",
-          )
+      items,
+      cursor: (result.Items?.length ?? 0) > 50
+        ? Buffer.from(JSON.stringify({ pk, sk: items.at(-1)!.sk })).toString("base64url")
         : undefined,
     };
   }

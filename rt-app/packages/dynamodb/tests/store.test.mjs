@@ -34,11 +34,15 @@ test("Dynamo commands keep consistent reads, version checks and pagination scope
     calls.at(-1).TransactItems[1].Delete.ExpressionAttributeValues,
     { ":v": 3 },
   );
-  response = { Items: [row], LastEvaluatedKey: { pk: "P", sk: "1" } };
+  response = { Items: Array.from({ length: 51 }, (_, i) => ({ ...row, sk: String(i).padStart(2, "0") })) };
   const page = await store.list("P");
+  assert.equal(calls.at(-1).Limit, 51, "one look-ahead row");
+  assert.equal(page.items.length, 50);
+  response = { Items: [row] };
+  assert.deepEqual(await store.list("P", page.cursor), { items: [row], cursor: undefined });
+  assert.deepEqual(calls.at(-1).ExclusiveStartKey, { pk: "P", sk: "49" });
   response = {};
-  assert.deepEqual((await store.list("P", page.cursor)).items, []);
-  assert.deepEqual(calls.at(-1).ExclusiveStartKey, { pk: "P", sk: "1" });
+  assert.deepEqual(await store.list("EMPTY"), { items: [], cursor: undefined });
   await assert.rejects(store.list("OTHER", page.cursor), { status: 400 });
   await assert.rejects(store.list("P", "!"), { status: 400 });
   assert.throws(() => new DynamoStore(""), /TABLE_NAME/);
