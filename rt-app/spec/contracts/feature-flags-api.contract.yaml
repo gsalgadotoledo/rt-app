@@ -1,0 +1,84 @@
+contract: 1
+kind: http
+module: feature-flags-api
+title: Feature flags HTTP API (local mode)
+description: |
+  The API every backend language serves with the health and feature-flags modules, started in
+  local mode: owner endpoints are mounted under /admin/app and the local owner is "rt-app-root".
+  Errors are {"error": message}. Unknown routes are 404 "Endpoint not found"; bodies must be JSON
+  objects (400 "Invalid JSON"). The server keeps state between cases, so each case uses its own keys.
+cases:
+  - name: liveness and readiness
+    requests:
+      - { request: { method: GET, path: /health/live }, expect: { status: 200, body: { ok: true } } }
+      - { request: { method: GET, path: /health/ready }, expect: { status: 200, body: { ok: true } } }
+
+  - name: unknown routes and methods are 404
+    tags: [edge]
+    requests:
+      - { request: { method: GET, path: /nope }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: DELETE, path: /health/live }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /feature-flags/evaluate }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: owner endpoints are only under /admin/app
+    tags: [security]
+    requests:
+      - { request: { method: GET, path: /feature-flags }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: PUT, path: /feature-flags/api-owner-only, body: {} }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: bodies must be JSON objects
+    tags: [edge, validation]
+    requests:
+      - { request: { method: POST, path: /feature-flags/evaluate, headers: { content-type: application/json }, raw: "{bad" }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - { request: { method: POST, path: /feature-flags/evaluate, body: [1] }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - { request: { method: POST, path: /feature-flags/evaluate, raw: "null" }, expect: { status: 400, body: { error: Invalid JSON } } }
+
+  - name: create, read back, evaluate and update a flag
+    requests:
+      - request: { method: PUT, path: /admin/app/feature-flags/api-checkout, body: { version: null, description: New checkout, enabled: true, public: true, rollout: 100, subjects: [] } }
+        expect: { status: 200, body: { key: api-checkout, description: New checkout, enabled: true, public: true, rollout: 100, subjects: [], version: 1, updatedAt: { $type: iso-date }, updatedBy: rt-app-root } }
+      - request: { method: POST, path: /feature-flags/evaluate, body: { keys: [api-checkout, api-missing] } }
+        expect: { status: 200, body: { api-checkout: true, api-missing: false } }
+      - request: { method: PUT, path: /admin/app/feature-flags/api-checkout, body: { version: 1, description: Off, enabled: false, public: true, rollout: 100, subjects: [] } }
+        expect: { status: 200, body: { $partial: { version: 2, enabled: false } } }
+      - request: { method: PUT, path: /admin/app/feature-flags/api-checkout, body: { version: 1, description: Stale, enabled: true, public: true, rollout: 100, subjects: [] } }
+        expect: { status: 409, body: { error: "Conflict: refresh and try again" } }
+      - request: { method: POST, path: /feature-flags/evaluate, body: { keys: [api-checkout] } }
+        expect: { status: 200, body: { api-checkout: false } }
+
+  - name: public evaluation hides private flags and uses subjects
+    tags: [security]
+    requests:
+      - request: { method: PUT, path: /admin/app/feature-flags/api-private, body: { version: null, description: "", enabled: true, public: false, rollout: 100, subjects: [] } }
+        expect: { status: 200 }
+      - request: { method: PUT, path: /admin/app/feature-flags/api-vip, body: { version: null, description: "", enabled: true, public: true, rollout: 0, subjects: [vip] } }
+        expect: { status: 200 }
+      - request: { method: POST, path: /feature-flags/evaluate, body: { keys: [api-private, api-vip], subject: vip } }
+        expect: { status: 200, body: { api-private: false, api-vip: true } }
+      - request: { method: POST, path: /feature-flags/evaluate, body: { keys: [api-vip], subject: other } }
+        expect: { status: 200, body: { api-vip: false } }
+
+  - name: list shows saved flags
+    requests:
+      - request: { method: PUT, path: /admin/app/feature-flags/api-listed, body: { version: null, description: Listed, enabled: false, public: false, rollout: 0, subjects: [] } }
+        expect: { status: 200 }
+      - request: { method: GET, path: /admin/app/feature-flags }
+        expect: { status: 200, body: { $partial: { items: { $type: array } } } }
+
+  - name: evaluation input is validated
+    tags: [edge, validation]
+    requests:
+      - { request: { method: POST, path: /feature-flags/evaluate, body: {} }, expect: { status: 400, body: { error: Provide up to 20 flag keys } } }
+      - { request: { method: POST, path: /feature-flags/evaluate, body: { keys: x } }, expect: { status: 400, body: { error: Provide up to 20 flag keys } } }
+      - { request: { method: POST, path: /feature-flags/evaluate, body: { keys: [1] } }, expect: { status: 400, body: { error: Provide up to 20 flag keys } } }
+      - { request: { method: POST, path: /feature-flags/evaluate, body: { keys: [{ $repeat: { count: 21, item: "k{i}" } }] } }, expect: { status: 400, body: { error: Provide up to 20 flag keys } } }
+      - { request: { method: POST, path: /feature-flags/evaluate, body: { keys: [Bad Key] } }, expect: { status: 400, body: { error: Invalid flag key } } }
+      - { request: { method: POST, path: /feature-flags/evaluate, body: { keys: [ok], subject: 5 } }, expect: { status: 400, body: { error: Invalid flag subject } } }
+
+  - name: save input is validated
+    tags: [edge, validation]
+    requests:
+      - { request: { method: PUT, path: /admin/app/feature-flags/api-bad, body: { version: null } }, expect: { status: 400, body: { error: Invalid flag configuration } } }
+      - { request: { method: PUT, path: "/admin/app/feature-flags/Bad%20Key", body: { version: null, description: "", enabled: true, public: true, rollout: 1, subjects: [] } }, expect: { status: 400, body: { error: Invalid flag key } } }
+      - { request: { method: PUT, path: "/admin/app/feature-flags/%E0%A4%A", body: {} }, expect: { status: 400, body: { error: Invalid URL } } }
+      - { request: { method: GET, path: /admin/app/feature-flags, query: { cursor: bad } }, expect: { status: 400, body: { error: Invalid cursor } } }

@@ -38,7 +38,8 @@ export interface Step {
   /** Human note shown on failure. */
   note?: string;
 }
-export interface HttpRequest { method: string; path: string; headers?: Record<string, string>; query?: Record<string, string>; body?: Json }
+/** `body` is sent as JSON; `raw` is sent as-is (for malformed payloads). */
+export interface HttpRequest { method: string; path: string; headers?: Record<string, string>; query?: Record<string, string>; body?: Json; raw?: string }
 export interface HttpExpectation { status?: number; body?: Json; headers?: Record<string, Json> }
 export interface Case {
   name: string;

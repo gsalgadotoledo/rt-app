@@ -141,3 +141,134 @@ test("cli: show and test with a config file", async (t) => {
   assert.match(lines.join("\n"), /✓ counter · adds/);
   await assert.rejects(main(["test", "--bogus"]), /Usage/);
 });
+
+const DIST = new URL("../dist/index.js", import.meta.url).href;
+
+test("targets started by command: host, API, http contracts and startup failures", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "contract-cmd-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, "host.mjs"), `import { runHost } from ${JSON.stringify(DIST)};\nawait runHost({ language: "test", subjects: { echo: () => ({ echo: (v) => v }) } });\n`);
+  await writeFile(join(dir, "api.mjs"), `import { createServer } from "node:http";
+createServer(async (req, res) => {
+  let raw = ""; for await (const c of req) raw += c;
+  if (req.url === "/health") { res.writeHead(200, { "content-type": "application/json", "x-kind": "health" }); return res.end('{"ok":true}'); }
+  if (req.url.startsWith("/echo")) { let body; try { body = raw ? JSON.parse(raw) : {}; } catch { res.writeHead(400); return res.end('{"error":"Invalid JSON"}'); } res.writeHead(200); return res.end(JSON.stringify({ body, url: req.url })); }
+  res.writeHead(404, { "content-type": "text/plain" }); res.end("missing");
+}).listen(Number(process.env.PORT), "127.0.0.1");\n`);
+  await writeFile(join(dir, "broken.mjs"), `process.exit(3);\n`);
+  await writeFile(join(dir, "echo.contract.yaml"), `contract: 1
+module: echo
+cases:
+  - { name: echoes, call: echo, args: [{ a: 1 }], expect: { value: { a: 1 } } }
+`);
+  await writeFile(join(dir, "api.contract.yaml"), `contract: 1
+kind: http
+module: api
+cases:
+  - name: health
+    request: { method: GET, path: /health }
+    expect: { status: 200, body: { ok: true }, headers: { x-kind: health } }
+  - name: chained
+    requests:
+      - { request: { method: POST, path: /echo, body: { id: 7 } }, expect: { status: 200, body: { $partial: { body: { id: 7 } } } } }
+      - { request: { method: POST, path: /echo, query: { q: "1" }, body: { again: { $ref: "0.body.body.id" } } }, expect: { status: 200, body: { body: { again: 7 }, url: "/echo?q=1" } } }
+  - name: raw
+    request: { method: POST, path: /echo, raw: "{nope" }
+    expect: { status: 400, body: { error: Invalid JSON } }
+  - name: text body
+    request: { method: GET, path: /other }
+    expect: { status: 404, body: missing }
+  - name: wrong status
+    request: { method: GET, path: /other }
+    expect: { status: 200 }
+  - name: wrong body
+    request: { method: GET, path: /health }
+    expect: { body: { ok: false } }
+  - name: wrong header
+    request: { method: GET, path: /health }
+    expect: { headers: { x-kind: other } }
+  - name: not recorded
+    request: { method: GET, path: /health }
+`);
+  const contracts = [await loadContract(join(dir, "echo.contract.yaml")), await loadContract(join(dir, "api.contract.yaml"))];
+  const results = await runTarget({ name: "cmd", host: { command: [process.execPath, "host.mjs"], cwd: dir }, api: { command: [process.execPath, "api.mjs"], cwd: dir, readyPath: "/health" } }, contracts);
+  assert.deepEqual(results.map((r) => [r.name, r.status]), [["echoes", "passed"], ["health", "passed"], ["chained", "passed"], ["raw", "passed"], ["text body", "passed"], ["wrong status", "failed"], ["wrong body", "failed"], ["wrong header", "failed"], ["not recorded", "unrecorded"]]);
+  const hostOnly = await runTarget({ name: "no-api", host: { command: [process.execPath, "host.mjs"], cwd: dir } }, contracts);
+  assert.equal(hostOnly.find((r) => r.name === "health").status, "skipped");
+  const apiOnly = await runTarget({ name: "no-host", api: { command: [process.execPath, "api.mjs"], cwd: dir, readyPath: "/health", port: 4997 } }, contracts, { filter: "echoes" });
+  assert.deepEqual(apiOnly.map((r) => r.status), ["missing"]);
+  await assert.rejects(runTarget({ name: "broken", host: { command: [process.execPath, "broken.mjs"], cwd: dir } }, contracts), /exited \(3\) before it was ready/);
+  await assert.rejects(runTarget({ name: "broken-api", api: { command: [process.execPath, "broken.mjs"], cwd: dir } }, [contracts[1]]), /API exited/);
+  await assert.rejects(runTarget({ name: "no-command", host: { command: [join(dir, "missing-binary")] } }, contracts), /ENOENT|exited/);
+
+  // CLI over the same folder: --json, --target, --record and show for http contracts
+  await writeFile(join(dir, "contracts.json"), JSON.stringify({ contracts: ["echo.contract.yaml"], reference: "cmd", targets: { cmd: { host: { command: [process.execPath, "host.mjs"] } }, other: { host: { command: [process.execPath, "host.mjs"] } } } }));
+  const lines = [];
+  assert.equal(await main(["test", "--config", join(dir, "contracts.json"), "--json", "--target", "cmd"], (l) => lines.push(l)), 0);
+  assert.equal(JSON.parse(lines.join("\n")).summary[0].passed, 1);
+  await writeFile(join(dir, "echo.contract.yaml"), `contract: 1\nmodule: echo\ncases:\n  - { name: to record, call: echo, args: [5] }\n`);
+  lines.length = 0;
+  assert.equal(await main(["test", "--config", join(dir, "contracts.json"), "--record"], (l) => lines.push(l)), 0);
+  assert.match(lines.join("\n"), /recorded 1 expectation/);
+  assert.match(await readFile(join(dir, "echo.contract.yaml"), "utf8"), /expect: \{ value: 5 \}/);
+  await assert.rejects(main(["test", "--config", join(dir, "contracts.json"), "--record", "--target", "cmd,other"]), /exactly one/);
+  await assert.rejects(main(["test", "--config", join(dir, "contracts.json"), "--target", "nope"]), /No such target/);
+  await assert.rejects(main(["test", join(dir, "api.contract.yaml")]), /needs --config/);
+  lines.length = 0;
+  await main(["show", join(dir, "api.contract.yaml")], (l) => lines.push(l));
+  assert.match(lines.join("\n"), /POST \/echo \{"id":7\} → 200/);
+  assert.equal(await main([], () => {}), 1);
+  assert.equal(await main(["help"], () => {}), 0);
+});
+
+test("host protocol errors", async (t) => {
+  const host = await serveContracts({ subjects: { thing: () => ({ fail() { throw "plain string"; }, close() { throw new Error("ignored"); } }) } });
+  t.after(() => host.close());
+  const post = (path, body) => fetch(host.url + path, { method: "POST", headers: { "content-type": "application/json" }, body });
+  assert.equal((await post("/instances", "{bad")).status, 400);
+  assert.equal((await post("/instances", JSON.stringify({ subject: "nope" }))).status, 404);
+  const { id } = await (await post("/instances", JSON.stringify({ subject: "thing" }))).json();
+  assert.deepEqual(await (await post(`/instances/${id}/fail`, JSON.stringify({ args: [] }))).json(), { ok: false, error: { type: "string", message: "plain string" } });
+  assert.equal((await post(`/instances/${id}/fail`, JSON.stringify({ args: "x" }))).status, 400);
+  assert.equal((await post(`/instances/999/fail`, "{}")).status, 404);
+  assert.equal((await fetch(host.url + "/unknown")).status, 404);
+  assert.equal((await fetch(host.url.replace("/rt-contract/v1", "/other"))).status, 404);
+  assert.deepEqual(await (await fetch(`${host.url}/instances/${id}`, { method: "DELETE" })).json(), { ok: true });
+  assert.equal((await post("/instances", "x".repeat(5 * 1024 * 1024 + 1))).status, 413);
+});
+
+test("values and contracts: remaining branches", async (t) => {
+  for (const [value, type] of [["s", "string"], [1.5, "number"], [true, "boolean"], [[1], "array"], [{}, "object"], [null, "null"]]) assert.equal(compare(value, { $type: type }), undefined, type);
+  assert.match(compare(1, { $type: "weird" }), /unknown \$type/);
+  assert.match(compare(1, { $regex: "x" }), /does not match/);
+  assert.match(compare(1, { $approx: 2 }), /≈2/);
+  assert.match(compare("abc", { $length: 2 }), /length 2/);
+  assert.match(compare("c", { $oneOf: ["a"] }), /none of/);
+  assert.match(compare(1, { $partial: { a: 1 } }), /expected an object/);
+  assert.match(compare({}, { $partial: 1 }), /needs an object/);
+  assert.match(compare({ a: 1 }, { $partial: { a: 2 } }), /expected 2/);
+  assert.equal(compare({ $date: "x" }, { $date: "x" }), undefined);
+  assert.match(compare(1, { a: 1 }), /expected an object/);
+  assert.match(compare(1, [1]), /expected an array/);
+  assert.match(compare({ a: [1, 2] }, { a: [1, 3] }), /\$\.a\[1\]/);
+  assert.deepEqual(encode(new Map([["k", new Date(0)]])), { k: { $date: "1970-01-01T00:00:00.000Z" } });
+  assert.throws(() => encode(Symbol("x")), /Cannot encode/);
+  assert.throws(() => expand({ $text: { repeat: 1, count: 2 } }), /\$text/);
+  assert.deepEqual(expand({ $repeat: { count: 2, item: ["{i}", { n: "{i}" }, true] } }), [[0, { n: 0 }, true], [1, { n: 1 }, true]]);
+  assert.throws(() => lookupThrough(), /nothing/);
+  const dir = await mkdtemp(join(tmpdir(), "contract-find-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, "a.contract.json"), JSON.stringify({ contract: 1, module: "a", cases: [{ name: "x", call: "f", args: [] }] }));
+  await writeFile(join(dir, "bad.contract.yaml"), "contract: [\n");
+  const { findContracts } = await import("../dist/index.js");
+  assert.deepEqual(await findContracts([join(dir, "a.contract.json")]), [join(dir, "a.contract.json")]);
+  assert.equal((await findContracts([dir])).length, 2);
+  await assert.rejects(loadContract(join(dir, "bad.contract.yaml")), /bad.contract.yaml/);
+  const json = await loadContract(join(dir, "a.contract.json"));
+  assert.equal(await saveRecorded(json, new Map([["x\u00000", { value: 1 }]])), 1);
+  assert.deepEqual(JSON.parse(await readFile(join(dir, "a.contract.json"), "utf8")).cases[0].expect, { value: 1 });
+  assert.equal(await saveRecorded({ cases: [] }, new Map([["a", {}]])), 0);
+  for (const bad of [null, { contract: 1, module: "Bad" }, { contract: 1, kind: "x", module: "m", cases: [{}] }, { contract: 1, module: "m", cases: [{ name: "" }] }, { contract: 1, module: "m", cases: [{ name: "t", tags: [1], call: "f" }] }, { contract: 1, module: "m", cases: [{ name: "s", steps: [{ call: "1bad" }] }] }, { contract: 1, module: "m", cases: [{ name: "n" }] }, { contract: 1, module: "m", cases: [{ name: "e", call: "f", expect: { error: "x" } }] }, { contract: 1, kind: "http", module: "m", cases: [{ name: "h" }] }]) assert.throws(() => normalize(bad));
+  assert.equal(normalize({ contract: 1, module: "m", cases: [{ name: "c", create: { value: null } }] }).cases[0].steps.length, 0);
+});
+function lookupThrough() { return expand({ $ref: "0.a.b" }, [{ a: 1 }]); }

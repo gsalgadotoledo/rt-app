@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Case, Contract, Expectation, HttpExpectation } from "./contract.js";
 import { READY } from "./host.js";
@@ -66,11 +67,21 @@ export async function startHost(target: Target, { timeoutMs = 120000 } = {}): Pr
   return { url, info, stop: () => stopProcess(child) };
 }
 
+/** A port that is free right now on 127.0.0.1. */
+function freePort() {
+  return new Promise<number>((resolve, reject) => {
+    const server = createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => { const { port } = server.address() as { port: number }; server.close(() => resolve(port)); });
+  });
+}
+
 /** Start (or connect to) a target's API for http contracts; waits until readyPath answers. */
 export async function startApi(target: Target, { timeoutMs = 120000 } = {}): Promise<Started> {
   if (!target.api) throw new Error(`${target.name}: no api configured`);
   if (typeof target.api === "string") return { url: target.api.replace(/\/$/, ""), stop: async () => {} };
-  const { command, cwd, env, port = 4700 + Math.floor(Math.random() * 200), readyPath = "/health" } = target.api;
+  const { command, cwd, env, readyPath = "/health" } = target.api;
+  const port = target.api.port ?? (await freePort());
   const child = spawn(command[0], command.slice(1), { cwd, env: { ...process.env, PORT: String(port), ...env }, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   child.stdout!.on("data", (c: Buffer) => { output += c; });
@@ -145,7 +156,7 @@ async function runHttpCase(api: string, c: Case): Promise<{ status: Status; mess
   const results: Json[] = [];
   for (const [i, { request, expect }] of c.requests.entries()) {
     const path = request.path + (request.query ? "?" + new URLSearchParams(request.query) : "");
-    const body = request.body === undefined ? undefined : JSON.stringify(expand(request.body, results));
+    const body = typeof request.raw === "string" ? request.raw : request.body === undefined ? undefined : JSON.stringify(expand(request.body, results));
     const response = await fetch(api + path, { method: request.method, headers: { ...(body ? { "content-type": "application/json" } : {}), ...request.headers }, body });
     const text = await response.text();
     let parsed: Json = text;

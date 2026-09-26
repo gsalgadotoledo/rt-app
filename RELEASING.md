@@ -13,6 +13,23 @@ npm run release:publish
 
 Validation builds and tests the framework, prepares the app-only template, checks packed exports and exclusions, then installs the tarballs in an empty directory. It generates and builds an application without a source copy of the core and bundles its Lambda, starts the installed admin, runs generated app tests and validates Terraform without applying resources. Terraform 1.11+ is required for release validation; TF_CLI_PATH can select a separate executable. Artifacts are hash-verified before publication, in dependency order. Interrupted publication can resume: already published versions are skipped only when their integrity matches exactly. A conflicting immutable version fails rather than being overwritten. Never commit tokens, state, databases or release artifacts.
 
+## Develop without publishing
+
+Apps can run this checkout instead of the published packages, so small changes do not need a
+release:
+
+```sh
+npm run build                                      # once, then per changed package:
+npm run build --workspace @gsalgadotoledo/rt-app-feature-flags
+npm run link:app -- ~/Desktop/rt-apps/my-app       # symlink the app's @gsalgadotoledo packages here
+npm run link:app -- ~/Desktop/rt-apps/my-app --status
+npm run unlink:app -- ~/Desktop/rt-apps/my-app     # back to the published versions (npm install)
+```
+
+Linking changes only `node_modules` of the app: `package.json` and `package-lock.json` stay
+untouched, so committing the app never pins a local path. Restart the app after rebuilding. A
+linked app that runs `npm install` goes back to the published packages; link it again.
+
 ## GitHub OIDC
 After the first publication, configure each package's Trusted Publisher for user `gsalgadotoledo`, repository `rt-app`, workflow `publish.yml`, environment `npm`. Protect that GitHub environment with required reviewers. The workflow is manual and uses OIDC; no npm token is stored. GitHub Actions must be enabled and the account billing limit must allow a runner. Private-repository provenance is not requested.
 

@@ -1,7 +1,90 @@
 {
-  "contracts": ["contracts"],
+  "contracts": [
+    "contracts"
+  ],
   "reference": "node",
   "targets": {
-    "node": { "host": { "command": ["node", "hosts/node.mjs"] } }
+    "node": {
+      "host": {
+        "command": [
+          "node",
+          "hosts/node.mjs"
+        ]
+      },
+      "api": {
+        "command": [
+          "node",
+          "hosts/node-api.mjs"
+        ],
+        "readyPath": "/health/live"
+      }
+    },
+    "python": {
+      "host": {
+        "command": [
+          "sh",
+          "hosts/python.sh",
+          "hosts/python_host.py"
+        ]
+      },
+      "api": {
+        "command": [
+          "sh",
+          "../spec/hosts/python.sh",
+          "-m",
+          "rt_app.web",
+          "serve",
+          "app:app"
+        ],
+        "cwd": "../examples/flags-api/python",
+        "readyPath": "/health/live"
+      }
+    },
+    "python-lambda": {
+      "api": {
+        "command": [
+          "sh",
+          "../spec/hosts/python.sh",
+          "-m",
+          "rt_app.web",
+          "lambda-local",
+          "app:app"
+        ],
+        "cwd": "../examples/flags-api/python",
+        "readyPath": "/health/live"
+      }
+    },
+    "go": {
+      "host": {
+        "command": [
+          "go",
+          "run",
+          "./cmd/contract-host"
+        ],
+        "cwd": "../core-go"
+      },
+      "api": {
+        "command": [
+          "go",
+          "run",
+          ".",
+          "-mode=serve"
+        ],
+        "cwd": "../examples/flags-api/go",
+        "readyPath": "/health/live"
+      }
+    },
+    "go-lambda": {
+      "api": {
+        "command": [
+          "go",
+          "run",
+          ".",
+          "-mode=lambda-local"
+        ],
+        "cwd": "../examples/flags-api/go",
+        "readyPath": "/health/live"
+      }
+    }
   }
 }
