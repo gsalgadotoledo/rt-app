@@ -89,12 +89,13 @@ test('workspace projects are listed without opening them; registered ones keep t
  }
  await mkdir(join(ws,'.hidden'));await writeFile(join(ws,'file.txt'),'x');
  const hub=new ServiceHub({home});hub.registry=[{path:join(ws,'beta-app'),name:'beta (opened)'}];
- assert.deepEqual(await hub.projects(),[{path:join(ws,'beta-app'),name:'beta (opened)'}],'no workspace configured');
+ const beta={path:join(ws,'beta-app'),name:'beta (opened)',kind:'rt-app',runtimes:['node']};
+ assert.deepEqual(await hub.projects(),[beta],'no workspace configured');
  await writeFile(join(home,'workspace.json'),JSON.stringify({path:ws}));
- assert.deepEqual(await hub.projects(),[{path:join(ws,'beta-app'),name:'beta (opened)'},{path:join(ws,'alpha-app'),name:'alpha-app',discovered:true}]);
+ assert.deepEqual(await hub.projects(),[beta,{path:join(ws,'alpha-app'),name:'alpha-app',kind:'rt-app',runtimes:['node'],discovered:true},{path:join(ws,'old-app'),name:'old-app',kind:'generic',runtimes:['node'],discovered:true}],'a folder with only package.json is a generic Node project');
  await writeFile(join(home,'workspace.json'),JSON.stringify({path:join(ws,'missing')}));
  assert.equal((await hub.projects()).length,1);
- assert.deepEqual((await hub.snapshot()).projects,[{path:join(ws,'beta-app'),name:'beta (opened)'}]);
+ assert.deepEqual((await hub.snapshot()).projects,[beta]);
 });
 
 test('deleteProject forgets a known project and refuses unknown paths',async t=>{

@@ -4,6 +4,11 @@ import {runtimeLabel} from './runtime-label.mjs';
 import {Toolchains} from '@gsalgadotoledo/rt-app-create/runtime';
 import {catalog,installTool,toolService} from './catalog.mjs';
 import {discover} from './discovery.mjs';
+import {detectProject,projectName,genericServices,genericManifest,excludeFromGit,scanWorkspace} from './stacks.mjs';
+import {LaunchAgents,agentLabel} from './launchd.mjs';
+import {MachineProcesses} from './processes.mjs';
+import {adminFor} from './admins.mjs';
+import {createHash as hashOf} from 'node:crypto';
 const jobs=new Map();
 import {readFile,writeFile,mkdir,rename,realpath,readdir} from 'node:fs/promises';
 import {homedir} from 'node:os';
@@ -32,12 +37,15 @@ async function apply(root,config){
 }
 /** Main-process coordinator. Each project retains its own native daemon; common services have one per user. */
 export class ServiceHub {
- constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false}={}){this.home=home;this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();}
+ constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine}={}){this.home=home;this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();}
  exclusive(fn){const job=this.queue.then(fn);this.queue=job.catch(()=>{});return job;}
  async initialize(){await mkdir(this.home,{recursive:true,mode:0o700});this.registry=await read(join(this.home,'projects.json'),[]);this.global=await read(join(this.home,'settings.json'),{version:1,ports:{smtp:1025,mail:8025},extra:[]});validatePorts(this.global.ports);}
  async select(root){return this.exclusive(async()=>{
   this.registry=await read(join(this.home,'projects.json'),[]);this.global=await read(join(this.home,'settings.json'),this.global);
-  root=await realpath(root);const settings=await read(join(root,'rt-app.settings.json'));const pkg=await read(join(root,'package.json'));
+  root=await realpath(root);const detected=await detectProject(root);
+  if(!detected)throw new Error('Not a project: add package.json, pyproject.toml, go.mod, Cargo.toml, a Makefile or rt-app.settings.json');
+  if(detected.kind==='generic')return this.openGeneric(root);
+  const settings=await read(join(root,'rt-app.settings.json'));const pkg=await read(join(root,'package.json'));
   if(settings.version!==1||!settings.runtime?.local)throw new Error('Select a project containing rt-app.settings.json version 1 and package.json');
   const existing=this.registry.find(p=>p.path===root);
   if(!existing){
@@ -58,32 +66,46 @@ export class ServiceHub {
   await this.ensureProject(root);
   return this.snapshot();
  });}
- globalManifest(){const {smtp,mail}=this.global.ports;return {services:[{id:'mail',label:'Mailpit · shared email',cwd:'.',command:this.global.mailCommand,env:{RT_APP_MAIL_SMTP_PORT:String(smtp),RT_APP_MAIL_UI_PORT:String(mail)},ports:[smtp,mail],url:`http://localhost:${mail}`,readyUrl:`http://localhost:${mail}/readyz`,dependencies:[]},...(this.global.extra??[]).map(bindPorts)]};}
+ globalManifest(){const {smtp,mail}=this.global.ports;return {services:[...(this.global.mailCommand?[{id:'mail',label:'Mailpit · shared email',cwd:'.',command:this.global.mailCommand,env:{RT_APP_MAIL_SMTP_PORT:String(smtp),RT_APP_MAIL_UI_PORT:String(mail)},ports:[smtp,mail],url:`http://localhost:${mail}`,readyUrl:`http://localhost:${mail}/readyz`,dependencies:[]}]:[]),...(this.global.extra??[]).map(bindPorts)]};}
+ /** Projects without rt-app.settings.json: services detected by convention, kept in the manager home. */
+ async isGeneric(root){try{await read(join(root,'rt-app.settings.json'));return false;}catch{return true;}}
+ genericPath(root){return join(this.home,'generic',hashOf('sha256').update(root).digest('hex').slice(0,16)+'.json');}
+ async genericConfig(root){let saved=await read(this.genericPath(root),null);if(!saved){saved={services:await genericServices(root)};await mkdir(join(this.home,'generic'),{recursive:true,mode:0o700});await save(this.genericPath(root),saved);}return saved;}
+ async openGeneric(root){
+  if(!this.registry.some(p=>p.path===root)){this.registry.push({path:root,name:await projectName(root,basename(root)),kind:'generic'});await save(join(this.home,'projects.json'),this.registry);}
+  this.root=root;
+  // The supervisor keeps its state in <project>/.rt-app; hide it from git without editing tracked files.
+  await excludeFromGit(root);
+  const globalConfig=this.globalManifest();const globalDaemon=await ensureDaemon(this.home,{binary:this.options.binary,config:globalConfig});
+  if(!globalDaemon.started&&JSON.stringify(await read(join(this.home,'.rt-app/services.json')))!==JSON.stringify(globalConfig))await apply(this.home,globalConfig);
+  await this.ensureProject(root);
+  return this.snapshot();
+ }
  async projectManifest(root,settings){return manifest(root,{...this.options,sharedMail:this.global.ports,sharedEnv:Object.fromEntries((this.global.extra??[]).flatMap(s=>(s.portEnv??[]).map((key,i)=>[key,String(s.ports[i])]))),settings});}
- async ensureProject(root){const config=await this.projectManifest(root);const {started}=await ensureDaemon(root,{binary:this.options.binary,config});if(!started){const current=await read(join(root,'.rt-app/services.json'));if(JSON.stringify(current)!==JSON.stringify(config))await apply(root,config);}}
+ async ensureProject(root){const config=await this.isGeneric(root)?genericManifest((await this.genericConfig(root)).services):await this.projectManifest(root);const {started}=await ensureDaemon(root,{binary:this.options.binary,config});if(!started){const current=await read(join(root,'.rt-app/services.json'));if(JSON.stringify(current)!==JSON.stringify(config))await apply(root,config);}}
  async snapshot(){
   if(!this.root)return {project:'',services:[],projects:await this.projects(),catalog:[]};
   this.global=await read(join(this.home,'settings.json'),this.global);this.registry=await read(join(this.home,'projects.json'),this.registry);
   const [project,global]=await Promise.all([request(this.root,'status'),request(this.home,'status')]);
-  const settings=await read(join(this.root,'rt-app.settings.json'));
+  const settings=await read(join(this.root,'rt-app.settings.json'),{});
   const config=await read(join(this.root,'.rt-app/services.json'),{services:[]});
+  const detected=await detectProject(this.root)??{kind:'generic',runtimes:[]};
+  const background=new Set((await this.agents.registry().catch(()=>[])).map(b=>b.label));
+  const installed=this.global.catalogTools??[];const pgweb=global.services.find(s=>s.id==='pgweb'&&s.state==='running');
   const globalConfig=await read(join(this.home,'.rt-app/services.json'),{services:[]});
   const runtime=(s,list,backend)=>runtimeLabel(list.find(spec=>spec.id===s.id)??s,backend);
-  return {...project,catalog:catalog.map(t=>({...t,installed:(this.global.catalogTools??[]).includes(t.id),job:jobs.get(t.id)})),projects:await this.projects(),globalPorts:{...this.global.ports,...extraPorts(this.global.extra)},projectPorts:{...defaults,...settings.local?.ports,...extraPorts(settings.services?.extra)},services:[...global.services.map(s=>({...s,runtime:runtime(s,globalConfig.services),id:`global:${s.id}`,scope:'global',project:'Shared across projects'})),...project.services.map(s=>({...s,runtime:runtime(s,config.services,settings.backend),scope:'project',project:this.registry.find(p=>p.path===this.root)?.name??basename(this.root)}))]};
+  return {...project,catalog:catalog.map(t=>({...t,installed:(this.global.catalogTools??[]).includes(t.id),job:jobs.get(t.id)})),projects:await this.projects(),globalPorts:{...this.global.ports,...extraPorts(this.global.extra)},projectPorts:detected.kind==='generic'?{}:{...defaults,...settings.local?.ports,...extraPorts(settings.services?.extra)},projectKind:detected.kind,projectRuntimes:detected.runtimes,services:[...global.services.map(s=>({...s,runtime:runtime(s,globalConfig.services),id:`global:${s.id}`,scope:'global',project:'Shared across projects',background:background.has(agentLabel(this.home,s.id)),admin:adminFor({...(globalConfig.services.find(spec=>spec.id===s.id)??{}),...s},{installed,running:pgweb?{pgweb:pgweb.url}:{}})})),...project.services.map(s=>({...s,runtime:runtime(s,config.services,settings.backend),scope:'project',project:this.registry.find(p=>p.path===this.root)?.name??basename(this.root),background:background.has(agentLabel(this.root,s.id))}))]};
  }
  /**
   * Projects opened before plus every RT-App project in the workspace folder (one level deep,
   * identified by rt-app.settings.json), so projects created with npx appear without opening them.
   */
  async projects(){
-  const listed=[...this.registry];
+  const listed=[];
+  for(const project of this.registry)listed.push({...project,...(await detectProject(project.path).catch(()=>undefined)??{kind:'missing',runtimes:[]})});
   let workspace;try{workspace=JSON.parse(await readFile(join(this.home,'workspace.json'),'utf8')).path;}catch(e){if(e.code!=='ENOENT')throw e;}
   if(!workspace)return listed;
-  let entries=[];try{entries=await readdir(workspace,{withFileTypes:true});}catch(e){if(e.code!=='ENOENT')throw e;}
-  for(const entry of entries.filter(e=>e.isDirectory()&&!e.name.startsWith('.')).sort((a,b)=>a.name.localeCompare(b.name))){
-   const path=join(workspace,entry.name);if(listed.some(p=>p.path===path))continue;
-   try{const settings=JSON.parse(await readFile(join(path,'rt-app.settings.json'),'utf8'));if(settings.version!==1)continue;const pkg=JSON.parse(await readFile(join(path,'package.json'),'utf8'));listed.push({path,name:pkg.name??entry.name,discovered:true});}catch{}
-  }
+  for(const project of await scanWorkspace(workspace))if(!listed.some(p=>p.path===project.path))listed.push({...project,discovered:true});
   return listed;
  }
  /**
@@ -112,8 +134,7 @@ export class ServiceHub {
   if(!this.root || typeof id!=='string') throw new Error('Select a project and command');
   const config=await read(join(this.root,'.rt-app/services.json'));
   const resolved=await commandSpec(this.root,id,config.services);
-  const settings=await read(join(this.root,'rt-app.settings.json'));
-  const required=Object.keys(settings.requirements??{node:'24'});
+  const required=await this.requiredTools();
   const missing=(await new Toolchains(this.home).status(required)).filter(t=>t.required&&!t.ready);
   if(missing.length)throw new Error('Install project requirements first: '+missing.map(t=>t.name).join(', '));
   if(resolved.serviceId){
@@ -128,8 +149,8 @@ export class ServiceHub {
  action(action,id){return this.exclusive(async()=>{
   if(!['start','stop','restart'].includes(action))throw new Error('Invalid action');
   if(id.startsWith('global:'))return request(this.home,action,id.slice(7));
-  if(action!=='stop'){const settings=await read(join(this.root,'rt-app.settings.json'));const required=Object.keys(settings.requirements??{node:'24'});const missing=(await new Toolchains(this.home).status(required)).filter(t=>t.required&&!t.ready);if(missing.length)throw new Error('Install project requirements first: '+missing.map(t=>t.name).join(', '));}
-  if(action!=='stop'&&!this.options.noMail&&id!=='build'&&!id.startsWith('run-'))await this.waitMail();
+  if(action!=='stop'){const required=await this.requiredTools();const missing=(await new Toolchains(this.home).status(required)).filter(t=>t.required&&!t.ready);if(missing.length)throw new Error('Install project requirements first: '+missing.map(t=>t.name).join(', '));}
+  if(action!=='stop'&&!this.options.noMail&&id!=='build'&&!id.startsWith('run-')&&!await this.isGeneric(this.root))await this.waitMail();
   return request(this.root,action,id==='project:all'?'all':id);
  });}
  logs(id){return request(id.startsWith('global:')?this.home:this.root,'logs',id.replace(/^global:/,''));}
@@ -163,9 +184,54 @@ export class ServiceHub {
    jobs.delete(id);return {removed:true,dataPreserved:true};
   });
  }
- async discover(){const settings=await read(join(this.root,'rt-app.settings.json'));const existing=new Set((settings.services?.extra??[]).map(s=>s.id));return (await discover(this.root)).filter(s=>!existing.has(s.id));}
+ /** Toolchains a project needs before starting: RT-App settings, or the detected runtimes we can install. */
+ async requiredTools(){
+  try{const settings=await read(join(this.root,'rt-app.settings.json'));return Object.keys(settings.requirements??{node:'24'});}
+  catch{const {runtimes=[]}=await detectProject(this.root)??{};return runtimes.filter(r=>['node','python','go'].includes(r));}
+ }
+
+ /**
+  * Run a service always (LaunchAgent: starts at login, restarts when it exits) or stop doing so.
+  * The supervised copy is stopped first so both never fight for the same port.
+  */
+ background(id,enabled){return this.exclusive(async()=>{
+  const global=id.startsWith('global:'),root=global?this.home:this.root,serviceId=global?id.slice(7):id;
+  if(!root)throw new Error('Select a project first');
+  const config=await read(join(root,'.rt-app/services.json'));const spec=config.services.find(s=>s.id===serviceId);
+  if(!spec)throw new Error('Unknown service');
+  if(!enabled){await this.agents.disable(agentLabel(root,serviceId));return this.snapshot();}
+  const bound=bindPorts(spec);
+  await request(root,'stop',serviceId).catch(()=>{});
+  await this.agents.enable({project:root,serviceId,name:spec.label,command:bound.command,cwd:join(root,spec.cwd??'.'),env:{PATH:process.env.PATH??'',...bound.env}});
+  return this.snapshot();
+ });}
+
+ /** Development processes on this computer (Node, Python, Go, …), including ones we did not start. */
+ async machineProcesses(){
+  const statuses=await Promise.all([this.home,...this.registry.map(p=>p.path)].map(root=>request(root,'status').catch(()=>({services:[]}))));
+  const managedPids=new Set(statuses.flatMap(s=>s.services.map(x=>x.pid)).filter(Boolean));
+  const launchd=await this.agents.loaded().catch(()=>new Map());
+  return this.machine.list({projects:await this.projects(),managedPids,launchd});
+ }
+
+ stopProcess(pid){if(!Number.isInteger(pid)||pid<2)throw new Error('Invalid process');return this.machine.stop(pid);}
+
+ detachAgent(label){return this.agents.detach(label);}
+
+ /** URL to open for "View admin" of a shared service; starts an installed admin tool when needed. */
+ async adminUrl(id){
+  const service=(await this.snapshot()).services.find(s=>s.id===id);
+  if(!service?.admin)throw new Error('Unknown service');
+  const admin=service.admin;
+  if(admin.kind==='url')return admin.url;
+  if(admin.kind==='start'){await request(this.home,'start',admin.tool);for(let i=0;i<50;i++){const pg=(await request(this.home,'status')).services.find(s=>s.id===admin.tool);if(pg?.state==='running'&&pg.url)return pg.url;await delay(200);}throw new Error(admin.name+' did not start; see its logs in Shared services');}
+  throw new Error(admin.kind==='install'?`Install ${admin.name} from Add tools & services first`:admin.description);
+ }
+
+ async discover(){if(await this.isGeneric(this.root)){const saved=await this.genericConfig(this.root);const known=new Set(saved.services.map(s=>s.id));return (await genericServices(this.root)).filter(s=>!known.has(s.id));}const settings=await read(join(this.root,'rt-app.settings.json'));const existing=new Set((settings.services?.extra??[]).map(s=>s.id));return (await discover(this.root)).filter(s=>!existing.has(s.id));}
  addDiscovered(id){return this.exclusive(async()=>{
   const candidate=(await this.discover()).find(s=>s.id===id);if(!candidate)throw new Error('Candidate not found; scan again');
+  if(await this.isGeneric(this.root)){const saved=await this.genericConfig(this.root);saved.services.push(candidate);await save(this.genericPath(this.root),saved);await apply(this.root,genericManifest(saved.services));return this.snapshot();}
   const path=join(this.root,'rt-app.settings.json'),settings=await read(path),next={...settings,services:{...settings.services,extra:[...(settings.services?.extra??[]),candidate]}};
   await apply(this.root,await this.projectManifest(this.root,next));await save(path,next);return this.snapshot();
  });}

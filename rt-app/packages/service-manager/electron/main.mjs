@@ -59,6 +59,14 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('deploy:open-admin',async event=>{trusted(event);const admin=new URL(await hub.url('admin'));admin.pathname='/settings/deployments';await shell.openExternal(admin.href);});
    // Delete: stop the project's services, forget it, move the folder to the Trash (recoverable).
    ipcMain.handle('projects:delete',async(event,path)=>{trusted(event);if(typeof path!=='string'||!path)throw new Error('Invalid project');const {removed}=await hub.deleteProject(path);await shell.trashItem(removed);return hub.snapshot();});
+   // Background services (run at login), web admins and the machine's development processes.
+   ipcMain.handle('services:background',(event,id,enabled)=>{trusted(event);if(typeof id!=='string'||typeof enabled!=='boolean')throw new Error('Invalid request');return hub.background(id,enabled);});
+   const openLocal=async url=>{const u=new URL(url);if(u.protocol!=='http:'||!['localhost','127.0.0.1'].includes(u.hostname))throw new Error('Only local URLs can be opened');await shell.openExternal(u.href);};
+   ipcMain.handle('services:open-admin',async(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid service');await openLocal(await hub.adminUrl(id));});
+   ipcMain.handle('machine:list',event=>{trusted(event);return hub.machineProcesses();});
+   ipcMain.handle('machine:stop',(event,pid)=>{trusted(event);return hub.stopProcess(pid);});
+   ipcMain.handle('machine:detach',(event,label)=>{trusted(event);if(typeof label!=='string')throw new Error('Invalid label');return hub.detachAgent(label);});
+   ipcMain.handle('machine:open-port',async(event,port)=>{trusted(event);if(!Number.isInteger(port)||port<1||port>65535)throw new Error('Invalid port');await openLocal(`http://localhost:${port}`);});
    ipcMain.handle('services:ports',(event,scope,ports)=>{trusted(event);return hub.setPorts(scope,ports);});
    window.on('close',event=>{if(!quitting){event.preventDefault();window.hide();}});
    tray=await createServiceTray({hub,show,quit});

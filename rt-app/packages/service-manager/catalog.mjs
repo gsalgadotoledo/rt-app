@@ -13,12 +13,15 @@ export const catalog=[
  {id:'sqlite',name:'SQLite',kind:'embedded',description:'Local database file and system SQLite CLI. Embedded: no server process or port.'},
  {id:'gh',name:'GitHub CLI',kind:'cli',description:'Official release (checksum verified). Used by rta github connect/sync and deploy workflows. Sign in with gh auth login.'},
  {id:'flyctl',name:'Fly.io CLI',kind:'cli',description:'Official flyctl release (checksum verified). Needed by the Fly.io deploy provider.'},
+ {id:'pgweb',name:'pgweb · PostgreSQL admin',kind:'service',port:8081,description:'Web admin for the local PostgreSQL (official release, SHA-256 verified). Opens with View admin on PostgreSQL.'},
 ];
 
 /** CLIs installed from official GitHub releases: asset pattern and checksum file per tool. */
 export const githubClis={
  gh:{repo:'cli/cli',asset:(v,arch)=>`gh_${v}_macOS_${arch==='arm64'?'arm64':'amd64'}.zip`,checksums:v=>`gh_${v}_checksums.txt`,binary:'gh'},
  flyctl:{repo:'superfly/flyctl',asset:(v,arch)=>`flyctl_${v}_macOS_${arch==='arm64'?'arm64':'x86_64'}.tar.gz`,checksums:v=>`flyctl_${v}_checksums.txt`,binary:'flyctl'},
+ // No checksum file: verified against the SHA-256 digest GitHub publishes for each release asset.
+ pgweb:{repo:'sosedoff/pgweb',asset:(v,arch)=>`pgweb_darwin_${arch==='arm64'?'arm64':'amd64'}.zip`,checksums:null,binary:'pgweb',archiveBinary:arch=>`pgweb_darwin_${arch==='arm64'?'arm64':'amd64'}`},
 };
 const hostAllowed=new Set(['registry.npmjs.org','downloads.mongodb.org','fastdl.mongodb.org','raw.githubusercontent.com','download.redis.io','api.github.com','github.com','release-assets.githubusercontent.com','objects.githubusercontent.com']);
 async function download(url,max=350*1024*1024){if(!hostAllowed.has(new URL(url).hostname)||new URL(url).protocol!=='https:')throw new Error('Untrusted download URL');const r=await fetch(url,{redirect:'error',signal:AbortSignal.timeout(120000)});if(!r.ok)throw new Error(`Download failed: ${r.status}`);const chunks=[];let size=0;for await(const c of r.body){size+=c.length;if(size>max)throw new Error('Download exceeds size limit');chunks.push(c);}return Buffer.concat(chunks);}
@@ -42,11 +45,14 @@ export async function installGithubCli(id,stage,{fetchImpl=fetch,arch=process.ar
  report('Resolving latest '+id+' release…');
  const release=JSON.parse((await downloadFollowing(`https://api.github.com/repos/${spec.repo}/releases/latest`,{fetchImpl,max:4*1024*1024})).toString());
  const version=String(release.tag_name).replace(/^v/,'');if(!/^\d+\.\d+\.\d+$/.test(version))throw new Error('Unexpected release version');
- const asset=spec.asset(version,arch),checksums=spec.checksums(version);
+ const asset=spec.asset(version,arch);
  const url=name=>{const found=release.assets.find(a=>a.name===name);if(!found)throw new Error('Release asset missing: '+name);return found.browser_download_url;};
- const expected=checksumFor((await downloadFollowing(url(checksums),{fetchImpl,max:1024*1024})).toString(),asset);
+ const digest=release.assets.find(a=>a.name===asset)?.digest;
+ const expected=spec.checksums
+  ?checksumFor((await downloadFollowing(url(spec.checksums(version)),{fetchImpl,max:1024*1024})).toString(),asset)
+  :/^sha256:[a-f0-9]{64}$/.test(digest??'')?digest.slice(7):(()=>{throw new Error('No published checksum for '+asset);})();
  report(`Downloading ${id} ${version}…`);const bytes=await downloadFollowing(url(asset),{fetchImpl});verify(bytes,'sha256',expected);
- return {version,asset,bytes,binary:spec.binary,source:url(asset),integrity:expected};
+ return {version,asset,bytes,binary:spec.binary,archiveBinary:spec.archiveBinary?.(arch)??spec.binary,source:url(asset),integrity:expected};
 }
 export function verify(bytes,algorithm,expected,encoding='hex'){if(createHash(algorithm).update(bytes).digest(encoding)!==expected)throw new Error('Download checksum mismatch');}
 async function extract(bytes,dir){const archive=join(dir,'download.tgz');await writeFile(archive,bytes);const {stdout}=await exec('tar',['-tzf',archive],{maxBuffer:8*1024*1024});if(stdout.split('\n').some(p=>p.startsWith('/')||p.split('/').includes('..')))throw new Error('Unsafe archive path');await exec('tar',['-xzf',archive,'--strip-components','1','-C',dir],{maxBuffer:8*1024*1024});await rm(archive);}
@@ -78,7 +84,7 @@ export async function installTool(home,id,report=()=>{}){
    const archive=join(stage,cli.asset);await writeFile(archive,cli.bytes);
    if(cli.asset.endsWith('.zip'))await exec('/usr/bin/ditto',['-x','-k',archive,stage]);else await extract(cli.bytes,stage);
    await rm(archive,{force:true});
-   const binary=await find(stage,cli.binary);if(!binary)throw new Error(cli.binary+' binary missing from the release');
+   const binary=await find(stage,cli.archiveBinary);if(!binary)throw new Error(cli.archiveBinary+' binary missing from the release');
    await mkdir(join(stage,'bin'),{recursive:true});await symlink(relative(join(stage,'bin'),binary),join(stage,'bin',cli.binary));
    info={id,version:cli.version,binary:join(dest,'bin',cli.binary),source:cli.source,integrity:cli.integrity};
   }else if(id==='json'){
@@ -99,6 +105,13 @@ export async function toolService(home,info,port){
  }else if(info.id==='mongodb')base.command=[info.binary,'--dbpath',data,'--bind_ip','127.0.0.1','--port','${MONGODB_PORT}'];
  else if(info.id==='redis')base.command=[info.binary,'--bind','127.0.0.1','--protected-mode','yes','--port','${REDIS_PORT}','--dir',data,'--appendonly','yes','--daemonize','no'];
  else if(info.id==='json'){base.command=['node',info.binary];base.env={RT_APP_JSON_SERVER_FILE:join(data,'db.json')};base.url=`http://localhost:${port}`;base.readyUrl=`http://localhost:${port}/health`;}
+ else if(info.id==='pgweb'){
+  // Connect to the shared PostgreSQL started by the catalog (trust auth on loopback, user rtapp).
+  let settings={};try{settings=JSON.parse(await readFile(join(home,'settings.json'),'utf8'));}catch{}
+  const pgPort=(settings.extra??[]).find(s=>s.catalogId==='postgres')?.ports?.[0]??5432;
+  base.command=[info.binary,'--bind','127.0.0.1','--listen','${PGWEB_PORT}','--url',`postgres://rtapp@127.0.0.1:${pgPort}/postgres?sslmode=disable`];
+  base.url=`http://localhost:${port}`;base.dependencies=['postgres'];
+ }
  else if(githubClis[info.id])return null;
  else{const file=join(data,'database.sqlite');try{await access(file);}catch(e){if(e.code!=='ENOENT')throw e;await exec(info.binary,[file,'VACUUM;']);}return null;}
  return base;
