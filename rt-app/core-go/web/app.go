@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime/debug"
@@ -52,11 +53,16 @@ type Endpoint struct {
 	Handle   func(*Context) (any, error)
 }
 
-// Actor is the authenticated caller.
+// Actor is the authenticated caller. Authenticators fill at least ID, Role and Grants;
+// session authenticators (package auth) also fill the public profile fields.
 type Actor struct {
-	ID     string   `json:"id"`
-	Role   string   `json:"role"`
-	Grants []string `json:"grants,omitempty"`
+	ID           string   `json:"id"`
+	Email        string   `json:"email,omitempty"`
+	Name         string   `json:"name,omitempty"`
+	Role         string   `json:"role"`
+	Grants       []string `json:"grants,omitempty"`
+	TokenVersion int      `json:"tokenVersion,omitempty"`
+	Active       bool     `json:"active,omitempty"`
 }
 
 // LocalOwner is the actor of local admin mode.
@@ -74,6 +80,9 @@ type Request struct {
 	Body map[string]any
 	// Raw is the body as received.
 	Raw []byte
+	// IP is the client address without the port (the socket peer, like Node's
+	// socket.remoteAddress; "unknown" when absent). Rate limits key on it.
+	IP string
 }
 
 // Context is what an endpoint handler receives.
@@ -111,6 +120,11 @@ func WithAdminAuthenticator(auth Authenticator) Option {
 // WithBodyLimit changes the body limit (default DefaultBodyLimit).
 func WithBodyLimit(bytes int64) Option { return func(a *App) { a.bodyLimit = bytes } }
 
+// WithFallback serves requests that match no endpoint with next instead of answering 404
+// "Endpoint not found". The request reaches next untouched (body unread), so a native API
+// can forward the routes it does not implement yet, e.g. with NewCoreProxy.
+func WithFallback(next http.Handler) Option { return func(a *App) { a.fallback = next } }
+
 // WithLogger sets the logger for internal errors (default slog.Default()).
 func WithLogger(logger *slog.Logger) Option { return func(a *App) { a.logger = logger } }
 
@@ -121,6 +135,7 @@ type App struct {
 	adminAuth Authenticator
 	bodyLimit int64
 	logger    *slog.Logger
+	fallback  http.Handler
 }
 
 type route struct {
@@ -173,6 +188,13 @@ func New(features []Feature, options ...Option) (*App, error) {
 
 // ServeHTTP reads the JSON body, dispatches and writes a JSON response.
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if a.fallback != nil {
+		path, _, _ := strings.Cut(RawTarget(r), "?")
+		if found, _ := a.find(r.Method, path); found == nil {
+			a.fallback.ServeHTTP(w, r)
+			return
+		}
+	}
 	raw, err := io.ReadAll(io.LimitReader(r.Body, a.bodyLimit+1))
 	if err != nil {
 		var maxErr *http.MaxBytesError
@@ -199,7 +221,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for name, list := range values {
 		query[name] = list[len(list)-1]
 	}
-	req := Request{Method: r.Method, Path: path, Query: query, Headers: r.Header, Body: body, Raw: raw}
+	req := Request{Method: r.Method, Path: path, Query: query, Headers: r.Header, Body: body, Raw: raw, IP: clientIP(r)}
 	status, result := a.dispatch(r, req)
 	writeJSON(w, status, result)
 }
@@ -223,31 +245,33 @@ func (a *App) dispatch(r *http.Request, req Request) (status int, body any) {
 	return http.StatusInternalServerError, errorBody("Internal error")
 }
 
-func (a *App) run(r *http.Request, req Request) (any, error) {
-	var found *route
-	var params map[string]string
+// find returns the first route matching method and the percent-encoded path, with its
+// raw (still encoded) parameters.
+func (a *App) find(method, path string) (*route, map[string]string) {
 	for i := range a.routes {
 		rt := &a.routes[i]
-		if rt.Method != req.Method {
+		if rt.Method != method {
 			continue
 		}
-		values, ok := rt.match(req.Path)
-		if !ok {
-			continue
+		if values, ok := rt.match(path); ok {
+			return rt, values
 		}
-		found = rt
-		params = make(map[string]string, len(values))
-		for name, value := range values {
-			decoded, err := decodeURIComponent(value)
-			if err != nil {
-				return nil, apperr.BadRequest("Invalid URL")
-			}
-			params[name] = decoded
-		}
-		break
 	}
+	return nil, nil
+}
+
+func (a *App) run(r *http.Request, req Request) (any, error) {
+	found, values := a.find(req.Method, req.Path)
 	if found == nil {
 		return nil, apperr.NotFound("Endpoint not found")
+	}
+	params := make(map[string]string, len(values))
+	for name, value := range values {
+		decoded, err := decodeURIComponent(value)
+		if err != nil {
+			return nil, apperr.BadRequest("Invalid URL")
+		}
+		params[name] = decoded
 	}
 	var actor *Actor
 	if found.Access != Guest {
@@ -266,6 +290,17 @@ func (a *App) run(r *http.Request, req Request) (any, error) {
 		}
 	}
 	return found.Handle(&Context{Ctx: r.Context(), Request: req, Params: params, Actor: actor})
+}
+
+// clientIP is the host part of r.RemoteAddr ("unknown" when empty).
+func clientIP(r *http.Request) string {
+	if r.RemoteAddr == "" {
+		return "unknown"
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 // check enforces the endpoint's access level.

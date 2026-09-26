@@ -1,6 +1,6 @@
 module flagsapi
 
-go 1.26
+go 1.26.0
 
 require rt.local/core-go v0.0.0
 

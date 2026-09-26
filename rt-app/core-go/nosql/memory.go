@@ -1,11 +1,7 @@
 package nosql
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
-	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -15,9 +11,6 @@ import (
 
 // PageSize is the number of rows MemoryStore.List returns per page.
 const PageSize = 50
-
-// ErrDuplicateKey is returned when a transaction writes the same key twice.
-var ErrDuplicateKey = errors.New("Duplicate transaction key")
 
 type key struct{ pk, sk string }
 
@@ -64,13 +57,11 @@ func (m *MemoryStore) Transact(_ context.Context, writes []Write) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	seen := make(map[key]bool, len(writes))
+	if err := CheckKeys(writes); err != nil {
+		return err
+	}
 	for _, w := range writes {
 		k := key{w.Row.PK, w.Row.SK}
-		if seen[k] {
-			return ErrDuplicateKey
-		}
-		seen[k] = true
 		old, exists := m.rows[k]
 		if w.Expected == nil && exists || w.Expected != nil && (!exists || old.Version != *w.Expected) {
 			return apperr.Conflict()
@@ -93,7 +84,7 @@ func (m *MemoryStore) Transact(_ context.Context, writes []Write) error {
 func (m *MemoryStore) List(_ context.Context, pk, cursor string) (Page, error) {
 	after := ""
 	if cursor != "" {
-		sk, err := decodeCursor(pk, cursor)
+		sk, err := DecodeCursor(pk, cursor)
 		if err != nil {
 			return Page{}, err
 		}
@@ -117,47 +108,11 @@ func (m *MemoryStore) List(_ context.Context, pk, cursor string) (Page, error) {
 		page.Items = append(page.Items, out)
 	}
 	if len(all) > PageSize {
-		next, err := encodeCursor(pk, page.Items[PageSize-1].SK)
+		next, err := EncodeCursor(pk, page.Items[PageSize-1].SK)
 		if err != nil {
 			return Page{}, err
 		}
 		page.Cursor = next
 	}
 	return page, nil
-}
-
-// cursorKey keeps the field order of the TypeScript cursor: {"pk":…,"sk":…}.
-type cursorKey struct {
-	PK string `json:"pk"`
-	SK string `json:"sk"`
-}
-
-// encodeCursor returns base64url (no padding) of compact JSON, like JavaScript's
-// Buffer.from(JSON.stringify({pk, sk})).toString("base64url").
-func encodeCursor(pk, sk string) (string, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(cursorKey{pk, sk}); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
-}
-
-func decodeCursor(pk, cursor string) (string, error) {
-	invalid := apperr.BadRequest("Invalid cursor")
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(cursor, "="))
-	if err != nil {
-		return "", invalid
-	}
-	var fields map[string]any
-	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
-		return "", invalid
-	}
-	cursorPK, okPK := fields["pk"].(string)
-	sk, okSK := fields["sk"].(string)
-	if !okPK || !okSK || cursorPK != pk {
-		return "", invalid
-	}
-	return sk, nil
 }
