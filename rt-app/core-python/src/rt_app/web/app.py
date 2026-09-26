@@ -7,7 +7,7 @@ import re
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 from .. import _js
 from ..errors import HttpError
@@ -37,15 +37,24 @@ class Request:
     headers: dict[str, str] = field(default_factory=dict)
     raw_body: str | None = None
     ip: str = ""
+    #: The query string as received (without ``?``) and the body bytes, for proxies.
+    query_string: str = ""
+    body_bytes: bytes = b""
 
 
 @dataclass
 class Response:
+    """A JSON response, or a raw one (``raw`` bytes with their own ``headers``) from a fallback."""
+
     status: int
     body: Any
+    headers: list[tuple[str, str]] | None = None
+    raw: bytes | None = None
 
     def text(self) -> str:
-        """JSON text of the body; ``None`` (JavaScript undefined) is an empty body."""
+        """Body text: the raw bytes as UTF-8, or JSON; ``None`` (JavaScript undefined) is empty."""
+        if self.raw is not None:
+            return self.raw.decode("utf-8", "replace")
         return "" if self.body is None else _js.stringify(self.body)
 
 
@@ -77,6 +86,16 @@ class Feature:
     admin: Mapping[str, Any] | None = None
 
 
+class AccessPolicy(Protocol):
+    """What ``App`` needs to authorize a request (``rt_app.acl.ACL`` implements it)."""
+
+    def check(self, endpoint: Endpoint, actor: Any = None) -> None: ...
+
+
+#: Serves requests that match no endpoint (e.g. ``proxy_to("http://127.0.0.1:4000")``).
+Fallback = Callable[[Request], Response]
+
+_ACCESS_LEVELS = ("guest", "authenticated", "permission", "owner")
 _BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
@@ -115,7 +134,11 @@ class App:
     - owner and permission endpoints are served only under ``/admin/app<path>``;
     - literal routes win over ``:param`` routes; params are URL-decoded (400 "Invalid URL");
     - ``local_admin`` makes admin routes run as ``{"id": "rt-app-root", "role": "owner"}``;
-    - ``authenticate(request)`` returns the actor for other protected routes (or None).
+    - ``authenticate(request)`` returns the actor for other protected routes (or None), e.g.
+      ``auth.actor_from_request``; it may raise ``HttpError`` (401 for a bad token);
+    - ``acl`` (e.g. ``rt_app.acl.ACL``) authorizes requests instead of the built-in policy;
+    - ``fallback(request)`` answers requests that match no endpoint instead of 404, e.g.
+      ``proxy_to("http://127.0.0.1:4000")`` forwards not-yet-ported routes to the Node core.
     """
 
     def __init__(
@@ -124,10 +147,14 @@ class App:
         *,
         local_admin: bool = False,
         authenticate: Callable[[Request], Actor | None] | None = None,
+        acl: AccessPolicy | None = None,
+        fallback: Fallback | None = None,
     ) -> None:
         self.features = tuple(features)
         self.local_admin = local_admin
         self.authenticate = authenticate
+        self.acl = acl
+        self.fallback = fallback
         endpoints: list[Endpoint] = []
         for feature in self.features:
             for endpoint in feature.endpoints:
@@ -158,12 +185,20 @@ class App:
                 return route.endpoint, params
         return None
 
+    def matches(self, method: str, path: str) -> bool:
+        """Whether an endpoint serves this method and path."""
+        return any(r.endpoint.method == method and r.pattern.fullmatch(path) for r in self._routes)
+
+    def fallback_body_limit(self) -> int:
+        """Body limit of requests handed to the fallback (its ``max_body_bytes``, else 16 KiB)."""
+        return int(getattr(self.fallback, "max_body_bytes", DEFAULT_BODY_LIMIT))
+
     def body_limit(self, method: str, path: str) -> int:
         """Body limit of the endpoint that would serve this request (16 KiB by default)."""
         for route in self._routes:
             if route.endpoint.method == method and route.pattern.fullmatch(path):
                 return route.endpoint.max_body_bytes
-        return DEFAULT_BODY_LIMIT
+        return self.fallback_body_limit() if self.fallback else DEFAULT_BODY_LIMIT
 
     def _actor(self, endpoint: Endpoint, request: Request) -> Actor | None:
         if endpoint.access == "guest":
@@ -172,10 +207,15 @@ class App:
             return dict(LOCAL_OWNER)  # type: ignore[return-value]
         return self.authenticate(request) if self.authenticate else None
 
-    @staticmethod
-    def _check(endpoint: Endpoint, actor: Actor | None) -> None:
+    def _check(self, endpoint: Endpoint, actor: Actor | None) -> None:
+        if self.acl is not None:
+            self.acl.check(endpoint, actor)
+            return
         if endpoint.access == "guest":
             return
+        # Fail closed like the TypeScript ACL: an unknown access value never opens an endpoint.
+        if endpoint.access not in _ACCESS_LEVELS:
+            raise HttpError(403, "You do not have permission to access this resource")
         if actor is None:
             raise HttpError(401, "Sign in")
         if endpoint.access == "owner" and actor.get("role") != "owner":
@@ -195,6 +235,8 @@ class App:
         try:
             found = self._match(request.method, request.path)
             if found is None:
+                if self.fallback is not None:
+                    return self.fallback(request)
                 raise HttpError(404, "Endpoint not found")
             endpoint, params = found
             actor = self._actor(endpoint, request)
@@ -244,20 +286,25 @@ def serve_raw(
     ip: str = "",
 ) -> Response:
     """Apply the adapter rules (body limit, JSON object bodies) and dispatch."""
+    method = method.upper()
     path, query = split_target(target)
     if len(raw) > app.body_limit(method, path):
         return Response(413, {"error": "Request body too large"})
+    # Requests for the fallback keep their body as received (it may not be JSON).
+    forwarded = app.fallback is not None and not app.matches(method, path)
     try:
-        body = parse_body(raw)
+        body = {} if forwarded else parse_body(raw)
     except HttpError as error:
         return Response(error.status, {"error": error.message})
     request = Request(
-        method=method.upper(),
+        method=method,
         path=path,
         body=body,
         query=parse_query(query),
         headers={k.lower(): v for k, v in headers.items()},
         raw_body=raw.decode("utf-8", "replace"),
         ip=ip,
+        query_string=query,
+        body_bytes=raw,
     )
     return app.handle(request)

@@ -421,7 +421,7 @@ export class Auth {
       await this.finishPending(pending);
     } else {
       const row=await this.store.get('MFA',user.data.id);
-      if(!row?.data.enabled) throw new HttpError(400,'MFA no configurado');
+      if(!row?.data.enabled) throw new HttpError(400,'MFA is not configured');
       const step=totpStep(this.vault.open(row.data.sealed).secret,code,row.data.lastStep,this.now());
       if(step===undefined) throw new HttpError(400,"Invalid or previously used code");
       await this.store.transact([

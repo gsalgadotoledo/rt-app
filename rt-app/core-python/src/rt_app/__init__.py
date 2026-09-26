@@ -20,3 +20,22 @@ __all__ = [
     "HttpError",
     "Conflict",
 ]
+
+# Identity modules (jwt, users, acl, auth). AES-GCM sealing needs the optional "crypto" extra,
+# imported only when a value is sealed or opened.
+from .acl import ACL  # noqa: E402
+from .auth import Auth, AuthVault, LocalMailbox  # noqa: E402
+from .jwt import JwtTokens  # noqa: E402
+from .users import Users, hash_password, validate_password, verify_password  # noqa: E402
+
+__all__ += [
+    "JwtTokens",
+    "Users",
+    "validate_password",
+    "hash_password",
+    "verify_password",
+    "ACL",
+    "Auth",
+    "AuthVault",
+    "LocalMailbox",
+]

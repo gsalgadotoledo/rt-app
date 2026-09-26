@@ -80,12 +80,14 @@ def lambda_local(app: App, port: int | None = None) -> None:
     """Serve HTTP by converting each request to an API Gateway v2 event for ``handler_for(app)``."""
     handler = handler_for(app)
 
-    def handle(method: str, target: str, headers: dict[str, str], raw: bytes, ip: str) -> tuple[int, dict[str, str], str]:
+    def handle(method: str, target: str, headers: dict[str, str], raw: bytes, ip: str) -> tuple[int, list[tuple[str, str]], str | bytes]:
         result = handler(api_gateway_v2_event(method, target, headers, raw, ip), None)
-        body = result.get("body", "")
+        body: str | bytes = result.get("body", "")
         if result.get("isBase64Encoded"):
-            body = base64.b64decode(body).decode("utf-8", "replace")
-        return int(result["statusCode"]), dict(result.get("headers") or {}), body
+            body = base64.b64decode(body)
+        pairs = list((result.get("headers") or {}).items())
+        pairs += [("set-cookie", cookie) for cookie in result.get("cookies") or []]
+        return int(result["statusCode"]), pairs, body
 
     port = int(os.environ.get("PORT", "4010")) if port is None else port
     # API Gateway accepts up to 10 MB; the handler itself enforces the endpoint limit (16 KiB).
@@ -106,7 +108,10 @@ def call(app: App, method: str, target: str, body: str | None, headers: Sequence
     response = serve_raw(app, method, target, parsed, raw, "127.0.0.1")
     text = response.text()
     if text:
-        print(json.dumps(json.loads(text), indent=2, ensure_ascii=False))
+        try:
+            print(json.dumps(json.loads(text), indent=2, ensure_ascii=False))
+        except ValueError:  # a proxied answer that is not JSON
+            print(text)
     return 0 if response.status < 400 else 1
 
 

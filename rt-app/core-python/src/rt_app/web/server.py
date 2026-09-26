@@ -6,14 +6,19 @@ import signal
 import sys
 import threading
 from collections.abc import Callable
+from typing import Any
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .app import App, Response, serve_raw
 
 JSON_HEADERS = {"content-type": "application/json", "cache-control": "no-store"}
 
-#: (method, target, headers, raw body, client ip) → (status, headers, body text)
-RawHandler = Callable[[str, str, dict[str, str], bytes, str], tuple[int, dict[str, str], str]]
+#: (method, target, headers, raw body, client ip) → (status, headers, body text or bytes).
+#: Headers are a mapping or (name, value) pairs (repeated names such as set-cookie).
+RawHandler = Callable[
+    [str, str, dict[str, str], bytes, str],
+    tuple[int, "dict[str, str] | list[tuple[str, str]]", "str | bytes"],
+]
 
 
 class _TooLarge(Exception):
@@ -45,10 +50,10 @@ def _handler_class(handle: RawHandler, max_read: int) -> type[BaseHTTPRequestHan
                 raise _TooLarge()
             return self.rfile.read(length) if length > 0 else b""
 
-        def _send(self, status: int, headers: dict[str, str], text: str) -> None:
-            data = text.encode("utf-8")
+        def _send(self, status: int, headers: dict[str, str] | list[tuple[str, str]], body: str | bytes) -> None:
+            data = body.encode("utf-8") if isinstance(body, str) else body
             self.send_response(status)
-            for name, value in headers.items():
+            for name, value in headers.items() if isinstance(headers, dict) else headers:
                 self.send_header(name, value)
             self.send_header("content-length", str(len(data)))
             self.end_headers()
@@ -83,8 +88,10 @@ def _handler_class(handle: RawHandler, max_read: int) -> type[BaseHTTPRequestHan
 
 
 def app_handler(app: App) -> RawHandler:
-    def handle(method: str, target: str, headers: dict[str, str], raw: bytes, ip: str) -> tuple[int, dict[str, str], str]:
+    def handle(method: str, target: str, headers: dict[str, str], raw: bytes, ip: str) -> tuple[int, Any, str | bytes]:
         response: Response = serve_raw(app, method, target, headers, raw, ip)
+        if response.raw is not None:  # a fallback answer (e.g. proxied), sent as received
+            return response.status, list(response.headers or []), response.raw
         return response.status, dict(JSON_HEADERS), response.text()
 
     return handle
@@ -119,7 +126,7 @@ def serve(app: App, port: int | None = None, *, host: str = "127.0.0.1") -> None
     Bodies over the endpoint limit (16 KiB by default) answer 413; bodies must be JSON objects.
     """
     port = int(os.environ.get("PORT", "4010")) if port is None else port
-    limit = max([e.max_body_bytes for e in app.endpoints] or [16 * 1024])
+    limit = max([e.max_body_bytes for e in app.endpoints] + [app.fallback_body_limit() if app.fallback else 16 * 1024])
     server = make_server(app_handler(app), port, host=host, max_read=limit)
     run_forever(server, "RT-App API")
     sys.stdout.flush()

@@ -5,16 +5,20 @@
     serve(app)                    # python -m rt_app.web serve app:app
     handler = handler_for(app)    # AWS Lambda (API Gateway v1/v2)
                                   # python -m rt_app.web call app:app GET /health/live
+    App(features, authenticate=auth.actor_from_request, acl=acl,
+        fallback=proxy_to("http://127.0.0.1:4000"))  # forward unported routes to the Node core
 """
 from .app import (
     ADMIN_PREFIX,
     DEFAULT_BODY_LIMIT,
     LOCAL_OWNER,
     Access,
+    AccessPolicy,
     Actor,
     App,
     Context,
     Endpoint,
+    Fallback,
     Feature,
     Request,
     Response,
@@ -23,6 +27,7 @@ from .app import (
     serve_raw,
 )
 from .aws_lambda import handler_for, parse_event
+from .proxy import Proxy, proxy_to
 from .server import serve
 
 __all__ = [
@@ -30,10 +35,12 @@ __all__ = [
     "DEFAULT_BODY_LIMIT",
     "LOCAL_OWNER",
     "Access",
+    "AccessPolicy",
     "Actor",
     "App",
     "Context",
     "Endpoint",
+    "Fallback",
     "Feature",
     "Request",
     "Response",
@@ -43,4 +50,6 @@ __all__ = [
     "handler_for",
     "parse_event",
     "serve",
+    "Proxy",
+    "proxy_to",
 ]

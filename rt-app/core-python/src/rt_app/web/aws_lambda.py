@@ -6,7 +6,7 @@ import urllib.parse
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .app import App, serve_raw
+from .app import App, Response, serve_raw
 
 LambdaHandler = Callable[[Mapping[str, Any], Any], dict[str, Any]]
 
@@ -58,12 +58,35 @@ def parse_event(event: Mapping[str, Any]) -> tuple[str, str, dict[str, str], byt
     return method, path + ("?" + query if query else ""), _headers(event), raw, ip or ""
 
 
+def raw_result(response: Response) -> dict[str, Any]:
+    """Lambda result for a raw response: base64 body, cookies apart (v2 ``cookies``, v1 multi-value)."""
+    single: dict[str, str] = {}
+    multi: dict[str, list[str]] = {}
+    for name, value in response.headers or []:
+        multi.setdefault(name, []).append(value)
+    cookies = multi.pop("set-cookie", [])
+    for name, values in multi.items():
+        single[name] = ", ".join(values)
+    result: dict[str, Any] = {
+        "statusCode": response.status,
+        "headers": single,
+        "body": base64.b64encode(response.raw or b"").decode("ascii"),
+        "isBase64Encoded": True,
+    }
+    if cookies:
+        result["cookies"] = cookies
+        result["multiValueHeaders"] = {"set-cookie": cookies}
+    return result
+
+
 def handler_for(app: App) -> LambdaHandler:
     """``handler = handler_for(app)``: the Lambda entry point for API Gateway v1/v2 events."""
 
     def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
         method, target, headers, raw, ip = parse_event(event)
         response = serve_raw(app, method, target, headers, raw, ip)
+        if response.raw is not None:  # a fallback answer (e.g. proxied), sent as received
+            return raw_result(response)
         return {
             "statusCode": response.status,
             "headers": {"content-type": "application/json", "cache-control": "no-store"},
