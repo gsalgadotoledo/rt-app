@@ -253,9 +253,19 @@ export async function searchPage(
 export function auditView(data: Data) {
  return Object.fromEntries(["createdAt","createdBy","updatedAt","updatedBy","deletedAt","deletedBy","restoredAt","restoredBy"].map(key=>[key,data[key]??null]));
 }
-export function auditCreate(actor: string | null) {
- const now=new Date().toISOString();return {createdAt:now,createdBy:actor,updatedAt:now,updatedBy:actor,deletedAt:null,deletedBy:null};
+/**
+ * Injectable clock shared by identity modules: epoch milliseconds or a Date. Omitted means the
+ * system clock; tests and contract hosts pass a fixed one.
+ */
+export type Clock = () => number | Date;
+/** Current time in epoch milliseconds from an optional clock. */
+export function epochMs(clock?: Clock): number {
+  const value = clock ? clock() : Date.now();
+  return typeof value === "number" ? value : value.getTime();
 }
-export function auditUpdate(actor: string | null) {return {updatedAt:new Date().toISOString(),updatedBy:actor};}
-export function auditDelete(actor: string) {const now=new Date().toISOString();return {updatedAt:now,updatedBy:actor,deletedAt:now,deletedBy:actor};}
-export function auditRestore(actor: string) {return {...auditUpdate(actor),deletedAt:null,deletedBy:null,restoredAt:new Date().toISOString(),restoredBy:actor};}
+export function auditCreate(actor: string | null, at: Date = new Date()) {
+ const now=at.toISOString();return {createdAt:now,createdBy:actor,updatedAt:now,updatedBy:actor,deletedAt:null,deletedBy:null};
+}
+export function auditUpdate(actor: string | null, at: Date = new Date()) {return {updatedAt:at.toISOString(),updatedBy:actor};}
+export function auditDelete(actor: string, at: Date = new Date()) {const now=at.toISOString();return {updatedAt:now,updatedBy:actor,deletedAt:now,deletedBy:actor};}
+export function auditRestore(actor: string, at: Date = new Date()) {return {...auditUpdate(actor, at),deletedAt:null,deletedBy:null,restoredAt:at.toISOString(),restoredBy:actor};}

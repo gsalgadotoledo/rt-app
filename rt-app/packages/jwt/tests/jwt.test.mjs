@@ -40,3 +40,17 @@ test("reject expired, incomplete and malformed claims without leaking verificati
     });
   }
 });
+
+test("an injected clock makes tokens deterministic and controls expiry", async () => {
+  let now = Date.parse("2026-01-02T03:04:05.000Z");
+  const tokens = new JwtTokens(secret, undefined, undefined, { now: () => now });
+  const token = await tokens.issue({ id: "alice", tokenVersion: 1 });
+  const fromDate = new JwtTokens(secret, undefined, undefined, { now: () => new Date("2026-01-02T03:04:05.999Z") });
+  assert.equal(await fromDate.issue({ id: "alice", tokenVersion: 1 }), token);
+  const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+  assert.deepEqual(payload, { v: 1, sub: "alice", iss: "rt-app", aud: "rt-app-api", iat: 1767323045, exp: 1767323945 });
+  now += 899_999;
+  assert.deepEqual(await tokens.verify(token), { id: "alice", version: 1 });
+  now += 1;
+  await assert.rejects(tokens.verify(token), { status: 401, message: "Invalid or expired session" });
+});

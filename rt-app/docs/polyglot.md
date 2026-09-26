@@ -131,3 +131,130 @@ No dependency-injection framework is needed:
    - DynamoDB and Postgres stores for Python and Go
    - generator backends that use native modules instead of proxying to the Node core
    - a Service Manager "Contracts" panel
+
+## Subscriptions ledger and credits contracts
+
+Contracts: `spec/contracts/subscriptions-ledger.contract.yaml` and
+`subscriptions-credits.contract.yaml`. Node host: `spec/hosts/node/billing.mjs`. The contract
+descriptions hold the full algorithm; this section lists what a port has to expose.
+
+**`subscriptions-ledger`** is a stateless object over the pure functions of
+`packages/subscriptions/src/ledger.ts`. `init` is ignored.
+
+| Method | Returns |
+| --- | --- |
+| `emptyTotals()` | `{creditsIn, creditsOut, expired, paidMinor:{}, grantedValueMinor:{}}` |
+| `LEDGER(userId)` | `"SUB_LEDGER#" + userId`. Python's `snake_case` maps it to `ledger`. |
+| `ledgerKey(at, seed, sequence?)` | `pad15(at)-pad10(sequence)-sha256hex(utf8(seed))[:16]` |
+| `ledgerWrite(userId, entry, seed, sequence?)` | `{entry, write:{row:{pk, sk, version:1, data}, expected:null}}` |
+| `applyTotals(totals?, entry)` | new totals. The input is never mutated. |
+| `rollover(previous?, current?, used, now)` | `{entries, state}` |
+
+- `used` is a function in TypeScript. On the wire it is a table `{productId: {"<start>": credits}}`,
+  and a missing entry means 0.
+- Wire `null` means "not given", so optional parameters take their default.
+
+**`subscriptions-credits`** is built from `init.credits` (raw settings, validated when the instance is
+created) or from the defaults. Methods: `defaults()`, `validateCredits(input)`,
+`estimate({rateId, inputTokens, outputTokens?})`, `validCurrency(code)`, `currencyDecimals(code)`
+and `validMinorAmount(amount, code)`. The account preview of `estimate` (`userId`) is not part of the
+contract.
+
+**Numeric and time conventions (TypeScript is the reference):**
+
+- **Numbers:** all numbers are IEEE-754 float64. Use `float`/`float64`, never `Decimal`/`big.Float`.
+  - `0.1 + 0.2` credits is `0.30000000000000004`.
+  - The rate check `Math.round(n*1e4) === n*1e4` rejects some 2-decimal rates, such as 0.07.
+  - Integers stay exact up to 2^53.
+- **Rounding:** `Math.round` rounds halves up (`floor(x + 0.5)`). Python `round()` and Go
+  `math.Round`/`RoundToEven` differ at .5 (Go `math.Round` rounds -2.5 away from zero), so use
+  `floor(x + 0.5)`.
+- **Validation errors** use status 400, except `Credit rate not found` (404). Messages must match
+  exactly, and checks run in the documented order.
+- **Number to string:** numbers inside keys and seeds use JavaScript Number to String.
+  - Integers are written as plain digits: `1.0` is written `1`, not `1.0`.
+  - Other examples: `1.5`, `-1`, `1e+21`, `1e-7`.
+  - Python `repr(float)` and Go `strconv.FormatFloat(x, 'f', -1, 64)` need adjusting for integral
+    floats and exponents.
+- **Padding:** `padStart` pads and never truncates.
+- **Hashing:** seeds are hashed as UTF-8. A lone surrogate becomes U+FFFD.
+- **Time:** timestamps are epoch milliseconds. Nothing reads the clock: `rollover` takes `now`
+  explicitly, and `estimate` does not depend on time.
+- **Entry order** in `rollover`:
+  - Entries are sorted stably by `at`.
+  - For the same `at`, expiries come first, in reverse generation order, then allowances in
+    generation order.
+  - Expiries are generated in JavaScript property order of `previous.products`: array-index keys
+    such as `"2"` or `"10"` in ascending numeric order, then the other keys in JSON order. Go
+    ports must decode that object with its key order preserved.
+
+## Identity contracts: jwt, users, acl and auth
+
+Contracts: `spec/contracts/{jwt,users,acl,auth}.contract.yaml`. Node host:
+`spec/hosts/node/identity.mjs`. The contract descriptions hold the full algorithms (claim rules,
+validation order, hash, HMAC and vault formats, rate-limit keys); this section lists what a port has
+to expose. Every subject is a small facade, so every language exposes the same surface.
+
+**Clock.** Every identity subject takes `init.now`, an ISO 8601 instant, and reads the time only
+from that clock. The TypeScript classes accept an optional clock (`() => number | Date`, epoch
+milliseconds or a Date; the system clock when omitted):
+
+- `new JwtTokens(secret, issuer?, audience?, {now})`
+- `new Users(store, credentials?, {now})`
+- `new ACL(store, resources, {now})`
+- `new Auth(users, tokens, mailer, secret, provider?, {now})`
+- `totpStep(secret, code, last?, nowMs?)`
+
+The audit helpers (`auditCreate`, `auditUpdate`, `auditDelete`, `auditRestore`) take an optional
+`at: Date`. Ports must inject the clock the same way, with production defaults unchanged.
+
+| Subject | `init` | Module methods | Helpers (facade only) |
+| --- | --- | --- | --- |
+| `jwt` | `{secret, issuer?, audience?, now}` | `issue(user)`, `verify(token)` | `setNow(iso)` → null |
+| `users` | `{rows, now}` (rows seed a MemoryStore) | `get(id)`, `byEmail(email)`, `create(input, role?, actor?)`, `bootstrapOwner(input)`, `profile(id, input, actor?)` | `validatePassword(p)` → null, `hashPassword(p)`, `verifyPassword(p, stored)`, `row(pk, sk)` |
+| `acl` | `{rows, resources, now}` (resources are the registered endpoints) | `allows(actor, resource)`, `check(endpoint, actor)` → null | `resources(query)` (GET /acl/resources handler), `assign(id, body, actor)` (PUT /acl/users/:id handler), `row(pk, sk)` |
+| `auth` | `{secret, now, rows}` | `login`, `issue`, `consume`, `actor`, `limit` → null, `settings`, `updateSettings`, `hasMfa`, `setupMfa`, `enableMfa`, `verifyMfa`, `resetMfa`, `requestEmailChange`, `confirmEmailChange` | `mailbox()`, `row(pk, sk)`, `setNow(iso)`, `totpCode(secret, step)`, `unseal(sealed)` |
+
+**Helper details:**
+
+- `setNow(iso)` moves the clock that the subject shares with its JWT signer. It is how contracts
+  cross expiry and rate-limit boundaries.
+- `row(pk, sk)` returns the raw stored row or null. It is used to pin the storage formats (users,
+  EMAIL index, RATE, CHALLENGE, AUTH_FLOW, MFA) that another language must be able to read.
+- `mailbox()` returns the codes sent by a capturing mailer, newest first, as `[{email, code, purpose}]`.
+  Contracts read an emailed code with `$ref: "N.value[0].code"`.
+- `totpCode(secret, step)` is the RFC 6238 six-digit code for an explicit 30-second step.
+- `unseal(sealed)` opens a vault value.
+- Wire `null` stands for an omitted optional argument: role defaults to `user`, actor defaults
+  to the user itself, and `password`/`challengeId` are optional in `consume`.
+- `auth` wires `Users` + `JwtTokens(secret)` + a capturing mailbox + `Auth(secret)` over one
+  MemoryStore, with no identity provider.
+
+**Interop details ports get wrong most often:**
+
+- **JWT:**
+  - The key is the UTF-8 secret, which needs at least 32 bytes.
+  - Payload key order is `v, sub, iss, aud, iat, exp`, so tokens are byte-identical across
+    languages.
+  - `exp <= now` is expired, with no leeway.
+  - A future `iat` is accepted; `nbf` is honored.
+  - `aud` may be an array.
+  - `v` must be an integer, and `true` is not one.
+- **Passwords:**
+  - The hash format is `scrypt$<32 hex salt>$<128 hex>`.
+  - The scrypt salt is the hex **text** as UTF-8, with N=32768, r=8, p=3 and dkLen=64. Python
+    needs `maxmem=64 MiB`.
+  - Lengths count UTF-16 units, and there is no Unicode normalization.
+- **Emails:**
+  - Normalization is JavaScript `trim()` + `toLowerCase()`: `İ` becomes `i̇`. U+FEFF is trimmed;
+    U+0085 and U+001F are not.
+  - Validation uses the JavaScript regular-expression `\s`: NBSP and U+2028 count as whitespace;
+    U+200B and U+0085 do not. Go's `\s` is ASCII-only and Python's differs, so port the exact sets.
+  - Auth methods never normalize; only the HTTP endpoints do.
+- **Codes:** codes are `^\d{6}$` with ASCII digits only. Python must use `re.ASCII` or `[0-9]`.
+- **HMAC keys:** CHALLENGE, RATE and code hashes are `hex(HMAC-SHA256(secret, text))`. The texts
+  are `"<purpose>:<email>"`, `"<purpose>:<email>:<code>"`, `"<key>:<floor(ms/60000)>"` and
+  `"email-change:<id>[:<email>:<code>]"`.
+- **Vault:** the key is `SHA-256("rt-app-auth-vault:" + secret)`, the cipher is AES-256-GCM, and
+  the stored value is `base64url_nopad(iv12 || tag16 || ciphertext)` of compact JSON. The
+  contracts include values sealed with fixed IVs.

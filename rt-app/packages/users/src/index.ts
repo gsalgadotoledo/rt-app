@@ -20,6 +20,8 @@ import {
   viewUser,
   searchPage,
   schemaMigration,
+  epochMs,
+  type Clock,
 } from "@gsalgadotoledo/rt-app-contracts";
 const scrypt = (password: string, salt: string) =>
   new Promise<Buffer>((resolve, reject) => {
@@ -61,8 +63,15 @@ export interface CredentialProvider {
   disable(id: string): Promise<void>;
   enable?(id: string): Promise<void>;
 }
+export interface UsersOptions {
+  /** Injectable clock (epoch ms or Date) for audit timestamps; defaults to the system clock. */
+  now?: Clock;
+}
 export class Users {
-  constructor(public store: Store, private credentials?: CredentialProvider) {}
+  constructor(public store: Store, private credentials?: CredentialProvider, private options: UsersOptions = {}) {}
+  private at() {
+    return new Date(epochMs(this.options.now));
+  }
   get(id: string) {
     return this.store.get("USERS", id);
   }
@@ -118,7 +127,7 @@ export class Users {
         grants: [],
         active: !this.credentials,
         tokenVersion: 1,
-        ...auditCreate(actor ?? id),
+        ...auditCreate(actor ?? id, this.at()),
       },
     };
     await this.store.transact([
@@ -161,7 +170,7 @@ export class Users {
     const next = {
       ...row,
       version: row.version + 1,
-      data: { ...row.data, name: text(input.name, "name"), ...auditUpdate(actor) },
+      data: { ...row.data, name: text(input.name, "name"), ...auditUpdate(actor, this.at()) },
     };
     await this.store.transact([{ row: next, expected: row.version }]);
     return viewUser(next.data);
@@ -241,7 +250,7 @@ export class Users {
             if(this.credentials&&!this.credentials.enable)throw new HttpError(409,"This identity provider does not support restoration");
             // Enable the provider first; the local tombstone continues to reject login until committed.
             if(this.credentials)await this.credentials.enable!(row.data.id);
-            const next={...row,version:row.version+1,data:{...row.data,...auditRestore(c.actor!.id),active:!row.data.provisioning,tokenVersion:row.data.tokenVersion+1}};
+            const next={...row,version:row.version+1,data:{...row.data,...auditRestore(c.actor!.id, this.at()),active:!row.data.provisioning,tokenVersion:row.data.tokenVersion+1}};
             await this.store.transact([{row:next,expected:row.version}]);return viewUser(next.data);
           },
         },
@@ -262,7 +271,7 @@ export class Users {
                   version: row.version + 1,
                   data: {
                     ...row.data,
-                    ...auditDelete(c.actor!.id),
+                    ...auditDelete(c.actor!.id, this.at()),
                     active: false,
                     tokenVersion: row.data.tokenVersion + 1,
                   },

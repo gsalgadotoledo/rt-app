@@ -1,11 +1,16 @@
 import { SignJWT, jwtVerify } from "jose";
-import { HttpError } from "@gsalgadotoledo/rt-app-contracts";
+import { HttpError, epochMs, type Clock } from "@gsalgadotoledo/rt-app-contracts";
+export interface JwtOptions {
+  /** Injectable clock (epoch ms or Date) for iat/exp and expiry checks; defaults to the system clock. */
+  now?: Clock;
+}
 export class JwtTokens {
   private key: Uint8Array;
   constructor(
     secret: string,
     private issuer = "rt-app",
     private audience = "rt-app-api",
+    private options: JwtOptions = {},
   ) {
     if (Buffer.byteLength(secret) < 32)
       throw new Error("JWT_SECRET must contain at least 32 bytes");
@@ -13,13 +18,14 @@ export class JwtTokens {
   }
   /** Sign a 15-minute session; user.id becomes sub and tokenVersion enables server-side revocation. */
   async issue(user: { id: string; tokenVersion: number }) {
+    const now = Math.floor(epochMs(this.options.now) / 1000);
     return new SignJWT({ v: user.tokenVersion })
       .setProtectedHeader({ alg: "HS256", typ: "JWT" })
       .setSubject(user.id)
       .setIssuer(this.issuer)
       .setAudience(this.audience)
-      .setIssuedAt()
-      .setExpirationTime("15m")
+      .setIssuedAt(now)
+      .setExpirationTime(now + 900)
       .sign(this.key);
   }
   /** Return {id, version}; malformed, expired or foreign-audience tokens always yield HTTP 401. */
@@ -30,6 +36,7 @@ export class JwtTokens {
         issuer: this.issuer,
         audience: this.audience,
         requiredClaims: ["exp", "iat", "sub"],
+        currentDate: new Date(epochMs(this.options.now)),
       });
       if (!payload.sub || !Number.isInteger(payload.v)) throw 0;
       return { id: payload.sub, version: payload.v as number };

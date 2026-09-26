@@ -14,6 +14,8 @@ import {
   publicUser,
   viewUser,
   schemaMigration,
+  epochMs,
+  type Clock,
 } from "@gsalgadotoledo/rt-app-contracts";
 import { Users, hashPassword, verifyPassword, validatePassword } from "@gsalgadotoledo/rt-app-users";
 import { JwtTokens } from "@gsalgadotoledo/rt-app-jwt";
@@ -59,6 +61,13 @@ export class SesMailer implements Mailer {
     );
   }
 }
+export interface AuthOptions {
+  /**
+   * Injectable clock (epoch ms or Date) for rate-limit windows, code and challenge expiry and
+   * TOTP steps; defaults to the system clock. Pass the same clock to JwtTokens.
+   */
+  now?: Clock;
+}
 export class Auth {
   constructor(
     private users: Users,
@@ -66,7 +75,11 @@ export class Auth {
     private mail: Mailer,
     private secret: string,
     private provider?: IdentityProvider,
+    private options: AuthOptions = {},
   ) {}
+  private now() {
+    return epochMs(this.options.now);
+  }
   private get vault(){return new AuthVault(this.secret);}
   private get store() {
     return this.users.store;
@@ -75,7 +88,7 @@ export class Auth {
     return createHmac("sha256", this.secret).update(value).digest("hex");
   }
   async limit(key: string, max: number) {
-    const window = Math.floor(Date.now() / 60000);
+    const window = Math.floor(this.now() / 60000);
     const sk = this.digest(`${key}:${window}`);
     for (let i = 0; i < 8; i++) {
       const row = await this.store.get("RATE", sk);
@@ -89,7 +102,7 @@ export class Auth {
               sk,
               version: (row?.version ?? 0) + 1,
               data: { count: (row?.data.count ?? 0) + 1 },
-              ttl: Math.floor(Date.now() / 1000) + 120,
+              ttl: Math.floor(this.now() / 1000) + 120,
             },
             expected: row?.version ?? null,
           },
@@ -166,13 +179,13 @@ export class Auth {
             pk: "CHALLENGE",
             sk,
             version: (old?.version ?? 0) + 1,
-            ttl: Math.floor(Date.now() / 1000) + 600,
+            ttl: Math.floor(this.now() / 1000) + 600,
             data: {
               userId: user.data.id,
               hash: this.digest(`${purpose}:${email}:${code}`),
               attempts: 0,
               used: false,
-              expires: Date.now() + 600000,
+              expires: this.now() + 600000,
               tokenVersion: user.data.tokenVersion,
             },
           },
@@ -217,7 +230,7 @@ export class Auth {
     if (
       !row ||
       row.data.used ||
-      row.data.expires < Date.now() ||
+      row.data.expires < this.now() ||
       row.data.attempts >= 5
     )
       throw new HttpError(400, "Invalid or expired code");
@@ -288,14 +301,14 @@ export class Auth {
           pk: "CHALLENGE",
           sk,
           version: (old?.version ?? 0) + 1,
-          ttl: Math.floor(Date.now() / 1000) + 600,
+          ttl: Math.floor(this.now() / 1000) + 600,
           data: {
             email,
             userId,
             hash: this.digest(`email-change:${userId}:${email}:${code}`),
             used: false,
             attempts: 0,
-            expires: Date.now() + 600000,
+            expires: this.now() + 600000,
             tokenVersion: user.data.tokenVersion,
           },
         },
@@ -318,7 +331,7 @@ export class Auth {
       !row ||
       row.data.used ||
       row.data.attempts >= 5 ||
-      row.data.expires < Date.now()
+      row.data.expires < this.now()
     )
       throw new HttpError(400, "Invalid or expired code");
     const match = timingSafeEqual(
@@ -385,13 +398,13 @@ export class Auth {
   async hasMfa(id:string) {return this.provider ? this.provider.mfaStatus(id) : !!(await this.store.get('MFA',id))?.data.enabled;}
   private async pending(user:Row,kind:string,value:object) {
     const id=randomUUID();
-    await this.store.transact([{row:{pk:'AUTH_FLOW',sk:id,version:1,ttl:Math.floor(Date.now()/1000)+300,data:{userId:user.data.id,tokenVersion:user.data.tokenVersion,kind,expires:Date.now()+300000,used:false,sealed:this.vault.seal(value)}},expected:null}]);
+    await this.store.transact([{row:{pk:'AUTH_FLOW',sk:id,version:1,ttl:Math.floor(this.now()/1000)+300,data:{userId:user.data.id,tokenVersion:user.data.tokenVersion,kind,expires:this.now()+300000,used:false,sealed:this.vault.seal(value)}},expected:null}]);
     return {challenge:kind,challengeId:id};
   }
   private async readPending(id:unknown,kind:string) {
     if(typeof id!=='string'||id.length>100) throw new HttpError(400,"Invalid challenge");
     const row=await this.store.get('AUTH_FLOW',id);
-    if(!row||row.data.kind!==kind||row.data.used||row.data.expires<Date.now()) throw new HttpError(400,"Invalid or expired challenge");
+    if(!row||row.data.kind!==kind||row.data.used||row.data.expires<this.now()) throw new HttpError(400,"Invalid or expired challenge");
     const user=await this.users.get(row.data.userId);
     if(!user?.data.active||user.data.tokenVersion!==row.data.tokenVersion) throw new HttpError(401,"Invalid session");
     return row;
@@ -409,7 +422,7 @@ export class Auth {
     } else {
       const row=await this.store.get('MFA',user.data.id);
       if(!row?.data.enabled) throw new HttpError(400,'MFA no configurado');
-      const step=totpStep(this.vault.open(row.data.sealed).secret,code,row.data.lastStep);
+      const step=totpStep(this.vault.open(row.data.sealed).secret,code,row.data.lastStep,this.now());
       if(step===undefined) throw new HttpError(400,"Invalid or previously used code");
       await this.store.transact([
         {row:{...row,version:row.version+1,data:{...row.data,lastStep:step}},expected:row.version},
@@ -452,7 +465,7 @@ export class Auth {
         {row:{...user,version:user.version+1,data:{...user.data,tokenVersion:user.data.tokenVersion+1}},expected:user.version}
       ]);
     } else {
-      const step=totpStep(value.secret,code);if(step===undefined)throw new HttpError(400,"Invalid code");
+      const step=totpStep(value.secret,code,-1,this.now());if(step===undefined)throw new HttpError(400,"Invalid code");
       await this.store.transact([
         {row:{pk:'MFA',sk:id,version:1,data:{enabled:true,sealed:this.vault.seal({secret:value.secret}),lastStep:step}},expected:null},
         {row:{...pending,version:pending.version+1,data:{...pending.data,used:true}},expected:pending.version},

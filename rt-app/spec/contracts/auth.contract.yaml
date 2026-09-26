@@ -1,0 +1,613 @@
+contract: 1
+module: auth
+title: Authentication (password, email codes, sessions, TOTP)
+description: |
+  Local authentication over the users module (no external identity provider). secret is the app
+  secret: it signs JWTs (see the jwt contract) and keys every HMAC and the vault below.
+  Methods take already-normalized emails (the HTTP endpoints call emailAddress first): here
+  "Alice@example.test" is simply an unknown address. All rows live in the same NoSQL store.
+
+  Clock: now = epoch ms of the injected clock; T = floor(now/1000).
+  Digest: hex(HMAC-SHA256(key = UTF-8 secret, message = UTF-8 text)).
+
+  Rate limits, limit(key, max): window = floor(now/60000); row RATE/digest("<key>:<window>")
+  {count} with ttl T+120; if count >= max → 429 "Too many attempts; wait one minute", else count+1
+  (version-guarded; 8 retries on conflict, then 429 "Too many simultaneous attempts").
+  Keys and limits, checked in this order, BEFORE any other validation except the settings gates:
+    login: login-ip:<ip> 30, login:<email> 8          issue: mail-ip:<ip> 20, mail:<email> 3
+    consume: verify-ip:<ip> 30, verify:<email> 8      verifyMfa: mfa-ip:<ip> 20, then (after the
+    challenge is read) mfa-user:<userId> 5            setupMfa: mfa-setup:<ip> 5, mfa-setup-user:<id> 5
+    enableMfa: mfa-enable:<ip> 10, mfa-enable-user:<id> 5
+    requestEmailChange: email-change-ip:<ip> 10, email-change:<id> 3
+    confirmEmailChange: email-confirm:<id> 8, email-confirm-ip:<ip> 20
+
+  Sessions: {token: jwt.issue(user), expiresIn: 900, user: users view}.
+  login(email, password, ip): 403 "Password sign-in is disabled" when settings disable it; rate
+  limits; password verified against the stored hash, or against the dummy hash
+  "scrypt$" + "0"*32 + "$" + "00"*64 when the user is missing (constant work); missing, inactive or
+  wrong → 401 "Incorrect email or password". Users with MFA/<id>.enabled get a pending challenge
+  instead of a session: {challenge: "totp", challengeId}.
+  Pending challenges: AUTH_FLOW/<uuid v4> {userId, tokenVersion, kind, expires: now+300000,
+  used: false, sealed: vault(value)} with ttl T+300 (kind totp seals {}, kind enroll seals
+  {secret}). Reading one: id must be a string of <= 100 units (else 400 "Invalid challenge");
+  missing, other kind, used or expires < now → 400 "Invalid or expired challenge"; user inactive
+  or tokenVersion changed → 401 "Invalid session".
+
+  Email codes. issue(email, purpose login|reset, ip): 403 "Email code sign-in is disabled" for
+  login when disabled; rate limits; always answers {message: "If the account supports this
+  method, you will receive a code."}. Only for an active user (and, for login, one without MFA):
+  code = uniform random integer in [100000, 999999] as text; row CHALLENGE/digest("<purpose>:<email>")
+  replaced (version+1) with {userId, hash: digest("<purpose>:<email>:<code>"), attempts: 0,
+  used: false, expires: now+600000, tokenVersion} ttl T+600; then mailer.sendCode(email, code, purpose).
+  consume(email, code, purpose, ip, password?): settings gate, rate limits, code must match
+  ^\d{6}$ with ASCII digits (else 400 "Invalid code"). Then 400 "Invalid or expired code" when:
+  no row, used, expires < now, attempts >= 5, hash differs (this one also stores attempts+1),
+  or the user is inactive / tokenVersion changed. reset: the new password is validated and hashed,
+  the challenge marked used and the user gets passwordHash + tokenVersion+1 in one transaction →
+  {message: "Password updated. Sign in to continue."}. login: users with MFA → 403 "Use your
+  password and authenticator" (code not consumed); else the challenge is marked used → session.
+
+  actor(header): no header or "" → null; not starting with "Bearer " (case-sensitive, one
+  space) → 401 "Invalid token"; jwt.verify(rest) (401 "Invalid or expired session"); user missing,
+  inactive, tokenVersion != v, or credentialProvider (default "local") != "local" → 401
+  "Invalid session"; else {id, email, name, role, grants, tokenVersion, active}.
+
+  Settings: SETTINGS/auth. settings() → {version (0 when absent), values (row data, or
+  {passwordLogin: true, emailCodeLogin: true}), fields: [...]}. updateSettings({version, values}):
+  version must be an integer and both values booleans with at least one true, else 400 "At least
+  one sign-in method must remain enabled"; disabling passwordLogin while any MFA row (first page
+  of 50) is enabled → 409 "Password sign-in is required for accounts with MFA"; version must equal
+  the stored version → else 409 "Conflict: refresh and try again". Stores only the two booleans.
+
+  TOTP (RFC 6238, SHA-1, 6 digits, 30 s): secrets are 20 random bytes in RFC 4648 base32 without
+  padding (32 chars A-Z2-7). step = floor(now/30000). A code is accepted for the first of
+  steps [now, now-1, now+1] that is > lastStep (-1 at enrollment) and matches.
+  setupMfa(id, password, ip): limits; 409 "Enable password sign-in before enabling MFA"; 409
+  "MFA is already enabled"; password policy (400); wrong password 401 "Incorrect password";
+  → {challenge: "enroll", challengeId, secret, uri:
+  "otpauth://totp/RT-APP:<encodeURIComponent(email)>?secret=<secret>&issuer=RT-APP&algorithm=SHA1&digits=6&period=30"}.
+  enableMfa(id, challengeId, code, ip): limits; read challenge (kind enroll); another user's →
+  403 "Challenge belongs to another account"; 409 "MFA is already enabled"; code format or no
+  match → 400 "Invalid code"; then atomically MFA/<id> {enabled: true, sealed: vault({secret}),
+  lastStep}, challenge used, user tokenVersion+1 → {message: "MFA enabled. Sign in again.",
+  reauthenticate: true}.
+  verifyMfa(challengeId, code, ip): mfa-ip limit; read challenge (kind totp); mfa-user limit;
+  format → 400 "Invalid code"; no match → 400 "Invalid or previously used code"; else lastStep and
+  challenge used are written together → session.
+  resetMfa(id): id must be a string <= 100 units (400 "Invalid user"); 404 "User not found";
+  deletes MFA/<id> if present and bumps tokenVersion → {message: "MFA reset; application sessions
+  have been invalidated."}.
+
+  Vault (sealed values): key = SHA-256(UTF-8 "rt-app-auth-vault:" + secret); AES-256-GCM with a
+  random 12-byte IV and 16-byte tag; sealed = base64url_nopad(iv || tag || ciphertext) of
+  JSON.stringify(value) (compact, UTF-8). Rows sealed by any language must open in every other.
+
+  Email change: requestEmailChange(id, email, ip): limits; email already indexed → 400 "This email
+  address cannot be used"; user inactive → 401 "Invalid session"; CHALLENGE/digest("email-change:<id>")
+  {email, userId, hash: digest("email-change:<id>:<email>:<code>"), used, attempts, expires,
+  tokenVersion}; code mailed to the NEW address with purpose "email-change" → {message: "We sent a
+  code to the new email address."}. confirmEmailChange(id, code, ip): same code checks as consume
+  (400 "Invalid code" / "Invalid or expired code"), user changed → 401 "Invalid session"; then
+  atomically: challenge used, user email + tokenVersion+1, old EMAIL row deleted, new EMAIL row
+  created → session.
+
+  Subject facade "auth": init {secret, now, rows}. Auth methods as above (null for optional
+  arguments) plus helpers: mailbox() → sent messages newest first [{email, code, purpose}];
+  row(pk, sk) → raw row|null; setNow(iso) → null (moves the shared clock); totpCode(secret, step)
+  → 6-digit code; unseal(sealed) → the decrypted JSON value.
+subject: auth
+init:
+  secret: rt-app-contract-secret-0123456789abcdef
+  now: "2026-01-02T03:04:05.000Z"
+  rows:
+    - &alice { pk: USERS, sk: u-alice, version: 1, data: { id: u-alice, email: alice@example.test, name: Alice, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 1, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: u-alice, deletedAt: null, deletedBy: null } }
+    - &alice-email { pk: EMAIL, sk: alice@example.test, version: 1, data: { id: u-alice } }
+    - &bob { pk: USERS, sk: u-bob, version: 1, data: { id: u-bob, email: bob@example.test, name: Bob, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 1 } }
+    - &bob-email { pk: EMAIL, sk: bob@example.test, version: 1, data: { id: u-bob } }
+    - &bob-mfa { pk: MFA, sk: u-bob, version: 1, data: { enabled: true, sealed: AAECAwQFBgcICQoLOToKaO5-5QPD1JHvL0I6C9CtDSvDjl7_8wQUWo0PfU1er31KjW6fOXMyqMi2cG3Koxq82AJrCWy_b6BmyA, lastStep: 58910700 } }
+    - &carol { pk: USERS, sk: u-carol, version: 1, data: { id: u-carol, email: carol@example.test, name: Carol, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: false, tokenVersion: 1 } }
+    - &carol-email { pk: EMAIL, sk: carol@example.test, version: 1, data: { id: u-carol } }
+    - &dave { pk: USERS, sk: u-dave, version: 1, data: { id: u-dave, email: dave@example.test, name: Dave, credentialProvider: cognito, role: user, grants: [], active: true, tokenVersion: 1 } }
+    - &dave-email { pk: EMAIL, sk: dave@example.test, version: 1, data: { id: u-dave } }
+cases:
+  # --- password login ---------------------------------------------------------------------------
+  - name: password login returns the exact session for a fixed clock
+    tags: [ interop, determinism ]
+    call: login
+    args: [ alice@example.test, correct horse battery, 1.1.1.1 ]
+    expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo, expiresIn: 900, user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+
+  - name: a session token identifies the actor
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - call: actor
+        args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo" ]
+        expect: { value: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], tokenVersion: 1, active: true } }
+
+  - name: wrong credentials all fail the same way
+    tags: [ security ]
+    steps:
+      - { call: login, args: [ alice@example.test, wrong password 123, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } } }
+      - { call: login, args: [ nobody@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } } }
+      - { call: login, args: [ carol@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } }, note: inactive user with the right password }
+      - { call: login, args: [ dave@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } }, note: provider account without a local hash }
+      - { call: login, args: [ Alice@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } }, note: emails are not normalized here }
+      - { call: login, args: [ alice@example.test, null, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } } }
+      - { call: login, args: [ alice@example.test, short, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } }, note: no policy error on login }
+
+  - name: password login can be disabled
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ *alice, *alice-email, { pk: SETTINGS, sk: auth, version: 1, data: { passwordLogin: false, emailCodeLogin: true } } ]
+    call: login
+    args: [ alice@example.test, correct horse battery, 1.1.1.1 ]
+    expect: { error: { status: 403, message: Password sign-in is disabled } }
+
+  - name: users with MFA get a pending TOTP challenge instead of a session
+    steps:
+      - { call: login, args: [ bob@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { challenge: totp, challengeId: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" } } } }
+      - call: row
+        args: [ AUTH_FLOW, { $ref: "0.value.challengeId" } ]
+        expect: { value: { pk: AUTH_FLOW, sk: { $ref: "0.value.challengeId" }, version: 1, ttl: 1767323345, data: { userId: u-bob, tokenVersion: 1, kind: totp, expires: 1767323345000, used: false, sealed: { $regex: "^[A-Za-z0-9_-]+$" } } } }
+      - { call: row, args: [ AUTH_FLOW, { $ref: "0.value.challengeId" } ], expect: { value: { $partial: { data: { $partial: { sealed: { $length: 40 } } } } } }, note: "12 + 16 + len('{}') bytes → 40 base64url chars" }
+      - { call: login, args: [ bob@example.test, wrong password 123, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } } }
+
+  # --- rate limits -------------------------------------------------------------------------------
+  - name: limit counts per key and minute window
+    tags: [ rate-limit, clock ]
+    steps:
+      - { call: limit, args: [ "login:alice@example.test", 2 ], expect: { value: null } }
+      - { call: row, args: [ RATE, 997006e472b1a08e8093fae9240c2d24f49e984e5144f8339382975d5d5e5e36 ], expect: { value: { pk: RATE, sk: 997006e472b1a08e8093fae9240c2d24f49e984e5144f8339382975d5d5e5e36, version: 1, ttl: 1767323165, data: { count: 1 } } }, note: "sk = HMAC(secret, 'login:alice@example.test:29455384')" }
+      - { call: limit, args: [ "login:alice@example.test", 2 ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 2 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } } }
+      - { call: row, args: [ RATE, 997006e472b1a08e8093fae9240c2d24f49e984e5144f8339382975d5d5e5e36 ], expect: { value: { $partial: { version: 2, data: { count: 2 } } } }, note: a refused attempt is not counted }
+      - { call: limit, args: [ "login:other@example.test", 2 ], expect: { value: null }, note: other keys are independent }
+      - { call: setNow, args: [ "2026-01-02T03:04:59.999Z" ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 2 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } } }
+      - { call: setNow, args: [ "2026-01-02T03:05:00.000Z" ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 2 ], expect: { value: null }, note: a new window starts on the minute }
+
+  - name: eight logins per email per minute, successful or not
+    tags: [ rate-limit ]
+    steps:
+      - { call: limit, args: [ "login:alice@example.test", 8 ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 8 ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 8 ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 8 ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 8 ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 8 ], expect: { value: null } }
+      - { call: limit, args: [ "login:alice@example.test", 8 ], expect: { value: null } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: the 8th attempt }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } } }
+      - { call: setNow, args: [ "2026-01-02T03:05:00.000Z" ], expect: { value: null } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+
+  - name: rate rows written by another implementation are honored
+    tags: [ rate-limit, interop ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - *alice
+        - *alice-email
+        - { pk: RATE, sk: 997006e472b1a08e8093fae9240c2d24f49e984e5144f8339382975d5d5e5e36, version: 8, ttl: 1767323165, data: { count: 8 } }
+        - { pk: RATE, sk: f867244ba11ddc1cb207598eb3d1a9a6a545030fc79e884ae733587f926af2c7, version: 30, ttl: 1767323165, data: { count: 30 } }
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } } }
+      - { call: login, args: [ bob@example.test, correct horse battery, 9.9.9.9 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } }, note: "login-ip:9.9.9.9 is full (checked first)" }
+      - { call: login, args: [ nobody@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } } }
+
+  - name: three code emails per address per minute
+    tags: [ rate-limit ]
+    steps:
+      - { call: issue, args: [ alice@example.test, login, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: issue, args: [ alice@example.test, reset, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: issue, args: [ alice@example.test, login, 2.2.2.2 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: issue, args: [ alice@example.test, login, 3.3.3.3 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } } }
+      - { call: issue, args: [ nobody@example.test, login, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: mailbox, args: [], expect: { value: { $length: 3 } } }
+
+  # --- actor ---------------------------------------------------------------------------------------
+  - name: no header means no actor
+    steps:
+      - { call: actor, args: [ null ], expect: { value: null } }
+      - { call: actor, args: [ "" ], expect: { value: null } }
+
+  - name: malformed authorization headers
+    tags: [ security ]
+    steps:
+      - { call: actor, args: [ Basic dXNlcjpwYXNz ], expect: { error: { status: 401, message: Invalid token } } }
+      - { call: actor, args: [ "bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo" ], expect: { error: { status: 401, message: Invalid token } }, note: the scheme is case-sensitive }
+      - { call: actor, args: [ Bearer ], expect: { error: { status: 401, message: Invalid token } } }
+      - { call: actor, args: [ "Bearer garbage" ], expect: { error: { status: 401, message: Invalid or expired session } } }
+      - { call: actor, args: [ "Bearer  eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: two spaces; the token is everything after the first 7 characters }
+
+  - name: sessions of missing, inactive and provider users are invalid
+    tags: [ security ]
+    steps:
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ], expect: { error: { status: 401, message: Invalid session } }, note: no such user }
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWNhcm9sIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.TXf4Pt3PgfHZciBYjklD1bm8EE9UpMFVCM78WVf7EFE" ], expect: { error: { status: 401, message: Invalid session } }, note: inactive }
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWRhdmUiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.CBRAolTSaWvh6_vTp1MqtXNtwWE1C35RQChlrZQBY9E" ], expect: { error: { status: 401, message: Invalid session } }, note: credentialProvider cognito while running locally }
+
+  - name: bumping tokenVersion revokes existing sessions
+    tags: [ security ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ { pk: USERS, sk: u-alice, version: 2, data: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, tokenVersion: 2 } } ]
+    call: actor
+    args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo" ]
+    expect: { error: { status: 401, message: Invalid session } }
+
+  - name: sessions expire after 15 minutes
+    tags: [ clock ]
+    steps:
+      - { call: setNow, args: [ "2026-01-02T03:19:05.000Z" ], expect: { value: null } }
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo" ], expect: { error: { status: 401, message: Invalid or expired session } } }
+
+  # --- email codes -------------------------------------------------------------------------------
+  - name: email code login from issue to session
+    steps:
+      - { call: issue, args: [ alice@example.test, login, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: mailbox, args: [], expect: { value: [ { email: alice@example.test, code: { $regex: "^[1-9][0-9]{5}$" }, purpose: login } ] } }
+      - call: row
+        args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ]
+        expect: { value: { pk: CHALLENGE, sk: b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61, version: 1, ttl: 1767323645, data: { userId: u-alice, hash: { $regex: "^[0-9a-f]{64}$" }, attempts: 0, used: false, expires: 1767323645000, tokenVersion: 1 } } }
+        note: "sk = HMAC(secret, 'login:alice@example.test')"
+      - { call: consume, args: [ alice@example.test, { $ref: "1.value[0].code" }, login, 1.1.1.1 ], expect: { value: { token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo", expiresIn: 900, user: { $partial: { id: u-alice } } } } }
+      - { call: consume, args: [ alice@example.test, { $ref: "1.value[0].code" }, login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } }, note: codes are single-use }
+      - { call: row, args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ], expect: { value: { $partial: { version: 2, data: { $partial: { used: true, attempts: 0 } } } } } }
+
+  - name: a challenge written by another implementation is accepted
+    tags: [ interop ]
+    init: &known-code
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - *alice
+        - *alice-email
+        - { pk: CHALLENGE, sk: b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61, version: 1, ttl: 1767323645, data: { userId: u-alice, hash: 397475ca4d5d6aa2161d4364750e1d865832329fa3b5314ca170ea648685bdc0, attempts: 0, used: false, expires: 1767323645000, tokenVersion: 1 } }
+    call: consume
+    args: [ alice@example.test, "123456", login, 1.1.1.1 ]
+    expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo, expiresIn: 900, user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+
+  - name: codes are six ASCII digits
+    tags: [ validation, unicode ]
+    init: *known-code
+    steps:
+      - { call: consume, args: [ alice@example.test, "12345", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } } }
+      - { call: consume, args: [ alice@example.test, "1234567", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } } }
+      - { call: consume, args: [ alice@example.test, 123456, login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } }, note: a number is not a code }
+      - { call: consume, args: [ alice@example.test, " 123456", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } } }
+      - { call: consume, args: [ alice@example.test, "１２３４５６", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } }, note: "fullwidth digits are not \\d (unlike Python's Unicode \\d)" }
+      - { call: consume, args: [ alice@example.test, "١٢٣٤٥٦", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } }, note: Arabic-Indic digits }
+      - { call: row, args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ], expect: { value: { $partial: { version: 1, data: { $partial: { attempts: 0 } } } } }, note: format errors do not count as attempts }
+
+  - name: five wrong codes lock the challenge
+    tags: [ security ]
+    init: *known-code
+    steps:
+      - { call: consume, args: [ alice@example.test, "000000", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+      - { call: consume, args: [ alice@example.test, "000001", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+      - { call: consume, args: [ alice@example.test, "000002", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+      - { call: consume, args: [ alice@example.test, "000003", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+      - { call: row, args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ], expect: { value: { $partial: { version: 5, data: { $partial: { attempts: 4, used: false } } } } } }
+      - { call: consume, args: [ alice@example.test, "000004", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+      - { call: consume, args: [ alice@example.test, "123456", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } }, note: the right code after 5 failures }
+      - { call: row, args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ], expect: { value: { $partial: { version: 6, data: { $partial: { attempts: 5 } } } } }, note: locked challenges are not updated }
+
+  - name: codes are valid through the expiry millisecond
+    tags: [ clock, edge ]
+    init: *known-code
+    steps:
+      - { call: setNow, args: [ "2026-01-02T03:14:05.000Z" ], expect: { value: null } }
+      - { call: consume, args: [ alice@example.test, "123456", login, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+
+  - name: codes expire after ten minutes
+    tags: [ clock, edge ]
+    init: *known-code
+    steps:
+      - { call: setNow, args: [ "2026-01-02T03:14:05.001Z" ], expect: { value: null } }
+      - { call: consume, args: [ alice@example.test, "123456", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+
+  - name: a newer code replaces the previous one
+    steps:
+      - { call: issue, args: [ alice@example.test, login, 1.1.1.1 ], expect: { value: { $partial: { message: { $type: string } } } } }
+      - { call: issue, args: [ alice@example.test, login, 1.1.1.1 ], expect: { value: { $partial: { message: { $type: string } } } } }
+      - { call: mailbox, args: [], expect: { value: { $length: 2 } } }
+      - { call: row, args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ], expect: { value: { $partial: { version: 2 } } } }
+      - { call: consume, args: [ alice@example.test, { $ref: "2.value[0].code" }, login, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: the newest message is first }
+
+  - name: a password or session change invalidates outstanding codes
+    tags: [ security ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - { pk: USERS, sk: u-alice, version: 2, data: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, tokenVersion: 2 } }
+        - *alice-email
+        - { pk: CHALLENGE, sk: b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61, version: 1, ttl: 1767323645, data: { userId: u-alice, hash: 397475ca4d5d6aa2161d4364750e1d865832329fa3b5314ca170ea648685bdc0, attempts: 0, used: false, expires: 1767323645000, tokenVersion: 1 } }
+    steps:
+      - { call: consume, args: [ alice@example.test, "123456", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+      - { call: row, args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ], expect: { value: { $partial: { version: 1 } } }, note: a matching code is not counted as an attempt }
+
+  - name: no code is sent to unknown, inactive or MFA accounts
+    tags: [ security ]
+    steps:
+      - { call: issue, args: [ nobody@example.test, login, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: issue, args: [ carol@example.test, login, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: issue, args: [ bob@example.test, login, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: mailbox, args: [], expect: { value: [] } }
+      - { call: consume, args: [ nobody@example.test, "123456", login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+      - { call: issue, args: [ bob@example.test, reset, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } }, note: password reset still works with MFA }
+      - { call: mailbox, args: [], expect: { value: [ { email: bob@example.test, code: { $regex: "^[1-9][0-9]{5}$" }, purpose: reset } ] } }
+
+  - name: MFA accounts cannot sign in with an email code
+    tags: [ security ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - *bob
+        - *bob-email
+        - *bob-mfa
+        - { pk: CHALLENGE, sk: d5d58c95592576e6c0a477f4607ab0d13c1ef2284871152b37c7d55ab05e1468, version: 1, ttl: 1767323645, data: { userId: u-bob, hash: 5dc78e42f101ab60f69fc4d8c1b5878240ca88802aa364de9eed979424332ef7, attempts: 0, used: false, expires: 1767323645000, tokenVersion: 1 } }
+    steps:
+      - { call: consume, args: [ bob@example.test, "123456", login, 1.1.1.1 ], expect: { error: { status: 403, message: Use your password and authenticator } } }
+      - { call: row, args: [ CHALLENGE, d5d58c95592576e6c0a477f4607ab0d13c1ef2284871152b37c7d55ab05e1468 ], expect: { value: { $partial: { version: 1, data: { $partial: { used: false } } } } } }
+
+  - name: email code login can be disabled; reset still works
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ *alice, *alice-email, { pk: SETTINGS, sk: auth, version: 1, data: { passwordLogin: true, emailCodeLogin: false } } ]
+    steps:
+      - { call: issue, args: [ alice@example.test, login, 1.1.1.1 ], expect: { error: { status: 403, message: Email code sign-in is disabled } } }
+      - { call: consume, args: [ alice@example.test, "123456", login, 1.1.1.1 ], expect: { error: { status: 403, message: Email code sign-in is disabled } } }
+      - { call: issue, args: [ alice@example.test, reset, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: mailbox, args: [], expect: { value: [ { email: alice@example.test, code: { $regex: "^[1-9][0-9]{5}$" }, purpose: reset } ] } }
+
+  - name: password reset with an emailed code
+    steps:
+      - { call: issue, args: [ alice@example.test, reset, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: mailbox, args: [], expect: { value: [ { email: alice@example.test, code: { $regex: "^[1-9][0-9]{5}$" }, purpose: reset } ] } }
+      - { call: consume, args: [ alice@example.test, { $ref: "1.value[0].code" }, reset, 1.1.1.1, short ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: consume, args: [ alice@example.test, { $ref: "1.value[0].code" }, reset, 1.1.1.1, a brand new password ], expect: { value: { message: Password updated. Sign in to continue. } }, note: an invalid new password does not consume the code }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 2, data: { $partial: { tokenVersion: 2, passwordHash: { $regex: "^scrypt\\$[0-9a-f]{32}\\$[0-9a-f]{128}$" } } } } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } } }
+      - { call: login, args: [ alice@example.test, a brand new password, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: consume, args: [ alice@example.test, { $ref: "1.value[0].code" }, reset, 1.1.1.1, another new password ], expect: { error: { status: 400, message: Invalid or expired code } } }
+
+  # --- settings ----------------------------------------------------------------------------------
+  - name: default settings
+    call: settings
+    args: []
+    expect: { value: { version: 0, values: { passwordLogin: true, emailCodeLogin: true }, fields: [ { name: passwordLogin, label: Allow password sign-in, type: boolean }, { name: emailCodeLogin, label: Allow email code sign-in, type: boolean } ] } }
+
+  - name: settings updates are versioned
+    tags: [ concurrency ]
+    steps:
+      - call: updateSettings
+        args: [ { version: 0, values: { passwordLogin: true, emailCodeLogin: false, extra: 1 } } ]
+        expect: { value: { version: 1, values: { passwordLogin: true, emailCodeLogin: false }, fields: [ { name: passwordLogin, label: Allow password sign-in, type: boolean }, { name: emailCodeLogin, label: Allow email code sign-in, type: boolean } ] } }
+      - { call: row, args: [ SETTINGS, auth ], expect: { value: { pk: SETTINGS, sk: auth, version: 1, data: { passwordLogin: true, emailCodeLogin: false } } }, note: only the two booleans are stored }
+      - { call: updateSettings, args: [ { version: 0, values: { passwordLogin: true, emailCodeLogin: true } } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: updateSettings, args: [ { version: 1, values: { passwordLogin: true, emailCodeLogin: true } } ], expect: { value: { $partial: { version: 2, values: { passwordLogin: true, emailCodeLogin: true } } } } }
+      - { call: settings, args: [], expect: { value: { $partial: { version: 2 } } } }
+
+  - name: invalid settings share one message
+    tags: [ validation ]
+    steps:
+      - { call: updateSettings, args: [ { version: 0, values: { passwordLogin: false, emailCodeLogin: false } } ], expect: { error: { status: 400, message: At least one sign-in method must remain enabled } } }
+      - { call: updateSettings, args: [ { version: "0", values: { passwordLogin: true, emailCodeLogin: true } } ], expect: { error: { status: 400, message: At least one sign-in method must remain enabled } } }
+      - { call: updateSettings, args: [ { version: 0.5, values: { passwordLogin: true, emailCodeLogin: true } } ], expect: { error: { status: 400, message: At least one sign-in method must remain enabled } } }
+      - { call: updateSettings, args: [ { values: { passwordLogin: true, emailCodeLogin: true } } ], expect: { error: { status: 400, message: At least one sign-in method must remain enabled } } }
+      - { call: updateSettings, args: [ { version: 0 } ], expect: { error: { status: 400, message: At least one sign-in method must remain enabled } } }
+      - { call: updateSettings, args: [ { version: 0, values: { passwordLogin: "true", emailCodeLogin: true } } ], expect: { error: { status: 400, message: At least one sign-in method must remain enabled } } }
+      - { call: updateSettings, args: [ { version: 0, values: { passwordLogin: true, emailCodeLogin: 1 } } ], expect: { error: { status: 400, message: At least one sign-in method must remain enabled } } }
+      - { call: row, args: [ SETTINGS, auth ], expect: { value: null } }
+
+  - name: password sign-in stays on while any account has MFA
+    tags: [ validation ]
+    steps:
+      - { call: updateSettings, args: [ { version: 0, values: { passwordLogin: false, emailCodeLogin: true } } ], expect: { error: { status: 409, message: Password sign-in is required for accounts with MFA } } }
+      - { call: updateSettings, args: [ { version: 7, values: { passwordLogin: false, emailCodeLogin: true } } ], expect: { error: { status: 409, message: Password sign-in is required for accounts with MFA } }, note: checked before the version }
+      - { call: updateSettings, args: [ { version: 0, values: { passwordLogin: true, emailCodeLogin: false } } ], expect: { value: { $partial: { version: 1 } } } }
+
+  # --- TOTP ---------------------------------------------------------------------------------------
+  - name: TOTP codes match RFC 6238 SHA-1 vectors truncated to six digits
+    tags: [ interop, totp ]
+    steps:
+      - { call: totpCode, args: [ GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ, 1 ], expect: { value: "287082" } }
+      - { call: totpCode, args: [ GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ, 37037036 ], expect: { value: "081804" } }
+      - { call: totpCode, args: [ GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ, 37037037 ], expect: { value: "050471" } }
+      - { call: totpCode, args: [ GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ, 41152263 ], expect: { value: "005924" } }
+      - { call: totpCode, args: [ GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ, 66666666 ], expect: { value: "279037" } }
+      - { call: totpCode, args: [ GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ, 666666666 ], expect: { value: "353130" } }
+      - { call: totpCode, args: [ GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ, 58910768 ], expect: { value: "652348" }, note: the step of the contract clock }
+
+  - name: the vault opens values sealed by another implementation
+    tags: [ interop, vault ]
+    steps:
+      - { call: unseal, args: [ AAECAwQFBgcICQoLOToKaO5-5QPD1JHvL0I6C9CtDSvDjl7_8wQUWo0PfU1er31KjW6fOXMyqMi2cG3Koxq82AJrCWy_b6BmyA ], expect: { value: { secret: GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ } }, note: "IV 000102030405060708090a0b" }
+      - { call: unseal, args: [ CwoJCAcGBQQDAgEABVssCWTvS22ukbO0Zn4B3ort ], expect: { value: {} }, note: "IV 0b0a09080706050403020100" }
+
+  - name: sign-in with password and authenticator
+    tags: [ totp, determinism ]
+    steps:
+      - { call: login, args: [ bob@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { challenge: totp, challengeId: { $type: string } } } }
+      - call: verifyMfa
+        args: [ { $ref: "0.value.challengeId" }, "652348", 1.1.1.1 ]
+        expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWJvYiIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.X7w12JG1kbuSSLwbKfSRngvuVBY3MGL8W7Z9NefiVH4, expiresIn: 900, user: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: null, updatedBy: null, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+      - { call: row, args: [ MFA, u-bob ], expect: { value: { $partial: { version: 2, data: { $partial: { lastStep: 58910768, enabled: true } } } } } }
+      - { call: verifyMfa, args: [ { $ref: "0.value.challengeId" }, "751330", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired challenge } }, note: challenges are single-use }
+
+  - name: TOTP accepts one step of drift and never an older step
+    tags: [ totp, security ]
+    steps:
+      - { call: login, args: [ bob@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { challenge: totp } } } }
+      - { call: verifyMfa, args: [ { $ref: "0.value.challengeId" }, "594060", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or previously used code } }, note: two steps back }
+      - { call: verifyMfa, args: [ { $ref: "0.value.challengeId" }, "366299", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or previously used code } }, note: two steps ahead }
+      - { call: verifyMfa, args: [ { $ref: "0.value.challengeId" }, "751330", 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: one step ahead }
+      - { call: row, args: [ MFA, u-bob ], expect: { value: { $partial: { data: { $partial: { lastStep: 58910769 } } } } } }
+      - { call: login, args: [ bob@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { challenge: totp } } } }
+      - { call: verifyMfa, args: [ { $ref: "5.value.challengeId" }, "652348", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or previously used code } }, note: the current step is older than the last used one }
+      - { call: verifyMfa, args: [ { $ref: "5.value.challengeId" }, "751330", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or previously used code } }, note: replay }
+
+  - name: the previous step is accepted
+    tags: [ totp ]
+    steps:
+      - { call: login, args: [ bob@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { challenge: totp } } } }
+      - { call: verifyMfa, args: [ { $ref: "0.value.challengeId" }, "391022", 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: row, args: [ MFA, u-bob ], expect: { value: { $partial: { data: { $partial: { lastStep: 58910767 } } } } } }
+
+  - name: pending challenges written by another implementation
+    tags: [ interop, totp, clock ]
+    init: &bob-flow
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - *bob
+        - *bob-email
+        - *bob-mfa
+        - { pk: AUTH_FLOW, sk: flow-bob, version: 1, ttl: 1767323345, data: { userId: u-bob, tokenVersion: 1, kind: totp, expires: 1767323345000, used: false, sealed: CwoJCAcGBQQDAgEABVssCWTvS22ukbO0Zn4B3ort } }
+    steps:
+      - { call: setNow, args: [ "2026-01-02T03:09:05.000Z" ], expect: { value: null }, note: exactly at expiry }
+      - { call: totpCode, args: [ GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ, 58910778 ], expect: { value: "136155" } }
+      - call: verifyMfa
+        args: [ flow-bob, { $ref: "1.value" }, 1.1.1.1 ]
+        note: the challenge's sealed value and the MFA seed were sealed with fixed IVs
+        expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWJvYiIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMzNDUsImV4cCI6MTc2NzMyNDI0NX0.cfHw78q8WQ-EBU3vkfhjWUFhnAxhTjSickznsgd70XE, expiresIn: 900, user: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: null, updatedBy: null, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+      - { call: row, args: [ AUTH_FLOW, flow-bob ], expect: { value: { $partial: { version: 2, data: { $partial: { used: true } } } } } }
+
+  - name: pending challenges expire after five minutes
+    tags: [ totp, clock ]
+    init: *bob-flow
+    steps:
+      - { call: setNow, args: [ "2026-01-02T03:09:05.001Z" ], expect: { value: null } }
+      - { call: verifyMfa, args: [ flow-bob, "652348", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired challenge } } }
+
+  - name: challenge validation
+    tags: [ totp, validation ]
+    init: *bob-flow
+    steps:
+      - { call: verifyMfa, args: [ 42, "652348", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid challenge } } }
+      - { call: verifyMfa, args: [ { $text: { repeat: x, count: 101 } }, "652348", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid challenge } } }
+      - { call: verifyMfa, args: [ { $text: { repeat: x, count: 100 } }, "652348", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired challenge } } }
+      - { call: verifyMfa, args: [ flow-bob, "65234", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } } }
+      - { call: enableMfa, args: [ u-bob, flow-bob, "652348", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired challenge } }, note: a totp challenge is not an enroll challenge }
+      - { call: verifyMfa, args: [ flow-bob, "652348", 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+
+  - name: revoked sessions invalidate pending challenges
+    tags: [ totp, security ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - { pk: USERS, sk: u-bob, version: 2, data: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, tokenVersion: 2 } }
+        - *bob-mfa
+        - { pk: AUTH_FLOW, sk: flow-bob, version: 1, ttl: 1767323345, data: { userId: u-bob, tokenVersion: 1, kind: totp, expires: 1767323345000, used: false, sealed: CwoJCAcGBQQDAgEABVssCWTvS22ukbO0Zn4B3ort } }
+    call: verifyMfa
+    args: [ flow-bob, "652348", 1.1.1.1 ]
+    expect: { error: { status: 401, message: Invalid session } }
+
+  - name: five wrong TOTP codes per user per minute
+    tags: [ totp, rate-limit ]
+    init: *bob-flow
+    steps:
+      - { call: verifyMfa, args: [ flow-bob, "000000", a ], expect: { error: { status: 400, message: Invalid or previously used code } } }
+      - { call: verifyMfa, args: [ flow-bob, "000000", b ], expect: { error: { status: 400, message: Invalid or previously used code } } }
+      - { call: verifyMfa, args: [ flow-bob, "000000", c ], expect: { error: { status: 400, message: Invalid or previously used code } } }
+      - { call: verifyMfa, args: [ flow-bob, "000000", d ], expect: { error: { status: 400, message: Invalid or previously used code } } }
+      - { call: verifyMfa, args: [ flow-bob, "000000", e ], expect: { error: { status: 400, message: Invalid or previously used code } } }
+      - { call: verifyMfa, args: [ flow-bob, "652348", f ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } } }
+
+  - name: MFA enrollment from setup to sign-in
+    tags: [ totp ]
+    steps:
+      - call: setupMfa
+        args: [ u-alice, correct horse battery, 1.1.1.1 ]
+        expect:
+          value:
+            challenge: enroll
+            challengeId: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+            secret: { $regex: "^[A-Z2-7]{32}$" }
+            uri: { $regex: "^otpauth://totp/RT-APP:alice%40example\\.test\\?secret=[A-Z2-7]{32}&issuer=RT-APP&algorithm=SHA1&digits=6&period=30$" }
+      - { call: totpCode, args: [ { $ref: "0.value.secret" }, 58910768 ], expect: { value: { $regex: "^[0-9]{6}$" } } }
+      - { call: enableMfa, args: [ u-alice, { $ref: "0.value.challengeId" }, { $ref: "1.value" }, 1.1.1.1 ], expect: { value: { message: MFA enabled. Sign in again., reauthenticate: true } } }
+      - { call: hasMfa, args: [ u-alice ], expect: { value: true } }
+      - { call: row, args: [ MFA, u-alice ], expect: { value: { pk: MFA, sk: u-alice, version: 1, data: { enabled: true, sealed: { $type: string }, lastStep: 58910768 } } } }
+      - { call: unseal, args: [ { $ref: "4.value.data.sealed" } ], expect: { value: { secret: { $ref: "0.value.secret" } } } }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 2, data: { $partial: { tokenVersion: 2 } } } } }, note: sessions are revoked }
+      - { call: row, args: [ AUTH_FLOW, { $ref: "0.value.challengeId" } ], expect: { value: { $partial: { version: 2, data: { $partial: { kind: enroll, used: true } } } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { challenge: totp, challengeId: { $type: string } } } }
+      - { call: verifyMfa, args: [ { $ref: "8.value.challengeId" }, { $ref: "1.value" }, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or previously used code } }, note: the enrollment code's step is used }
+
+  - name: enrollment secrets are sealed in the challenge
+    tags: [ totp, vault ]
+    steps:
+      - { call: setupMfa, args: [ u-alice, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { challenge: enroll } } } }
+      - { call: row, args: [ AUTH_FLOW, { $ref: "0.value.challengeId" } ], expect: { value: { $partial: { ttl: 1767323345, data: { userId: u-alice, tokenVersion: 1, kind: enroll, expires: 1767323345000, used: false, sealed: { $type: string } } } } } }
+      - { call: unseal, args: [ { $ref: "1.value.data.sealed" } ], expect: { value: { secret: { $ref: "0.value.secret" } } }, note: "JSON {\"secret\":...}; no accessToken key locally" }
+
+  - name: enrollment errors
+    tags: [ totp, validation ]
+    steps:
+      - { call: setupMfa, args: [ u-alice, wrong password 123, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect password } } }
+      - { call: setupMfa, args: [ u-alice, short, 1.1.1.1 ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: setupMfa, args: [ u-bob, correct horse battery, 1.1.1.1 ], expect: { error: { status: 409, message: MFA is already enabled } } }
+      - { call: setupMfa, args: [ u-alice, correct horse battery, 2.2.2.2 ], expect: { value: { $partial: { challenge: enroll } } } }
+      - { call: enableMfa, args: [ u-carol, { $ref: "3.value.challengeId" }, "123456", 1.1.1.1 ], expect: { error: { status: 403, message: Challenge belongs to another account } } }
+      - { call: enableMfa, args: [ u-alice, { $ref: "3.value.challengeId" }, "12345", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } } }
+      - { call: enableMfa, args: [ u-alice, { $ref: "3.value.challengeId" }, null, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } } }
+      - { call: enableMfa, args: [ u-alice, missing-challenge, "123456", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired challenge } } }
+      - { call: hasMfa, args: [ u-alice ], expect: { value: false } }
+
+  - name: MFA enrollment needs password sign-in
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ *alice, *alice-email, { pk: SETTINGS, sk: auth, version: 1, data: { passwordLogin: false, emailCodeLogin: true } } ]
+    call: setupMfa
+    args: [ u-alice, correct horse battery, 1.1.1.1 ]
+    expect: { error: { status: 409, message: Enable password sign-in before enabling MFA } }
+
+  - name: resetting MFA removes it and revokes sessions
+    steps:
+      - { call: resetMfa, args: [ u-bob ], expect: { value: { message: MFA reset; application sessions have been invalidated. } } }
+      - { call: row, args: [ MFA, u-bob ], expect: { value: null } }
+      - { call: row, args: [ USERS, u-bob ], expect: { value: { $partial: { version: 2, data: { $partial: { tokenVersion: 2 } } } } } }
+      - { call: hasMfa, args: [ u-bob ], expect: { value: false } }
+      - { call: login, args: [ bob@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900, user: { $partial: { id: u-bob } } } } } }
+      - { call: resetMfa, args: [ u-alice ], expect: { value: { $partial: { message: { $type: string } } } }, note: without MFA it still revokes sessions }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { data: { $partial: { tokenVersion: 2 } } } } } }
+      - { call: resetMfa, args: [ missing ], expect: { error: { status: 404, message: User not found } } }
+      - { call: resetMfa, args: [ 5 ], expect: { error: { status: 400, message: Invalid user } } }
+      - { call: resetMfa, args: [ { $text: { repeat: x, count: 101 } } ], expect: { error: { status: 400, message: Invalid user } } }
+
+  # --- email change -------------------------------------------------------------------------------
+  - name: changing the email with a code sent to the new address
+    steps:
+      - { call: requestEmailChange, args: [ u-alice, new@example.test, 1.1.1.1 ], expect: { value: { message: We sent a code to the new email address. } } }
+      - { call: mailbox, args: [], expect: { value: [ { email: new@example.test, code: { $regex: "^[1-9][0-9]{5}$" }, purpose: email-change } ] } }
+      - call: row
+        args: [ CHALLENGE, f9c5f9cf437d46fdad294ee018ca06c33057615bd73ad7c8f23e8ac071590d8f ]
+        expect: { value: { pk: CHALLENGE, sk: f9c5f9cf437d46fdad294ee018ca06c33057615bd73ad7c8f23e8ac071590d8f, version: 1, ttl: 1767323645, data: { email: new@example.test, userId: u-alice, hash: { $regex: "^[0-9a-f]{64}$" }, used: false, attempts: 0, expires: 1767323645000, tokenVersion: 1 } } }
+        note: "sk = HMAC(secret, 'email-change:u-alice')"
+      - { call: confirmEmailChange, args: [ u-alice, "00000", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } } }
+      - call: confirmEmailChange
+        args: [ u-alice, { $ref: "1.value[0].code" }, 1.1.1.1 ]
+        expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoyLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.25yx92DtscQ0gMevmtUSdXkRBB8qnmJjyQNVhYD9KdI, expiresIn: 900, user: { id: u-alice, email: new@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+      - { call: row, args: [ EMAIL, alice@example.test ], expect: { value: null } }
+      - { call: row, args: [ EMAIL, new@example.test ], expect: { value: { pk: EMAIL, sk: new@example.test, version: 1, data: { id: u-alice } } } }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 2, data: { $partial: { email: new@example.test, tokenVersion: 2 } } } } } }
+      - { call: confirmEmailChange, args: [ u-alice, { $ref: "1.value[0].code" }, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } } }
+
+  - name: email change errors
+    tags: [ validation ]
+    steps:
+      - { call: requestEmailChange, args: [ u-alice, bob@example.test, 1.1.1.1 ], expect: { error: { status: 400, message: This email address cannot be used } } }
+      - { call: requestEmailChange, args: [ u-carol, free@example.test, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: mailbox, args: [], expect: { value: [] } }
+      - { call: confirmEmailChange, args: [ u-alice, "123456", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } }, note: no pending change }

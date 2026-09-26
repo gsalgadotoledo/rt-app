@@ -1,0 +1,163 @@
+contract: 1
+module: acl
+title: Access control (roles and grants)
+description: |
+  Endpoint access policy. An actor is {id, email, name, role: owner|admin|user, grants: [string],
+  tokenVersion, active}. An endpoint is {method, path, resource, access, explicitGrant?} with
+  access guest|authenticated|permission|owner.
+
+  allows(actor, resource): false without an actor; true for role "owner"; otherwise true only when
+  grants contains the resource exactly (no wildcards; "admin" has no implicit rights; `active` is
+  not consulted: the session layer filters inactive users).
+  check(endpoint, actor) returns null or throws, in this order:
+    access guest → allowed, even without an actor;
+    no actor → 401 "Sign in";
+    access owner and role != owner → 403 "Only the owner can perform this operation";
+    access permission → explicitGrant ? grants must include the resource (owners too)
+      : allows(actor, resource); otherwise 403 "You do not have permission to access this resource".
+    authenticated → allowed for any actor.
+
+  Delegation (the PUT /acl/users/:id endpoint), checks in order:
+    actor.role != owner → 403 "Only the owner can assign permissions";
+    USERS/<id> missing or deletedAt set → 404 "User not found";
+    target role owner → 403 "The owner cannot be modified through this endpoint";
+    body.grants must be an array of at most 100 strings, each the resource of a registered
+    endpoint with access "permission", and body.role must be "user" or "admin"
+    → otherwise 400 "Invalid permissions or role".
+  Success writes version+1 with role, grants de-duplicated in first-seen order, tokenVersion+1
+  (revokes sessions), updatedAt = clock, updatedBy = actor id, and returns the public user view.
+  Resource discovery (GET /acl/resources) lists {resource, method, path, access} of every
+  registered endpoint; query filters are case-insensitive substring matches on those four fields;
+  "cursor" is ignored; any other filter is 400 "Unsupported filter: <name>".
+
+  Subject facade "acl": init {rows, resources, now}; resources are the registered endpoints.
+  Methods: allows(actor, resource), check(endpoint, actor) → null, resources(query) →
+  filtered list, assign(id, body, actor) → user view, row(pk, sk).
+subject: acl
+init:
+  now: "2026-01-02T03:04:05.000Z"
+  resources: &resources
+    - { resource: items.read, method: GET, path: /items, access: permission }
+    - { resource: items.write, method: POST, path: /items, access: permission }
+    - { resource: acl.assign, method: PUT, path: "/acl/users/:id", access: permission }
+    - { resource: secret, method: POST, path: /secret, access: owner }
+    - { resource: users.me, method: GET, path: /users/me, access: authenticated }
+    - { resource: home, method: GET, path: /, access: guest }
+  rows:
+    - { pk: USERS, sk: alice, version: 1, data: { id: alice, email: alice@example.test, name: Alice, role: user, grants: [ items.read ], active: true, tokenVersion: 1, createdAt: "2026-01-01T00:00:00.000Z", createdBy: root, updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: root, deletedAt: null, deletedBy: null } }
+    - { pk: USERS, sk: root, version: 1, data: { id: root, email: root@example.test, name: Root, role: owner, grants: [], active: true, tokenVersion: 1 } }
+    - { pk: USERS, sk: gone, version: 3, data: { id: gone, email: gone@example.test, name: Gone, role: user, grants: [], active: false, tokenVersion: 2, deletedAt: "2026-01-01T00:00:00.000Z", deletedBy: root } }
+cases:
+  # --- allows ---------------------------------------------------------------------------------
+  - name: owners are allowed everything; others need the exact grant
+    steps:
+      - { call: allows, args: [ { id: root, role: owner, grants: [] }, anything.at.all ], expect: { value: true } }
+      - { call: allows, args: [ { id: alice, role: user, grants: [ items.read ] }, items.read ], expect: { value: true } }
+      - { call: allows, args: [ { id: alice, role: user, grants: [ items.read ] }, items.write ], expect: { value: false } }
+      - { call: allows, args: [ { id: adm, role: admin, grants: [] }, items.read ], expect: { value: false }, note: admin has no implicit rights }
+      - { call: allows, args: [ { id: alice, role: user, grants: [ "items.*" ] }, items.read ], expect: { value: false }, note: no wildcards }
+      - { call: allows, args: [ { id: alice, role: user, grants: [ Items.Read ] }, items.read ], expect: { value: false }, note: case-sensitive }
+      - { call: allows, args: [ null, items.read ], expect: { value: false } }
+      - { call: allows, args: [ { id: x, role: user, grants: [ items.read ], active: false }, items.read ], expect: { value: true }, note: active is not consulted }
+
+  # --- check -----------------------------------------------------------------------------------
+  - name: guest endpoints need no actor
+    steps:
+      - { call: check, args: [ { resource: home, method: GET, path: /, access: guest }, null ], expect: { value: null } }
+      - { call: check, args: [ { resource: home, method: GET, path: /, access: guest }, { id: alice, role: user, grants: [] } ], expect: { value: null } }
+
+  - name: every other access level needs an actor
+    tags: [security]
+    steps:
+      - { call: check, args: [ { resource: users.me, access: authenticated }, null ], expect: { error: { status: 401, message: Sign in } } }
+      - { call: check, args: [ { resource: items.read, access: permission }, null ], expect: { error: { status: 401, message: Sign in } } }
+      - { call: check, args: [ { resource: secret, access: owner }, null ], expect: { error: { status: 401, message: Sign in } } }
+      - { call: check, args: [ { resource: users.me, access: authenticated }, { id: alice, role: user, grants: [] } ], expect: { value: null } }
+
+  - name: owner endpoints
+    tags: [security]
+    steps:
+      - { call: check, args: [ { resource: secret, access: owner }, { id: root, role: owner, grants: [] } ], expect: { value: null } }
+      - { call: check, args: [ { resource: secret, access: owner }, { id: adm, role: admin, grants: [ secret ] } ], expect: { error: { status: 403, message: Only the owner can perform this operation } }, note: a grant does not help }
+      - { call: check, args: [ { resource: secret, access: owner }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 403, message: Only the owner can perform this operation } } }
+
+  - name: permission endpoints
+    tags: [security]
+    steps:
+      - { call: check, args: [ { resource: items.read, access: permission }, { id: alice, role: user, grants: [ items.read ] } ], expect: { value: null } }
+      - { call: check, args: [ { resource: items.write, access: permission }, { id: alice, role: user, grants: [ items.read ] } ], expect: { error: { status: 403, message: You do not have permission to access this resource } } }
+      - { call: check, args: [ { resource: items.write, access: permission }, { id: adm, role: admin, grants: [] } ], expect: { error: { status: 403, message: You do not have permission to access this resource } } }
+      - { call: check, args: [ { resource: items.write, access: permission }, { id: root, role: owner, grants: [] } ], expect: { value: null } }
+
+  - name: explicit grants apply to owners too
+    tags: [security]
+    steps:
+      - { call: check, args: [ { resource: items.read, access: permission, explicitGrant: true }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 403, message: You do not have permission to access this resource } } }
+      - { call: check, args: [ { resource: items.read, access: permission, explicitGrant: true }, { id: root, role: owner, grants: [ items.read ] } ], expect: { value: null } }
+      - { call: check, args: [ { resource: items.read, access: permission, explicitGrant: true }, { id: alice, role: user, grants: [ items.read ] } ], expect: { value: null } }
+      - { call: check, args: [ { resource: items.read, access: permission, explicitGrant: false }, { id: root, role: owner, grants: [] } ], expect: { value: null } }
+
+  # --- resources -----------------------------------------------------------------------------
+  - name: resource discovery lists every registered endpoint
+    call: resources
+    args: [ {} ]
+    expect:
+      value:
+        - { resource: items.read, method: GET, path: /items, access: permission }
+        - { resource: items.write, method: POST, path: /items, access: permission }
+        - { resource: acl.assign, method: PUT, path: "/acl/users/:id", access: permission }
+        - { resource: secret, method: POST, path: /secret, access: owner }
+        - { resource: users.me, method: GET, path: /users/me, access: authenticated }
+        - { resource: home, method: GET, path: /, access: guest }
+
+  - name: resource filters are case-insensitive substrings
+    steps:
+      - { call: resources, args: [ { resource: ITEMS } ], expect: { value: [ { resource: items.read, method: GET, path: /items, access: permission }, { resource: items.write, method: POST, path: /items, access: permission } ] } }
+      - { call: resources, args: [ { method: po, access: own } ], expect: { value: [ { resource: secret, method: POST, path: /secret, access: owner } ] } }
+      - { call: resources, args: [ { path: "", cursor: whatever } ], expect: { value: { $length: 6 } }, note: empty filters and cursor are ignored }
+      - { call: resources, args: [ { role: owner } ], expect: { error: { status: 400, message: "Unsupported filter: role" } } }
+
+  # --- assign -----------------------------------------------------------------------------------
+  - name: the owner assigns role and de-duplicated grants, revoking sessions
+    steps:
+      - call: assign
+        args: [ alice, { role: admin, grants: [ items.write, items.read, items.write ] }, { id: root, role: owner, grants: [] } ]
+        expect:
+          value: { id: alice, email: alice@example.test, name: Alice, role: admin, grants: [ items.write, items.read ], active: true, createdAt: "2026-01-01T00:00:00.000Z", createdBy: root, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: root, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null }
+      - { call: row, args: [ USERS, alice ], expect: { value: { $partial: { version: 2, data: { $partial: { tokenVersion: 2, role: admin, grants: [ items.write, items.read ] } } } } } }
+      - { call: assign, args: [ alice, { role: user, grants: [] }, { id: root, role: owner, grants: [] } ], expect: { value: { $partial: { role: user, grants: [] } } }, note: grants can be emptied }
+      - { call: row, args: [ USERS, alice ], expect: { value: { $partial: { version: 3, data: { $partial: { tokenVersion: 3 } } } } } }
+
+  - name: only the owner delegates
+    tags: [security]
+    steps:
+      - { call: assign, args: [ alice, { role: admin, grants: [] }, { id: adm, role: admin, grants: [ acl.assign ] } ], expect: { error: { status: 403, message: Only the owner can assign permissions } } }
+      - { call: assign, args: [ missing, { role: bogus }, { id: adm, role: user, grants: [] } ], expect: { error: { status: 403, message: Only the owner can assign permissions } }, note: the actor is checked first }
+
+  - name: missing, deleted and owner targets
+    tags: [security]
+    steps:
+      - { call: assign, args: [ missing, { role: user, grants: [] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 404, message: User not found } } }
+      - { call: assign, args: [ gone, { role: user, grants: [] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 404, message: User not found } } }
+      - { call: assign, args: [ root, { role: user, grants: [] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 403, message: The owner cannot be modified through this endpoint } } }
+      - { call: assign, args: [ root, { role: bogus }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 403, message: The owner cannot be modified through this endpoint } }, note: target checks come before validation }
+
+  - name: invalid roles and grants
+    tags: [validation]
+    steps:
+      - { call: assign, args: [ alice, { role: owner, grants: [] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } } }
+      - { call: assign, args: [ alice, { grants: [] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } } }
+      - { call: assign, args: [ alice, { role: user }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } } }
+      - { call: assign, args: [ alice, { role: user, grants: items.read }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } } }
+      - { call: assign, args: [ alice, { role: user, grants: [ secret ] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } }, note: owner-access resources are not grantable }
+      - { call: assign, args: [ alice, { role: user, grants: [ users.me ] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } }, note: authenticated resources are not grantable }
+      - { call: assign, args: [ alice, { role: user, grants: [ unknown.resource ] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } } }
+      - { call: assign, args: [ alice, { role: user, grants: [ 1 ] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } } }
+      - { call: assign, args: [ alice, { role: User, grants: [] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } } }
+      - { call: row, args: [ USERS, alice ], expect: { value: { $partial: { version: 1 } } }, note: nothing changed }
+
+  - name: at most 100 grants before de-duplication
+    tags: [validation, edge]
+    steps:
+      - { call: assign, args: [ alice, { role: user, grants: [ { $repeat: { count: 101, item: items.read } } ] }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: Invalid permissions or role } } }
+      - { call: assign, args: [ alice, { role: user, grants: [ { $repeat: { count: 100, item: items.read } } ] }, { id: root, role: owner, grants: [] } ], expect: { value: { $partial: { grants: [ items.read ] } } } }

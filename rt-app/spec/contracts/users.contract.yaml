@@ -1,0 +1,292 @@
+contract: 1
+module: users
+title: Users and passwords
+description: |
+  Local user accounts in a NoSQL store. Rows:
+    USERS/<id>   {id, email, name, passwordHash, role, grants: [], active: true, tokenVersion: 1,
+                  createdAt, createdBy, updatedAt, updatedBy, deletedAt: null, deletedBy: null}
+    EMAIL/<email> {id}                (unique index; created in the same transaction, expected null)
+    INSTALLATION/owner {id}           (bootstrapOwner only)
+  ids are random UUID v4. Timestamps are the clock as toISOString() (milliseconds, Z). createdBy
+  is the actor, or the new user's own id when there is no actor.
+
+  Input validation, in this order (all 400):
+    email: must be a string; trimmed (JavaScript String.prototype.trim: Unicode White_Space plus
+      U+FEFF, but NOT U+0085 or U+001C-U+001F); empty after trim or longer than 254 UTF-16 units
+      BEFORE trimming → "Invalid field: email". Then lowercased with full Unicode lowercasing
+      (JavaScript toLowerCase: "İ" → "i̇", two code points) and matched against
+      ^[^\s@]+@[^\s@]+\.[^\s@]+$ where \s is the JavaScript set (includes U+00A0, U+2028, U+3000,
+      U+FEFF; excludes U+200B and U+0085) → "Invalid email".
+    name: same trim rule, 1..200 UTF-16 units before trimming → "Invalid field: name".
+    password: validatePassword → "The password must contain 12 to 128 characters": a string of
+      12..128 UTF-16 code units. No trimming or normalization (12 spaces are valid).
+  A taken email (after normalization) fails the EMAIL create: 409 "Conflict: refresh and try again".
+  Deleted users keep their EMAIL index, so their address stays taken.
+
+  Password hashes: "scrypt$<salt>$<hex>". salt = 16 random bytes as 32 lowercase hex chars; the
+  scrypt salt is the UTF-8 bytes of that hex TEXT (not the decoded bytes). Parameters N=32768,
+  r=8, p=3, dkLen=64, password as UTF-8 (needs maxmem >= 64 MiB; Python hashlib.scrypt needs
+  maxmem=64*1024*1024). hex output is lowercase. verifyPassword(password, stored): false for
+  non-strings or passwords longer than 128 units (no minimum); otherwise constant-time compare of
+  scrypt(password, salt) with the decoded hex (case-insensitive hex). No Unicode normalization.
+
+  Subject facade "users": init {rows, now}. Users methods: get(id) → row|null,
+  byEmail(email) → row|null (exact index lookup; callers normalize), create(input, role?, actor?)
+  → stored row, bootstrapOwner(input) → stored row, profile(id, input, actor?) → view.
+  Helpers: validatePassword(p) → null or error, hashPassword(p), verifyPassword(p, stored),
+  row(pk, sk) → raw stored row|null.
+  profile view = {id, email, name, role, grants, active, createdAt, createdBy, updatedAt, updatedBy,
+  deletedAt, deletedBy, restoredAt, restoredBy} (never passwordHash or tokenVersion).
+subject: users
+init: { rows: [], now: "2026-01-02T03:04:05.000Z" }
+cases:
+  # --- create -----------------------------------------------------------------------------
+  - name: create normalizes input and stores the user, its email index and a scrypt hash
+    steps:
+      - call: create
+        args: [ { email: "  Alice@Example.TEST ", name: "  Alice  ", password: correct horse battery } ]
+        expect:
+          value:
+            pk: USERS
+            sk: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+            version: 1
+            data:
+              id: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+              email: alice@example.test
+              name: Alice
+              passwordHash: { $regex: "^scrypt\\$[0-9a-f]{32}\\$[0-9a-f]{128}$" }
+              role: user
+              grants: []
+              active: true
+              tokenVersion: 1
+              createdAt: "2026-01-02T03:04:05.000Z"
+              createdBy: { $regex: "^[0-9a-f-]{36}$" }
+              updatedAt: "2026-01-02T03:04:05.000Z"
+              updatedBy: { $regex: "^[0-9a-f-]{36}$" }
+              deletedAt: null
+              deletedBy: null
+      - { call: get, args: [ { $ref: "0.value.sk" } ], expect: { value: { $partial: { sk: { $ref: "0.value.sk" }, data: { $partial: { id: { $ref: "0.value.sk" }, createdBy: { $ref: "0.value.sk" }, updatedBy: { $ref: "0.value.sk" } } } } } } }
+      - { call: row, args: [ EMAIL, alice@example.test ], expect: { value: { pk: EMAIL, sk: alice@example.test, version: 1, data: { id: { $ref: "0.value.sk" } } } } }
+      - { call: byEmail, args: [ alice@example.test ], expect: { value: { $partial: { sk: { $ref: "0.value.sk" } } } } }
+      - { call: verifyPassword, args: [ correct horse battery, { $ref: "0.value.data.passwordHash" } ], expect: { value: true } }
+      - { call: verifyPassword, args: [ correct horse battery!, { $ref: "0.value.data.passwordHash" } ], expect: { value: false } }
+
+  - name: create with a role and an actor
+    call: create
+    args: [ { email: bob@example.test, name: Bob, password: correct horse battery }, admin, owner-1 ]
+    expect: { value: { $partial: { data: { $partial: { role: admin, createdBy: owner-1, updatedBy: owner-1 } } } } }
+
+  - name: the role defaults to user and the actor to the new id
+    call: create
+    args: [ { email: bob@example.test, name: Bob, password: correct horse battery }, null, null ]
+    expect: { value: { $partial: { data: { $partial: { role: user, createdBy: { $regex: "^[0-9a-f-]{36}$" } } } } } }
+
+  - name: emails are unique after normalization
+    tags: [conflict]
+    steps:
+      - { call: create, args: [ { email: alice@example.test, name: Alice, password: correct horse battery } ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: create, args: [ { email: " ALICE@example.test", name: Other, password: correct horse battery } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: byEmail, args: [ alice@example.test ], expect: { value: { $partial: { sk: { $ref: "0.value.sk" }, data: { $partial: { name: Alice } } } } }, note: the first user is untouched }
+
+  - name: deleted users keep their email reserved
+    tags: [conflict]
+    init:
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - { pk: USERS, sk: u-old, version: 2, data: { id: u-old, email: old@example.test, name: Old, role: user, grants: [], active: false, tokenVersion: 2, deletedAt: "2026-01-01T00:00:00.000Z", deletedBy: root } }
+        - { pk: EMAIL, sk: old@example.test, version: 1, data: { id: u-old } }
+    steps:
+      - { call: create, args: [ { email: old@example.test, name: New, password: correct horse battery } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: byEmail, args: [ old@example.test ], expect: { value: { $partial: { sk: u-old, data: { $partial: { deletedBy: root } } } } }, note: byEmail does not hide deleted users }
+
+  # --- validation ---------------------------------------------------------------------------
+  - name: email validation messages
+    tags: [validation]
+    steps:
+      - { call: create, args: [ { name: A, password: correct horse battery } ], expect: { error: { status: 400, message: "Invalid field: email" } } }
+      - { call: create, args: [ { email: 5, name: A, password: correct horse battery } ], expect: { error: { status: 400, message: "Invalid field: email" } } }
+      - { call: create, args: [ { email: "   ", name: A, password: correct horse battery } ], expect: { error: { status: 400, message: "Invalid field: email" } } }
+      - { call: create, args: [ { email: not-an-email, name: A, password: correct horse battery } ], expect: { error: { status: 400, message: Invalid email } } }
+      - { call: create, args: [ { email: a@b, name: A, password: correct horse battery } ], expect: { error: { status: 400, message: Invalid email } } }
+      - { call: create, args: [ { email: "a b@example.test", name: A, password: correct horse battery } ], expect: { error: { status: 400, message: Invalid email } } }
+      - { call: create, args: [ { email: "a@@example.test", name: A, password: correct horse battery } ], expect: { error: { status: 400, message: Invalid email } } }
+      - { call: create, args: [ { email: "@example.test", name: A, password: correct horse battery } ], expect: { error: { status: 400, message: Invalid email } } }
+
+  - name: validation order is email, name, password
+    tags: [validation]
+    steps:
+      - { call: create, args: [ { email: bad, name: "", password: x } ], expect: { error: { status: 400, message: Invalid email } } }
+      - { call: create, args: [ { email: a@example.test, name: "", password: x } ], expect: { error: { status: 400, message: "Invalid field: name" } } }
+      - { call: create, args: [ { email: a@example.test, name: A, password: x } ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: byEmail, args: [ a@example.test ], expect: { value: null }, note: nothing was stored }
+
+  - name: name limits count UTF-16 units before trimming
+    tags: [validation, unicode]
+    steps:
+      - { call: create, args: [ { email: a@example.test, name: "   ", password: correct horse battery } ], expect: { error: { status: 400, message: "Invalid field: name" } } }
+      - { call: create, args: [ { email: a@example.test, name: 7, password: correct horse battery } ], expect: { error: { status: 400, message: "Invalid field: name" } } }
+      - { call: create, args: [ { email: a@example.test, name: { $text: { repeat: "😀", count: 101 } }, password: correct horse battery } ], expect: { error: { status: 400, message: "Invalid field: name" } }, note: 202 units }
+      - call: create
+        args: [ { email: a@example.test, name: " Ana                                                                                                                                                                                                     ", password: correct horse battery } ]
+        expect: { error: { status: 400, message: "Invalid field: name" } }
+        note: 201 units before trimming, 3 after
+      - { call: create, args: [ { email: a@example.test, name: { $text: { repeat: "😀", count: 100 } }, password: correct horse battery } ], expect: { value: { $partial: { data: { $partial: { name: { $length: 200 } } } } } } }
+
+  - name: email length is 254 UTF-16 units before trimming
+    tags: [validation, edge]
+    steps:
+      - call: create
+        args: [ { email: " aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.test", name: A, password: correct horse battery } ]
+        expect: { error: { status: 400, message: "Invalid field: email" } }
+        note: 254 units after trimming but 255 before
+      - call: create
+        args: [ { email: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.test", name: A, password: correct horse battery } ]
+        expect: { value: { $partial: { data: { $partial: { email: { $length: 254 } } } } } }
+
+  - name: email normalization follows JavaScript trim, toLowerCase and \s
+    tags: [validation, unicode]
+    steps:
+      - { call: create, args: [ { email: "ÁNGEL@EXAMPLE.TEST", name: A, password: correct horse battery } ], expect: { value: { $partial: { data: { $partial: { email: "ángel@example.test" } } } } } }
+      - { call: create, args: [ { email: "İNCI@EXAMPLE.TEST", name: A, password: correct horse battery } ], expect: { value: { $partial: { data: { $partial: { email: "i̇nci@example.test" } } } } }, note: "U+0130 lowercases to i + U+0307" }
+      - { call: create, args: [ { email: "﻿ bob@example.test \n", name: A, password: correct horse battery } ], expect: { value: { $partial: { data: { $partial: { email: bob@example.test } } } } }, note: trim removes BOM, NBSP, EM SPACE and newlines }
+      - { call: create, args: [ { email: "carl smith@example.test", name: A, password: correct horse battery } ], expect: { error: { status: 400, message: Invalid email } }, note: NBSP is \s }
+      - { call: create, args: [ { email: "carl smith@example.test", name: A, password: correct horse battery } ], expect: { error: { status: 400, message: Invalid email } }, note: LINE SEPARATOR is \s }
+      - { call: create, args: [ { email: "dan​@example.test", name: A, password: correct horse battery } ], expect: { value: { $partial: { data: { $partial: { email: "dan​@example.test" } } } } }, note: ZERO WIDTH SPACE is not whitespace }
+      - { call: create, args: [ { email: "eve@example.test\u0085", name: A, password: correct horse battery } ], expect: { value: { $partial: { data: { $partial: { email: "eve@example.test\u0085" } } } } }, note: NEL is neither trimmed nor \s in JavaScript }
+      - { call: create, args: [ { email: "fay@example.test\u001F", name: A, password: correct horse battery } ], expect: { value: { $partial: { data: { $partial: { email: "fay@example.test\u001F" } } } } }, note: U+001F is neither trimmed nor \s in JavaScript }
+
+  # --- password policy ---------------------------------------------------------------------
+  - name: passwords have 12 to 128 UTF-16 units
+    tags: [validation, password, unicode]
+    steps:
+      - { call: validatePassword, args: [ "12345678901" ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: validatePassword, args: [ "123456789012" ], expect: { value: null } }
+      - { call: validatePassword, args: [ { $text: { repeat: x, count: 128 } } ], expect: { value: null } }
+      - { call: validatePassword, args: [ { $text: { repeat: x, count: 129 } } ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: validatePassword, args: [ "😀😀😀😀😀😀" ], expect: { value: null }, note: 6 emoji are 12 units }
+      - { call: validatePassword, args: [ "😀😀😀😀😀x" ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } }, note: 11 units }
+      - { call: validatePassword, args: [ { $text: { repeat: "😀", count: 64 } } ], expect: { value: null }, note: 128 units }
+      - { call: validatePassword, args: [ { $text: { repeat: "😀", count: 65 } } ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } }, note: 130 units although 65 code points }
+      - { call: validatePassword, args: [ "éééééééééééé" ], expect: { value: null }, note: precomposed é is one unit }
+      - { call: validatePassword, args: [ "éééééé" ], expect: { value: null }, note: 6 decomposed é are 12 units, no normalization }
+      - { call: validatePassword, args: [ "            " ], expect: { value: null }, note: 12 spaces; no trimming }
+
+  - name: non-string passwords are rejected
+    tags: [validation, password]
+    steps:
+      - { call: validatePassword, args: [ 123456789012 ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: validatePassword, args: [ null ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: validatePassword, args: [ [ "123456789012" ] ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: hashPassword, args: [ short ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+
+  - name: hashes are scrypt with a hex-text salt
+    tags: [password, interop]
+    steps:
+      - { call: hashPassword, args: [ "contraseña-😀-segura" ], expect: { value: { $regex: "^scrypt\\$[0-9a-f]{32}\\$[0-9a-f]{128}$" } } }
+      - { call: verifyPassword, args: [ "contraseña-😀-segura", { $ref: "0.value" } ], expect: { value: true } }
+
+  - name: fixed reference hashes verify
+    tags: [password, interop]
+    steps:
+      - call: verifyPassword
+        args: [ correct horse battery, "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3" ]
+        expect: { value: true }
+      - call: verifyPassword
+        args: [ "contraseña-😀-segura", "scrypt$0123456789abcdef0123456789abcdef$92e7c15fb7c0518d40567823b2111ba2130345f5c24d3cdaa3f55c3fe498580354a5d1f49a803bef19b1bac26d07295e16afd4bb1d02fb1d453812e1ebe6ac70" ]
+        expect: { value: true }
+        note: UTF-8 password
+      - call: verifyPassword
+        args: [ "contraseña-😀-segura", "scrypt$0123456789abcdef0123456789abcdef$92e7c15fb7c0518d40567823b2111ba2130345f5c24d3cdaa3f55c3fe498580354a5d1f49a803bef19b1bac26d07295e16afd4bb1d02fb1d453812e1ebe6ac70" ]
+        expect: { value: false }
+        note: NFD form of the same text does not match (no normalization)
+      - call: verifyPassword
+        args: [ correct horse battery, "scrypt$00112233445566778899aabbccddeeff$57312542235F0BD20DE68BA91435932724A28FB139D398248A941A31002A374C4B90936648D12A0FB3257C32D78B4F18D168BC11152AD26E7A4DA912DFEAE2D3" ]
+        expect: { value: true }
+        note: uppercase hex digest
+      - call: verifyPassword
+        args: [ Correct horse battery, "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3" ]
+        expect: { value: false }
+      - call: verifyPassword
+        args: [ correct horse battery, "scrypt$00112233445566778899AABBCCDDEEFF$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3" ]
+        expect: { value: false }
+        note: the salt is text, so its case matters
+      - call: verifyPassword
+        args: [ correct horse battery, "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2" ]
+        expect: { value: false }
+        note: truncated digest
+
+  - name: verifyPassword refuses non-strings and overlong input without hashing
+    tags: [password, edge]
+    steps:
+      - { call: verifyPassword, args: [ null, "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3" ], expect: { value: false } }
+      - { call: verifyPassword, args: [ 12345678901234, "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3" ], expect: { value: false } }
+      - { call: verifyPassword, args: [ { $text: { repeat: "😀", count: 65 } }, "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3" ], expect: { value: false } }
+
+  # --- bootstrap ---------------------------------------------------------------------------
+  - name: the first owner is created once
+    steps:
+      - call: bootstrapOwner
+        args: [ { email: Owner@Example.test, name: Owner, password: correct horse battery } ]
+        expect: { value: { $partial: { pk: USERS, version: 1, data: { $partial: { email: owner@example.test, role: owner, grants: [], active: true, tokenVersion: 1, createdAt: "2026-01-02T03:04:05.000Z" } } } } }
+      - { call: row, args: [ INSTALLATION, owner ], expect: { value: { pk: INSTALLATION, sk: owner, version: 1, data: { id: { $ref: "0.value.sk" } } } } }
+      - { call: bootstrapOwner, args: [ { email: second@example.test, name: Second, password: correct horse battery } ], expect: { error: { status: 409, message: The application already has users } } }
+
+  - name: bootstrap refuses when any user row exists, even a deleted one
+    init:
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ { pk: USERS, sk: u-old, version: 2, data: { id: u-old, email: old@example.test, name: Old, role: user, grants: [], active: false, tokenVersion: 2, deletedAt: "2026-01-01T00:00:00.000Z" } } ]
+    call: bootstrapOwner
+    args: [ { email: owner@example.test, name: Owner, password: correct horse battery } ]
+    expect: { error: { status: 409, message: The application already has users } }
+
+  - name: bootstrap validates input like create
+    tags: [validation]
+    call: bootstrapOwner
+    args: [ { email: owner@example.test, name: Owner, password: short } ]
+    expect: { error: { status: 400, message: The password must contain 12 to 128 characters } }
+
+  # --- reading and profile ----------------------------------------------------------------
+  - name: lookups by id and by exact email
+    init: &alice
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - { pk: USERS, sk: u-alice, version: 1, data: { id: u-alice, email: alice@example.test, name: Alice, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 1, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: u-alice, deletedAt: null, deletedBy: null } }
+        - { pk: EMAIL, sk: alice@example.test, version: 1, data: { id: u-alice } }
+    steps:
+      - { call: get, args: [ u-alice ], expect: { value: { $partial: { pk: USERS, sk: u-alice, version: 1, data: { $partial: { email: alice@example.test } } } } } }
+      - { call: get, args: [ missing ], expect: { value: null } }
+      - { call: byEmail, args: [ alice@example.test ], expect: { value: { $partial: { sk: u-alice } } } }
+      - { call: byEmail, args: [ Alice@example.test ], expect: { value: null }, note: byEmail does not normalize }
+      - { call: byEmail, args: [ nobody@example.test ], expect: { value: null } }
+
+  - name: profile edits the trimmed name and returns the public view
+    init: *alice
+    steps:
+      - call: profile
+        args: [ u-alice, { name: "  Alicia " } ]
+        expect:
+          value: { id: u-alice, email: alice@example.test, name: Alicia, role: user, grants: [], active: true, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null }
+      - call: row
+        args: [ USERS, u-alice ]
+        expect: { value: { $partial: { version: 2, data: { $partial: { name: Alicia, tokenVersion: 1, passwordHash: { $regex: "^scrypt\\$0011" } } } } } }
+        note: the version increases; tokenVersion and the hash are kept
+      - { call: profile, args: [ u-alice, { name: Ally }, admin-1 ], expect: { value: { $partial: { name: Ally, updatedBy: admin-1 } } } }
+
+  - name: profile only edits the name
+    tags: [validation]
+    init: *alice
+    steps:
+      - { call: profile, args: [ u-alice, { name: A, email: x@example.test } ], expect: { error: { status: 400, message: "Only name can be edited; email requires verification" } } }
+      - { call: profile, args: [ u-alice, { role: owner } ], expect: { error: { status: 400, message: "Only name can be edited; email requires verification" } } }
+      - { call: profile, args: [ u-alice, {} ], expect: { error: { status: 400, message: "Invalid field: name" } } }
+      - { call: profile, args: [ u-alice, { name: "  " } ], expect: { error: { status: 400, message: "Invalid field: name" } } }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 1 } } }, note: nothing changed }
+
+  - name: profile of missing or deleted users is 404
+    init:
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ { pk: USERS, sk: u-old, version: 2, data: { id: u-old, email: old@example.test, name: Old, role: user, grants: [], active: false, tokenVersion: 2, deletedAt: "2026-01-01T00:00:00.000Z" } } ]
+    steps:
+      - { call: profile, args: [ missing, { name: A } ], expect: { error: { status: 404, message: User not found } } }
+      - { call: profile, args: [ u-old, { name: A } ], expect: { error: { status: 404, message: User not found } } }
+      - { call: profile, args: [ missing, { email: x } ], expect: { error: { status: 404, message: User not found } }, note: existence is checked first }

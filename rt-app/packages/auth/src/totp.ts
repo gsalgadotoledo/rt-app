@@ -7,9 +7,9 @@ export function totpCode(secret:string,step=Math.floor(Date.now()/30000)){
  const hash=createHmac('sha1',key).update(counter).digest(),offset=hash[19]&15;
  return String((hash.readUInt32BE(offset)&0x7fffffff)%1000000).padStart(6,'0');
 }
-export function totpStep(secret:string,code:unknown,last=-1){
+export function totpStep(secret:string,code:unknown,last=-1,nowMs=Date.now()){
  if(typeof code!=='string'||!/^\d{6}$/.test(code))return undefined;
- const now=Math.floor(Date.now()/30000);
+ const now=Math.floor(nowMs/30000);
  for(const step of [now,now-1,now+1])if(step>last&&timingSafeEqual(Buffer.from(totpCode(secret,step)),Buffer.from(code)))return step;
  return undefined;
 }

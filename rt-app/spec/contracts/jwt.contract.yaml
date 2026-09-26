@@ -1,0 +1,188 @@
+contract: 1
+module: jwt
+title: Session tokens (JWT, HS256)
+description: |
+  Stateless 15-minute session tokens. Construction: JwtTokens(secret, issuer = "rt-app",
+  audience = "rt-app-api", clock). The secret must have at least 32 **UTF-8 bytes** (not characters)
+  or construction fails with the plain error "JWT_SECRET must contain at least 32 bytes"; the HMAC
+  key is the UTF-8 encoding of the secret.
+
+  issue({id, tokenVersion}) returns a compact JWS: header exactly {"alg":"HS256","typ":"JWT"},
+  payload exactly {"v":tokenVersion,"sub":id,"iss":issuer,"aud":audience,"iat":now,"exp":now+900}
+  in that key order, compact JSON (no spaces), base64url without padding. now = floor(clock/1000),
+  so the same clock, secret and user produce the same token in every language. Other user fields
+  are ignored.
+
+  verify(token) returns {id: sub, version: v} or throws 401 "Invalid or expired session" for ANY
+  failure (no detail leaks). Accept rules (the jose defaults used by the reference):
+    - alg must be HS256 (alg none, HS512, anything else is rejected); header key order and typ
+      are irrelevant; the signature is checked over the received header.payload bytes.
+    - iss must equal the issuer; aud must equal the audience, or be an array containing it.
+    - exp, iat and sub are required; exp and iat must be JSON numbers; expired when exp <= now
+      (no clock tolerance); nbf, when present, must be <= now; iat in the future is accepted.
+    - sub must be truthy (empty string rejected); v must be an integer number (0 accepted,
+      "1", 1.5 and true rejected).
+
+  Subject facade "jwt": init {secret, issuer?, audience?, now}: now is the ISO 8601 clock.
+  Methods: issue(user), verify(token), setNow(iso) (helper: moves the clock, returns null).
+subject: jwt
+init: { secret: rt-app-contract-secret-0123456789abcdef, now: "2026-01-02T03:04:05.000Z" }
+cases:
+  # --- issuing ---------------------------------------------------------------------------
+  - name: a fixed clock and secret issue the exact reference token
+    tags: [interop, determinism]
+    call: issue
+    args: [ { id: user-1, tokenVersion: 1 } ]
+    expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" }
+
+  - name: extra user fields are not part of the payload
+    tags: [interop, determinism]
+    call: issue
+    args: [ { id: user-1, tokenVersion: 1, email: a@example.test, role: owner, grants: [ x ], name: A } ]
+    expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" }
+
+  - name: iat truncates milliseconds
+    tags: [determinism, edge]
+    steps:
+      - { call: setNow, args: [ "2026-01-02T03:04:05.999Z" ], expect: { value: null } }
+      - call: issue
+        args: [ { id: user-1, tokenVersion: 1 } ]
+        expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" }
+
+  - name: issued tokens round-trip id and version
+    steps:
+      - { call: issue, args: [ { id: "usuario-ñ-😀", tokenVersion: 42 } ], expect: { value: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" } } }
+      - { call: verify, args: [ { $ref: "0.value" } ], expect: { value: { id: "usuario-ñ-😀", version: 42 } } }
+
+  - name: unicode subjects are UTF-8 in the payload
+    tags: [interop, unicode]
+    call: issue
+    args: [ { id: "usuario-ñ-😀", tokenVersion: 42 } ]
+    expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2Ijo0Miwic3ViIjoidXN1YXJpby3DsS3wn5iAIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.R2nPnvYWoQn8fCKhg0D2D1aYQNsA_JfcLkYyGL2Lycw" }
+
+  - name: custom issuer and audience
+    init: { secret: rt-app-contract-secret-0123456789abcdef, issuer: rt-app-admin, audience: rt-app-admin-api, now: "2026-01-02T03:04:05.000Z" }
+    steps:
+      - call: issue
+        args: [ { id: root, tokenVersion: 3 } ]
+        expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjozLCJzdWIiOiJyb290IiwiaXNzIjoicnQtYXBwLWFkbWluIiwiYXVkIjoicnQtYXBwLWFkbWluLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.JPkMiZKkCUt4P0ALvPy2p98DzS9SLgxviIuMw39wfHM" }
+      - { call: verify, args: [ { $ref: "0.value" } ], expect: { value: { id: root, version: 3 } } }
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ]
+        expect: { error: { status: 401, message: Invalid or expired session } }
+        note: a token for the default issuer and audience
+
+  # --- verifying ---------------------------------------------------------------------------
+  - name: a token issued by the reference verifies
+    tags: [interop]
+    call: verify
+    args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ]
+    expect: { value: { id: user-1, version: 1 } }
+
+  - name: header and claim order, typ and audience arrays do not matter
+    tags: [interop]
+    steps:
+      - call: verify
+        args: [ "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3NjczMjM5NDUsImlhdCI6MTc2NzMyMzA0NSwiYXVkIjoicnQtYXBwLWFwaSIsImlzcyI6InJ0LWFwcCIsInN1YiI6InVzZXItMSIsInYiOjd9.eBRObk6ZKzc4PeZOi0mW6xHBZEeCwGOUtmhZnrep5hM" ]
+        expect: { value: { id: user-1, version: 7 } }
+        note: keys in reverse order
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.Lgt2pzWScSnzUDJvBNpwhBBUGisZmCL33GN1E08rwpg" ]
+        expect: { value: { id: user-1, version: 1 } }
+        note: header without typ
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOlsib3RoZXIiLCJydC1hcHAtYXBpIl0sImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.iiBEftAeBTf5CdiuBetHH3yXawGvKzg77ogw-cNs5XU" ]
+        expect: { value: { id: user-1, version: 1 } }
+        note: aud ["other", "rt-app-api"]
+
+  - name: version 0 and a future iat are accepted
+    tags: [edge]
+    steps:
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjowLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.YwfZLFSbYETdNP4WBeQrVBakdsV-JNbd-bAgiqNt1gY" ]
+        expect: { value: { id: user-1, version: 0 } }
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzI2NjQ1LCJleHAiOjE3NjczMjc1NDV9.EKPocNA66pPFNh5dZuMN4o7IH0yEpAM4jqcaWiIpJSU" ]
+        expect: { value: { id: user-1, version: 1 } }
+        note: iat one hour in the future (no iat check without a max age)
+
+  - name: tokens expire exactly 900 seconds after iat
+    tags: [edge, clock]
+    steps:
+      - { call: setNow, args: [ "2026-01-02T03:19:04.999Z" ], expect: { value: null } }
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ]
+        expect: { value: { id: user-1, version: 1 } }
+        note: 899.999 s later
+      - { call: setNow, args: [ "2026-01-02T03:19:05.000Z" ], expect: { value: null } }
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ]
+        expect: { error: { status: 401, message: Invalid or expired session } }
+        note: exp <= now is expired (no tolerance)
+
+  - name: nbf in the future is rejected until it passes
+    tags: [edge, clock]
+    steps:
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDUsIm5iZiI6MTc2NzMyMzEwNX0.GTrCq2VzYX5k6mF7eQ_bvqRtHZxSMcotrswyKEjduEs" ]
+        expect: { error: { status: 401, message: Invalid or expired session } }
+      - { call: setNow, args: [ "2026-01-02T03:05:05.000Z" ], expect: { value: null } }
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDUsIm5iZiI6MTc2NzMyMzEwNX0.GTrCq2VzYX5k6mF7eQ_bvqRtHZxSMcotrswyKEjduEs" ]
+        expect: { value: { id: user-1, version: 1 } }
+        note: nbf == now is valid
+
+  - name: expired, foreign and forged tokens are 401 with one message
+    tags: [security]
+    steps:
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIyMDQ1LCJleHAiOjE3NjczMjI5NDV9.Kwsbc1QlvYvd47qvEKw_Knq_W7Z2I1qF8MpJCjCUntc" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: expired }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJvdGhlci1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.ghMp8ReClw1OyoC6ioWrElAQc99y18lESIytoLLGmdM" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: foreign audience }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.pBTvPT8uPphGl-GWJS4f2SKexAUB7BpaMLYUvQH2mog" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: no audience }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJzb21lb25lLWVsc2UiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.7QcQ2PCga5M5MaUgP3iEDbks1c4YsS2xoe4CrvKBzp4" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: foreign issuer }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.MktkY95BAj2DSlqXuNRByHb6NP_xW6mvVgOqym4Bzeo" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: signed with another secret }
+      - { call: verify, args: [ "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.nggAwqTvT7LyRkm9ATywRjZiOMs-rN0OuwGAI8-XEdk7TDj7Oq-DvMdBRty89kYavf_TvIW4NueaScOr3Bwgtg" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: HS512 with the right secret }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoyLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: payload changed to v 2, original signature }
+      - { call: verify, args: [ "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9." ], expect: { error: { status: 401, message: Invalid or expired session } }, note: alg none, empty signature }
+      - { call: verify, args: [ "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: alg none with a copied HS256 signature }
+
+  - name: missing or mistyped claims are 401
+    tags: [security, edge]
+    steps:
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1fQ.Px47uzALmZ0DLAqb3jU2UT5qhqwKQHTf4K9hdT3KUP0" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: no exp }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiZXhwIjoxNzY3MzIzOTQ1fQ.mgZWNaDsCQa3ylxf_wz8v2wz7bwAHhAMKP8QDaLh2dY" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: no iat }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.PRSZTbMrPEn7IcHPqoWsQP-K7dOQvcLW1R0RdWJSXno" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: no sub }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiIiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.GYk1mz9Nb35XSSUsfVLMyyFE456-ZoAZmPEUw0sk5R8" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: empty sub }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.aD9k-atJ9YQTYOuB9cvcBetsDG3wiKr9G75B089VPpk" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: no v }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoiMSIsInN1YiI6InVzZXItMSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.5qJ-KhjKK4ixxoRmUkIwI3KvnS_T5lnzFyII-rldO8M" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: v is the string "1" }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLjUsInN1YiI6InVzZXItMSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.8ABYetCu1laST-QgDcezVNV-DvW1MD3OjSlSdjxrOTc" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: v is 1.5 }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2Ijp0cnVlLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.h6yzxpHVkcaSzs9p-q_kTvuDrDZ_0l6HvBQWB7JER-M" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: v is true (not a number) }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOiIxNzY3MzIzOTQ1In0.VQClIMGTHnWAptwYoly43DwfcrDKZsk-QY_WqPDiCQY" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: exp is a string }
+
+  - name: malformed input is 401
+    tags: [edge]
+    steps:
+      - { call: verify, args: [ not.a.jwt ], expect: { error: { status: 401, message: Invalid or expired session } } }
+      - { call: verify, args: [ "" ], expect: { error: { status: 401, message: Invalid or expired session } } }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: no signature part }
+      - { call: verify, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: verify takes the bare token }
+      - { call: verify, args: [ null ], expect: { error: { status: 401, message: Invalid or expired session } } }
+
+  # --- construction --------------------------------------------------------------------------
+  - name: secrets need 32 UTF-8 bytes
+    tags: [validation]
+    init: { secret: "0123456789012345678901234567890", now: "2026-01-02T03:04:05.000Z" }
+    create: { error: { message: JWT_SECRET must contain at least 32 bytes } }
+
+  - name: 15 two-byte characters are too short
+    tags: [validation, unicode]
+    init: { secret: "ééééééééééééééé", now: "2026-01-02T03:04:05.000Z" }
+    create: { error: { message: JWT_SECRET must contain at least 32 bytes } }
+
+  - name: byte length, not character length, decides
+    tags: [validation, unicode]
+    init: { secret: "😀😀😀😀😀😀😀😀", now: "2026-01-02T03:04:05.000Z" }
+    steps:
+      - call: issue
+        args: [ { id: user-1, tokenVersion: 1 } ]
+        expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.rrjrlTdsx2uAubGCoff2KEbSJwOJZZV6nwauje2WVtU" }
+        note: 8 emoji are 32 UTF-8 bytes; the key is the UTF-8 encoding

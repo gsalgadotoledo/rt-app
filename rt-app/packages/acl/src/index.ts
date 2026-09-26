@@ -1,4 +1,4 @@
-import { auditUpdate } from "@gsalgadotoledo/rt-app-contracts";
+import { auditUpdate, epochMs, type Clock } from "@gsalgadotoledo/rt-app-contracts";
 import type { NoSQL as Store } from "@gsalgadotoledo/rt-app-nosql";
 import { migrations } from "./migrations.js";
 import admin from "./admin.json" with { type: "json" };
@@ -14,6 +14,8 @@ export class ACL {
   constructor(
     private store: Store,
     private resources: () => Endpoint[],
+    /** Injectable clock (epoch ms or Date) for audit timestamps; defaults to the system clock. */
+    private options: { now?: Clock } = {},
   ) {}
   /** Owners have normal resource access; other actors need the named grant. */
   allows(actor: Actor | undefined, resource: string) {
@@ -97,7 +99,7 @@ export class ACL {
               version: row.version + 1,
               data: {
                 ...row.data,
-                ...auditUpdate(c.actor!.id),
+                ...auditUpdate(c.actor!.id, new Date(epochMs(this.options.now))),
                 role,
                 grants: [...new Set(grants)],
                 tokenVersion: row.data.tokenVersion + 1,
