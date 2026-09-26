@@ -113,3 +113,16 @@ test("memory transactions are atomic, clone values and paginate deterministicall
   await store.transact([{ row: rows[0], expected: 1, delete: true }]);
   assert.equal(await store.get("P", "000"), undefined);
 });
+
+test("sort keys compare by Unicode code point, like DynamoDB", async () => {
+  const { byCodePoint } = await import("../dist/index.js");
+  assert.equal(byCodePoint("", ""), 0);
+  assert.equal(byCodePoint("a", "a"), 0);
+  assert.ok(byCodePoint("a", "ab") < 0);
+  assert.ok(byCodePoint("ab", "a") > 0);
+  assert.ok(byCodePoint("B", "a") < 0);
+  assert.ok(byCodePoint("�", "😀") < 0, "UTF-16 comparison would say the opposite");
+  const store = new MemoryStore();
+  await store.transact(["😀", "�", "z"].map((sk) => ({ row: { pk: "P", sk, version: 1, data: {} }, expected: null })));
+  assert.deepEqual((await store.list("P")).items.map((r) => r.sk), ["z", "�", "😀"]);
+});
