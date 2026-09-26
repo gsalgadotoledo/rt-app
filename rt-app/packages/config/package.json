@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-config",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "exports": {
     ".": {

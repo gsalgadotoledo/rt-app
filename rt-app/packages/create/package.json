@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-create",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "type": "module",
   "description": "RT-App project templates and generator",
   "bin": {
