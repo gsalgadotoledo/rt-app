@@ -10,6 +10,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"]
 
+[project.optional-dependencies]
+# Only what a component needs: auth sealing (AES-GCM), PostgreSQL and DynamoDB stores.
+crypto = ["cryptography>=46"]
+postgres = ["psycopg[binary]>=3.2"]
+dynamodb = ["boto3>=1.40"]
+all = ["cryptography>=46", "psycopg[binary]>=3.2", "boto3>=1.40"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
