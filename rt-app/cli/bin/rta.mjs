@@ -92,7 +92,9 @@ try {
   } else if(command==='create') {
     if(args[0]!=='crud') throw new Error('Usage: rta create crud <name> --fields "name:string" [--actions publish] [--json] [--dry-run]');
     const {parse,generate}=await import('./create-crud.mjs');
-    const {spec,dryRun}=await parse(args.slice(1));
+    const parsed=await parse(args.slice(1));
+    if(parsed.help){console.log(parsed.help);process.exit(0);}
+    const {spec,dryRun}=parsed;
     const result=await generate(root,spec,{dryRun});
     console.log(json?JSON.stringify(result):`${dryRun?'Preview':'Created'}: ${result.created}\n${result.note}\nNext: ${result.next.join(' && ')}`);
   } else if(command==='tools') {

@@ -127,7 +127,8 @@ function AdminApp({
     const data = await response.json();
     if (!response.ok) {
       if (response.status === 401 && session) setSession(undefined);
-      throw new Error(data.error ?? "Request failed");
+      // Keep the HTTP status so panels can tell a 409 conflict from a 403 or a 400.
+      throw Object.assign(new Error(data.error ?? "Request failed"), { status: response.status });
     }
     return data;
   };

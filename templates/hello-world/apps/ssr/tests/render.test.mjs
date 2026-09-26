@@ -8,7 +8,9 @@ import {setTimeout as delay} from 'node:timers/promises';
 const require=createRequire(import.meta.url);
 test('production Next.js renders API content in HTML and refreshes it per request',{timeout:30000},async()=>{
  let title='Rendered without JavaScript';
- const api=createServer((req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({title,content:'From the selected API adapter'}));});
+ // Answers the home content request; add routes here when a page fetches more (other paths get 404).
+ const routes={'/':()=>({title,content:'From the selected API adapter'})};
+ const api=createServer((req,res)=>{res.setHeader('content-type','application/json');const route=routes[new URL(req.url,'http://x').pathname];if(!route){res.statusCode=404;res.end(JSON.stringify({error:'Not found'}));return;}res.end(JSON.stringify(route()));});
  api.listen(0,'127.0.0.1');await once(api,'listening');
  const reservation=createServer();reservation.listen(0,'127.0.0.1');await once(reservation,'listening');const port=reservation.address().port;await new Promise(r=>reservation.close(r));
  const child=spawn(process.execPath,[require.resolve('next/dist/bin/next'),'start','--hostname','127.0.0.1','--port',String(port)],{env:{...process.env,RT_APP_ENVIRONMENT:'local',RT_APP_API_URL:`http://127.0.0.1:${api.address().port}`},stdio:'ignore'});

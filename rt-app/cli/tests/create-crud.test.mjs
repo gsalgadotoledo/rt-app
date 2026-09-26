@@ -80,3 +80,10 @@ test('generated search traverses empty pages and preserves continuation bounds',
   const page=await search(store,'pk',{q:'needle'},spec.fields,r=>r.data);assert.equal(calls,3);assert.equal(page.items[0].name,'needle');assert.equal(page.cursor,'3');
   calls=0;const empty=await search(store,'pk',{q:'missing'},spec.fields,r=>r.data);assert.equal(calls,10);assert.equal(empty.cursor,'10');
 });
+
+test('create crud --help prints usage instead of failing', async () => {
+  const { parse, CRUD_USAGE } = await import('@gsalgadotoledo/rt-app-create/crud');
+  assert.deepEqual(await parse(['--help']), { help: CRUD_USAGE });
+  assert.deepEqual(await parse(['products', '-h']), { help: CRUD_USAGE });
+  assert.match(CRUD_USAGE, /rta create crud <name> --fields/);
+});

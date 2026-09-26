@@ -26,7 +26,9 @@ export function normalize(spec) {
   if(!Array.isArray(actions)||actions.length>10||new Set(actions).size!==actions.length||actions.some(a=>typeof a!=='string'||a.length>40||!safeName.test(a)||reserved.has(a)||['list','read','create','edit','delete','restore'].includes(a)))throw new Error('Invalid or duplicate custom action');
   return {name:spec.name,title,fields,actions};
 }
+export const CRUD_USAGE='Usage: rta create crud <name> --fields "name:string,price:number,notes:string?" [--title Products] [--actions publish,archive] [--spec crud.json] [--dry-run] [--json]';
 export async function parse(args) {
+  if(args.includes('--help')||args.includes('-h'))return {help:CRUD_USAGE};
   let name;const options={};
   for(let i=0;i<args.length;i++){
     const arg=args[i];if(['--json','--dry-run'].includes(arg)){if(options[arg])throw new Error('Duplicate option');options[arg]=true;continue;}
