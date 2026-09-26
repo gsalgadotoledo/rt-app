@@ -1,29 +1,32 @@
-"""Contract host for the Python implementations (run with: sh hosts/python.sh hosts/python_host.py)."""
+"""Contract host for the Python implementations (run with: sh hosts/python.sh hosts/python_host.py).
+
+Every hosts/python/*.py module defines SUBJECTS; add a module per group of subjects."""
 from __future__ import annotations
 
-from typing import Any
+import importlib.util
+import sys
+from pathlib import Path
 
 from rt_app.conformance import run_host
-from rt_app.feature_flags import FeatureFlags
-from rt_app.nosql import MemoryStore, Row
+
+FOLDER = Path(__file__).parent / "python"
 
 
-def memory_store(rows: list[Row] | None = None) -> MemoryStore:
-    """A memory store holding the given rows (as written by version-guarded creates)."""
-    store = MemoryStore()
-    if rows:
-        store.transact([{"row": row, "expected": None} for row in rows])
-    return store
-
-
-def _rows(init: Any) -> list[Row] | None:
-    return init.get("rows") if isinstance(init, dict) else None
+def load_subjects() -> dict:
+    sys.path.insert(0, str(FOLDER))  # modules may import each other (e.g. `from storage import memory_store`)
+    subjects: dict = {}
+    for path in sorted(FOLDER.glob("*.py")):
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[path.stem] = module
+        spec.loader.exec_module(module)
+        for name, factory in getattr(module, "SUBJECTS", {}).items():
+            if name in subjects:
+                raise RuntimeError(f"Duplicate subject {name} in {path.name}")
+            subjects[name] = factory
+    return subjects
 
 
 if __name__ == "__main__":
-    run_host(
-        {
-            "nosql-memory": lambda init: memory_store(_rows(init)),
-            "feature-flags": lambda init: FeatureFlags(memory_store(_rows(init))),
-        }
-    )
+    run_host(load_subjects())
