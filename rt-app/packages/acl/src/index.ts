@@ -26,6 +26,9 @@ export class ACL {
   /** Enforce the endpoint access policy; explicitGrant also applies to owners. */
   check(endpoint: Endpoint, actor?: Actor) {
     if (endpoint.access === "guest") return;
+    // Fail closed: a typo in an endpoint's access must not open it to every signed-in user.
+    if (!["authenticated", "permission", "owner"].includes(endpoint.access))
+      throw new HttpError(403, "You do not have permission to access this resource");
     if (!actor) throw new HttpError(401, "Sign in");
     if (endpoint.access === "owner" && actor.role !== "owner")
       throw new HttpError(403, "Only the owner can perform this operation");

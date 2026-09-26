@@ -18,6 +18,7 @@ const resources = [
 test("access matrix, including explicit grants for owners", () => {
   const acl = new ACL(new MemoryStore(), () => resources);
   acl.check({ access: "guest" });
+  assert.throws(() => acl.check({ access: "admin" }, { role: "owner", grants: [] }), { status: 403 }, "unknown access fails closed");
   assert.throws(() => acl.check({ access: "authenticated" }), { status: 401 });
   acl.check({ access: "authenticated" }, user);
   acl.check({ access: "owner" }, owner);

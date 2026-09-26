@@ -11,6 +11,8 @@ description: |
   not consulted: the session layer filters inactive users).
   check(endpoint, actor) returns null or throws, in this order:
     access guest → allowed, even without an actor;
+    access not one of guest/authenticated/permission/owner → 403 "You do not have permission to
+      access this resource" (fail closed, even for owners);
     no actor → 401 "Sign in";
     access owner and role != owner → 403 "Only the owner can perform this operation";
     access permission → explicitGrant ? grants must include the resource (owners too)
@@ -61,6 +63,12 @@ cases:
       - { call: allows, args: [ { id: x, role: user, grants: [ items.read ], active: false }, items.read ], expect: { value: true }, note: active is not consulted }
 
   # --- check -----------------------------------------------------------------------------------
+  - name: unknown access values fail closed
+    tags: [ security, edge ]
+    steps:
+      - { call: check, args: [ { resource: x, method: GET, path: /x, access: admin }, { id: u1, email: a@example.test, role: owner, grants: [ x ] } ], expect: { error: { status: 403, message: You do not have permission to access this resource } } }
+      - { call: check, args: [ { resource: x, method: GET, path: /x, access: Guest }, null ], expect: { error: { status: 403, message: You do not have permission to access this resource } } }
+
   - name: guest endpoints need no actor
     steps:
       - { call: check, args: [ { resource: home, method: GET, path: /, access: guest }, null ], expect: { value: null } }
