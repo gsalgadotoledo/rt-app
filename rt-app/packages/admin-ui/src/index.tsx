@@ -147,7 +147,7 @@ export function ResourcePanel({ api, manifest, user }: PanelProps) {
       <div className="record-list-summary">
         <span className="badge">{items.length} on this page</span>
       </div>
-      {supportsTrash && <button className="trash-link" disabled={busy} onClick={()=>{const next=!trash;setTrash(next);setSelected(undefined);setMode("list");void load(undefined,next);}}>{trash?"← Active records":"Trash"}</button>}</>}
+      {supportsTrash && <button className="trash-link" disabled={busy} onClick={()=>{const next=!trash;setTrash(next);setSelected(undefined);setMode("list");void load(undefined,next);}} title={trash?"Back to the active records":"See deleted records; restore them from there"}>{trash?"← Back to active records":"View trash"}</button>}{trash&&<p className="hint trash-hint">Viewing trash: deleted records you can open and restore.</p>}</>}
       <nav className="tabs">
         <button
           className={mode === "list" ? "active" : ""}

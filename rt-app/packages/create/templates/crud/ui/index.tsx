@@ -31,7 +31,7 @@ export default function Panel({api,user}:PanelProps) {
   async function action(name:string){setBusy(true);setError('');try{await api(path+'/'+encodeURIComponent(selected.id)+'/actions/'+name,'POST',{version:selected.version});setSelected(await api(path+'/'+encodeURIComponent(selected.id)));await load(history.at(-1));}catch(e:any){setError(e.message);}finally{setBusy(false);}}
   return <section>
     <div className="section-head"><h1>{schema.title}</h1>{!trash&&allowed('create')&&<button disabled={busy} onClick={()=>{setTab("edit");setCreating(true);setSelected(undefined);setError('');}}>Create record</button>}</div>
-    <button className="trash-link" disabled={busy} onClick={()=>{const next=!trash;setTrash(next);setSelected(undefined);setCreating(false);setHistory([undefined]);void load(undefined,applied,next);}}>{trash?"← Active records":"Trash"}</button>
+    <button className="trash-link" disabled={busy} onClick={()=>{const next=!trash;setTrash(next);setSelected(undefined);setCreating(false);setHistory([undefined]);void load(undefined,applied,next);}} title={trash?"Back to the active records":"See deleted records; restore them from there"}>{trash?"← Back to active records":"View trash"}</button>{trash&&<p className="hint trash-hint">Viewing trash: deleted records you can open and restore.</p>}
     {error&&<p role="alert">{error}</p>}
     <form className="filters" onSubmit={e=>{e.preventDefault();setApplied(filters);setHistory([undefined]);void load(undefined,filters);}}>
       <label>Search<input value={filters.q??''} onChange={e=>setFilters({...filters,q:e.target.value})}/></label>
