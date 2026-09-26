@@ -30,7 +30,7 @@
       "api": {
         "command": [
           "sh",
-          "../spec/hosts/python.sh",
+          "../../../spec/hosts/python.sh",
           "-m",
           "rt_app.web",
           "serve",
@@ -44,7 +44,7 @@
       "api": {
         "command": [
           "sh",
-          "../spec/hosts/python.sh",
+          "../../../spec/hosts/python.sh",
           "-m",
           "rt_app.web",
           "lambda-local",

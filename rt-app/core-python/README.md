@@ -10,6 +10,32 @@ python3 -m venv .venv
 
 Build an installable wheel with `python -m pip wheel --no-deps /path/to/core-python -w dist`. Once a public release exists, installation will be `python -m pip install rt-app-core==<version>` (not available yet). Use a virtual environment; the desktop-generated backend creates one automatically and installs this local library in editable mode.
 
+## `rt_app`: modules, web app and contracts (0.3.0.dev0)
+
+The same package also ships `rt_app`, the Python port of the TypeScript modules. TypeScript is the
+reference, and the language-neutral contracts in `rt-app/spec/contracts` must pass unchanged
+(`npm run contracts -- --target python,python-lambda`). See `rt-app/docs/polyglot.md`.
+
+| Module | Contents |
+| --- | --- |
+| `rt_app` | `Singleton`, `AsyncSingleton` (re-exported from `rt_app_core`), `HttpError`, `Conflict` |
+| `rt_app.nosql` | `Row`, `Write`, the `NoSQL` protocol, `MemoryStore` (version-guarded, atomic, 50 rows per page) |
+| `rt_app.feature_flags` | `FeatureFlags(store)`: `list`, `get`, `save`, `enabled`, `feature()` |
+| `rt_app.health` | `Health().feature()`: `GET /health/live` and `GET /health/ready` |
+| `rt_app.web` | `App`, `Feature`, `Endpoint`, `Request`, `Context`; `serve`, `handler_for` (AWS Lambda) |
+| `rt_app.conformance` | contract host (protocol v1) for `rta-contract` |
+
+One application, three modes (`module:attr` is imported from the current directory):
+
+```sh
+python -m rt_app.web serve app:app                  # HTTP on 127.0.0.1:$PORT
+python -m rt_app.web lambda-local app:app           # HTTP → API Gateway v2 event → Lambda handler
+python -m rt_app.web call app:app GET /health/live  # one request, prints the JSON body
+```
+
+For Lambda, deploy `handler = handler_for(app)`; it accepts API Gateway HTTP API (v2) and REST (v1)
+events. A complete example lives in `rt-app/examples/flags-api/python`.
+
 ## Community-style composition
 
 Use normal classes/functions, keyword arguments, `functools.partial`, `typing.Protocol`, and context managers. There is no required base class or metaclass, and there is no global container.

@@ -62,7 +62,7 @@ The host listens on loopback only and prints `RT_CONTRACT_READY <url>` once it i
 ### Semantics that ports must copy exactly (TypeScript is the reference)
 
 - String length limits count **UTF-16 code units** (JavaScript `length`): Python uses
-  `len(s.encode("utf-16-le")) // 2`, Go uses `utf16.RuneLen`.
+  `len(s.encode("utf-16-le")) // 2`, Go counts runes above U+FFFF twice.
 - Sort keys are ordered by **Unicode code point**. This is the order of DynamoDB and of Postgres
   `COLLATE "C"`. Python `<` already does this, and Go compares UTF-8 bytes.
 - JSON typing follows JavaScript `typeof`:
@@ -83,7 +83,7 @@ an implementation means changing one line, and every module is a singleton per a
 | Swap implementation | change `module:` | change the class or `partial(...)` | change the import or the constructor |
 | Singleton | `RTAppManager` | `rt_app.Singleton` (thread-safe, lazy, `close`) | `rtcore.Singleton[T]` (`sync.OnceValues`) |
 | Dependencies | `bindings` / `dependsOn` | constructor arguments (`Protocol` types) | constructor arguments (small interfaces defined by the consumer) |
-| HTTP | framework `handle(request)` | `rt_app.web.App` + stdlib `http.server` | `web.App` implements `http.Handler` (Go 1.22 `ServeMux` patterns) |
+| HTTP | framework `handle(request)` | `rt_app.web.App` + stdlib `http.server` | `web.App` implements `http.Handler` (small router with the TypeScript rules) |
 | Lambda | `apps/lambda-ts` | `handler_for(app)` (API Gateway v1/v2 events, no dependencies) | `aws-lambda-go` + `events.APIGatewayV2HTTPRequest` |
 | CLI | `rta` | `python -m rt_app.web call app:app GET /path` | `-mode=cli GET /path` |
 
@@ -108,7 +108,7 @@ No dependency-injection framework is needed:
   - Anything else answers 500 `{"error":"Internal error"}` and is logged.
 - **Owner and permission endpoints** are mounted under `/admin/app<path>` only.
   - In local mode (`local_admin`) the actor is `{id: "rt-app-root", role: "owner"}`.
-  - Without an actor they return 401 `Authentication required`.
+  - Without an actor they return 401 `Sign in` (the TypeScript ACL message).
 - **Adapters:**
   - Bodies must be JSON objects: 400 `Invalid JSON`.
   - The body limit is 16 KiB: 413 `Request body too large`.

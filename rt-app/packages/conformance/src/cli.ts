@@ -101,7 +101,7 @@ export async function main(argv: string[], out: (line: string) => void = console
     const results = await runTarget(target, contracts, {
       filter: typeof flags.filter === "string" ? flags.filter : undefined,
       recorded,
-      onResult: (r) => { if (!flags.json) out(`  ${ICON[r.status]} ${r.module} · ${r.name}${r.message && r.status !== "passed" ? `\n      ${r.message}` : ""}`); },
+      onResult: (r) => { if (!flags.json && r.status !== "skipped") out(`  ${ICON[r.status]} ${r.module} · ${r.name}${r.message && r.status !== "passed" ? `\n      ${r.message}` : ""}`); },
     });
     all.push(...results);
     if (recorded) for (const contract of contracts) {
@@ -116,8 +116,8 @@ export async function main(argv: string[], out: (line: string) => void = console
   });
   if (flags.json) out(JSON.stringify({ summary, results: all }, null, 2));
   else {
-    out("\n" + ["target", "passed", "failed", "missing", "unrecorded"].map((h) => h.padEnd(11)).join(""));
-    for (const s of summary) out([s.target, s.passed, s.failed, s.missing, s.unrecorded].map((v) => String(v).padEnd(11)).join(""));
+    out("\n" + ["target", "passed", "failed", "missing", "unrecorded", "skipped"].map((h) => h.padEnd(14)).join(""));
+    for (const s of summary) out([s.target, s.passed, s.failed, s.missing, s.unrecorded, s.skipped].map((v) => String(v).padEnd(14)).join(""));
   }
   return all.some((r) => r.status === "failed" || r.status === "unrecorded") ? 1 : 0;
 }

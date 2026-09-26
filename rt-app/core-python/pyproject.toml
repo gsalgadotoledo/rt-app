@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rt-app-core"
-version = "0.1.0"
-description = "Application-owned singleton providers for RT-App Python"
+version = "0.3.0.dev0"
+description = "RT-App for Python: singleton providers, NoSQL store, feature flags, web app (server, Lambda, CLI) and contract host"
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = ["Programming Language :: Python :: 3", "Typing :: Typed"]
@@ -15,3 +15,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 rt_app_core = ["py.typed"]
+rt_app = ["py.typed"]

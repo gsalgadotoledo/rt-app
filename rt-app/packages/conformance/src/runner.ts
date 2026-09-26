@@ -202,7 +202,8 @@ export async function runTarget(target: Target, contracts: Contract[], options: 
         const base = { target: target.name, module: contract.module, file: contract.file, name: c.name, tags: c.tags };
         if (!selected(c)) continue;
         const started = Date.now();
-        if (contract.kind === "module" && (!host || !subjects.includes(c.subject))) { report({ ...base, status: "missing", message: host ? `subject ${c.subject} is not implemented` : "no host configured", ms: 0 }); continue; }
+        if (contract.kind === "module" && !host) { report({ ...base, status: "skipped", message: "API-only target (no host)", ms: 0 }); continue; }
+        if (contract.kind === "module" && !subjects.includes(c.subject)) { report({ ...base, status: "missing", message: `subject ${c.subject} is not implemented`, ms: 0 }); continue; }
         if (contract.kind === "http" && !api) { report({ ...base, status: "skipped", message: "no api configured", ms: 0 }); continue; }
         try {
           const outcome = contract.kind === "module" ? await runModuleCase(host!.url, c, recorded) : await runHttpCase(api!.url, c);

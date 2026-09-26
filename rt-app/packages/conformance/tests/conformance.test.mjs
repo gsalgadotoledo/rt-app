@@ -196,7 +196,7 @@ cases:
   const hostOnly = await runTarget({ name: "no-api", host: { command: [process.execPath, "host.mjs"], cwd: dir } }, contracts);
   assert.equal(hostOnly.find((r) => r.name === "health").status, "skipped");
   const apiOnly = await runTarget({ name: "no-host", api: { command: [process.execPath, "api.mjs"], cwd: dir, readyPath: "/health", port: 4997 } }, contracts, { filter: "echoes" });
-  assert.deepEqual(apiOnly.map((r) => r.status), ["missing"]);
+  assert.deepEqual(apiOnly.map((r) => r.status), ["skipped"]);
   await assert.rejects(runTarget({ name: "broken", host: { command: [process.execPath, "broken.mjs"], cwd: dir } }, contracts), /exited \(3\) before it was ready/);
   await assert.rejects(runTarget({ name: "broken-api", api: { command: [process.execPath, "broken.mjs"], cwd: dir } }, [contracts[1]]), /API exited/);
   await assert.rejects(runTarget({ name: "no-command", host: { command: [join(dir, "missing-binary")] } }, contracts), /ENOENT|exited/);
