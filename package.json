@@ -20,6 +20,7 @@
     "release:publish": "node rt-app/scripts/release.mjs publish",
     "release:check": "npm run check:architecture && npm run build && npm run prepare:templates && npm run test:coverage && npm run release:pack && npm run release:verify",
     "contracts": "node rt-app/packages/conformance/bin/rta-contract.mjs test --config rt-app/spec/contracts.json",
+    "contracts:stores": "node rt-app/spec/services.mjs --postgres --dynamodb -- npm run contracts --",
     "contracts:show": "node rt-app/packages/conformance/bin/rta-contract.mjs show --config rt-app/spec/contracts.json",
     "link:app": "node rt-app/scripts/link-app.mjs link",
     "unlink:app": "node rt-app/scripts/link-app.mjs unlink",
@@ -32,6 +33,7 @@
     "postcss": "8.5.28"
   },
   "devDependencies": {
-    "c8": "^10.1.3"
+    "c8": "^10.1.3",
+    "embedded-postgres": "^18.4.0-beta.17"
   }
 }

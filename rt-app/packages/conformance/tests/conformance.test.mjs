@@ -272,3 +272,14 @@ test("values and contracts: remaining branches", async (t) => {
   assert.equal(normalize({ contract: 1, module: "m", cases: [{ name: "c", create: { value: null } }] }).cases[0].steps.length, 0);
 });
 function lookupThrough() { return expand({ $ref: "0.a.b" }, [{ a: 1 }]); }
+
+test("one contract, several subjects; optional subjects are skipped when a host lacks them", async (t) => {
+  const contract = normalize({ contract: 1, module: "store", subjects: ["mem", "pg", "db"], optionalSubjects: ["pg"], cases: [{ name: "reads", call: "get", expect: { value: 1 } }, { name: "custom", subject: "mem", call: "get", expect: { value: 1 } }] });
+  assert.deepEqual(contract.cases.map((c) => [c.name, c.subject]), [["reads [mem]", "mem"], ["reads [pg]", "pg"], ["reads [db]", "db"], ["custom", "mem"]]);
+  assert.throws(() => normalize({ contract: 1, module: "m", subjects: [], cases: [{ name: "x", call: "f" }] }), /subjects must be/);
+  assert.throws(() => normalize({ contract: 1, module: "m", optionalSubjects: "x", cases: [{ name: "x", call: "f" }] }), /optionalSubjects/);
+  const host = await serveContracts({ subjects: { mem: () => ({ get: () => 1 }) } });
+  t.after(() => host.close());
+  const results = await runTarget({ name: "t", host: host.url }, [contract]);
+  assert.deepEqual(results.map((r) => r.status), ["passed", "skipped", "missing", "passed"]);
+});

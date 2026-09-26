@@ -24,6 +24,9 @@ import type { Json } from "./values.js";
  *     expect: { error: { status: 400, message: Invalid flag key } }
  * ```
  *
+ * `subjects: [a, b]` runs every case once per subject (e.g. one store contract for memory,
+ * Postgres and DynamoDB); `optionalSubjects` lists the ones a host may not provide.
+ *
  * `kind: http` contracts test a running API instead: each case has `request` and `expect`
  * (`status`, `body`, `headers`).
  */
@@ -60,6 +63,8 @@ export interface Contract {
   title?: string;
   description?: string;
   subject: string;
+  /** Subjects a host may lack (e.g. stores that need a database): reported as skipped, not missing. */
+  optionalSubjects: string[];
   cases: Case[];
   document?: Document;
 }
@@ -87,6 +92,10 @@ export function normalize(raw: unknown, file = "contract"): Contract {
   if (typeof raw.module !== "string" || !/^[a-z][a-z0-9-]*$/.test(raw.module)) fail(file, "module must be a lowercase id");
   if (!Array.isArray(raw.cases) || !raw.cases.length) fail(file, "cases must be a non-empty list");
   const subject = raw.subject ?? raw.module;
+  const subjects: string[] | undefined = raw.subjects;
+  if (subjects !== undefined && (!Array.isArray(subjects) || !subjects.length || subjects.some((s) => typeof s !== "string"))) fail(file, "subjects must be a non-empty list of names");
+  const optionalSubjects = raw.optionalSubjects ?? [];
+  if (!Array.isArray(optionalSubjects) || optionalSubjects.some((s: unknown) => typeof s !== "string")) fail(file, "optionalSubjects must be a list of names");
   const names = new Set<string>();
   const cases = raw.cases.map((c: unknown, index: number): Case => {
     const where = `${file} case #${index + 1}`;
@@ -119,7 +128,10 @@ export function normalize(raw: unknown, file = "contract"): Contract {
       index,
     };
   });
-  return { file, kind, module: raw.module, title: raw.title, description: raw.description, subject, cases };
+  const expanded = subjects && kind === "module"
+    ? cases.flatMap((c: Case) => (c.subject !== subject ? [c] : subjects.map((s) => ({ ...c, subject: s, name: `${c.name} [${s}]` }))))
+    : cases;
+  return { file, kind, module: raw.module, title: raw.title, description: raw.description, subject: subjects?.[0] ?? subject, optionalSubjects, cases: expanded };
 }
 
 /** Load one contract from YAML (.yaml/.yml) or JSON. */
@@ -159,11 +171,12 @@ export async function saveRecorded(contract: Contract, recorded: Map<string, Exp
     const steps = node.get("steps");
     c.steps.forEach((step, i) => {
       const value = recorded.get(`${c.name}\u0000${i}`);
+      // Cases expanded per subject share one node in the file: the first recorded value wins.
       if (!value || step.expect) return;
       if (isSeq(steps)) {
         const stepNode = steps.items[i];
-        if (isMap(stepNode)) { stepNode.set("expect", contract.document!.createNode(value, { flow: true })); written++; }
-      } else if (i === 0) { node.set("expect", contract.document!.createNode(value, { flow: true })); written++; }
+        if (isMap(stepNode) && !stepNode.has("expect")) { stepNode.set("expect", contract.document!.createNode(value, { flow: true })); written++; }
+      } else if (i === 0 && !node.has("expect")) { node.set("expect", contract.document!.createNode(value, { flow: true })); written++; }
     });
   }
   if (written) await writeFile(contract.file, extname(contract.file) === ".json" ? JSON.stringify(contract.document.toJS(), null, 2) + "\n" : contract.document.toString({ lineWidth: 0, flowCollectionPadding: true }));

@@ -126,3 +126,9 @@ test("sort keys compare by Unicode code point, like DynamoDB", async () => {
   await store.transact(["😀", "�", "z"].map((sk) => ({ row: { pk: "P", sk, version: 1, data: {} }, expected: null })));
   assert.deepEqual((await store.list("P")).items.map((r) => r.sk), ["z", "�", "😀"]);
 });
+
+test("DynamoStore rejects the same key twice before calling DynamoDB", async () => {
+  const store = new DynamoStore("t", { region: "us-east-1", endpoint: "http://127.0.0.1:9" });
+  const write = { row: { pk: "A", sk: "x", version: 1, data: {} }, expected: null };
+  await assert.rejects(store.transact([write, write]), /Duplicate transaction key/);
+});

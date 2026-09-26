@@ -46,6 +46,9 @@ export class DynamoStore implements Store {
   /** Apply all version-guarded writes atomically; conflicts never commit a partial transaction. */
   async transact(writes: Write[]) {
     if (!writes.length) return;
+    // Same answer as the other stores (DynamoDB itself rejects it with a ValidationException).
+    if (new Set(writes.map((w) => JSON.stringify([w.row.pk, w.row.sk]))).size !== writes.length)
+      throw new Error("Duplicate transaction key");
     try {
       await this.client.send(
         new TransactWriteCommand({
