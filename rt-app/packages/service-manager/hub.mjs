@@ -5,7 +5,7 @@ import {Toolchains} from '@gsalgadotoledo/rt-app-create/runtime';
 import {catalog,installTool,toolService} from './catalog.mjs';
 import {discover} from './discovery.mjs';
 const jobs=new Map();
-import {readFile,writeFile,mkdir,rename,realpath} from 'node:fs/promises';
+import {readFile,writeFile,mkdir,rename,realpath,readdir} from 'node:fs/promises';
 import {homedir} from 'node:os';
 import {join,basename} from 'node:path';
 import {createServer} from 'node:net';
@@ -62,14 +62,29 @@ export class ServiceHub {
  async projectManifest(root,settings){return manifest(root,{...this.options,sharedMail:this.global.ports,sharedEnv:Object.fromEntries((this.global.extra??[]).flatMap(s=>(s.portEnv??[]).map((key,i)=>[key,String(s.ports[i])]))),settings});}
  async ensureProject(root){const config=await this.projectManifest(root);const {started}=await ensureDaemon(root,{binary:this.options.binary,config});if(!started){const current=await read(join(root,'.rt-app/services.json'));if(JSON.stringify(current)!==JSON.stringify(config))await apply(root,config);}}
  async snapshot(){
-  if(!this.root)return {project:'',services:[],projects:this.registry,catalog:[]};
+  if(!this.root)return {project:'',services:[],projects:await this.projects(),catalog:[]};
   this.global=await read(join(this.home,'settings.json'),this.global);this.registry=await read(join(this.home,'projects.json'),this.registry);
   const [project,global]=await Promise.all([request(this.root,'status'),request(this.home,'status')]);
   const settings=await read(join(this.root,'rt-app.settings.json'));
   const config=await read(join(this.root,'.rt-app/services.json'),{services:[]});
   const globalConfig=await read(join(this.home,'.rt-app/services.json'),{services:[]});
   const runtime=(s,list,backend)=>runtimeLabel(list.find(spec=>spec.id===s.id)??s,backend);
-  return {...project,catalog:catalog.map(t=>({...t,installed:(this.global.catalogTools??[]).includes(t.id),job:jobs.get(t.id)})),projects:this.registry,globalPorts:{...this.global.ports,...extraPorts(this.global.extra)},projectPorts:{...defaults,...settings.local?.ports,...extraPorts(settings.services?.extra)},services:[...global.services.map(s=>({...s,runtime:runtime(s,globalConfig.services),id:`global:${s.id}`,scope:'global',project:'Shared across projects'})),...project.services.map(s=>({...s,runtime:runtime(s,config.services,settings.backend),scope:'project',project:this.registry.find(p=>p.path===this.root)?.name??basename(this.root)}))]};
+  return {...project,catalog:catalog.map(t=>({...t,installed:(this.global.catalogTools??[]).includes(t.id),job:jobs.get(t.id)})),projects:await this.projects(),globalPorts:{...this.global.ports,...extraPorts(this.global.extra)},projectPorts:{...defaults,...settings.local?.ports,...extraPorts(settings.services?.extra)},services:[...global.services.map(s=>({...s,runtime:runtime(s,globalConfig.services),id:`global:${s.id}`,scope:'global',project:'Shared across projects'})),...project.services.map(s=>({...s,runtime:runtime(s,config.services,settings.backend),scope:'project',project:this.registry.find(p=>p.path===this.root)?.name??basename(this.root)}))]};
+ }
+ /**
+  * Projects opened before plus every RT-App project in the workspace folder (one level deep,
+  * identified by rt-app.settings.json), so projects created with npx appear without opening them.
+  */
+ async projects(){
+  const listed=[...this.registry];
+  let workspace;try{workspace=JSON.parse(await readFile(join(this.home,'workspace.json'),'utf8')).path;}catch(e){if(e.code!=='ENOENT')throw e;}
+  if(!workspace)return listed;
+  let entries=[];try{entries=await readdir(workspace,{withFileTypes:true});}catch(e){if(e.code!=='ENOENT')throw e;}
+  for(const entry of entries.filter(e=>e.isDirectory()&&!e.name.startsWith('.')).sort((a,b)=>a.name.localeCompare(b.name))){
+   const path=join(workspace,entry.name);if(listed.some(p=>p.path===path))continue;
+   try{const settings=JSON.parse(await readFile(join(path,'rt-app.settings.json'),'utf8'));if(settings.version!==1)continue;const pkg=JSON.parse(await readFile(join(path,'package.json'),'utf8'));listed.push({path,name:pkg.name??entry.name,discovered:true});}catch{}
+  }
+  return listed;
  }
  /** List scripts on demand; polling status never scans the source tree. */
  async commands(){

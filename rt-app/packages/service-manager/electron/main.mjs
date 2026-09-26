@@ -47,7 +47,7 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('services:logs',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid service');return hub.logs(id);});
    ipcMain.handle('services:action',(event,action,id)=>{trusted(event);if(!['start','stop','restart'].includes(action)||typeof id!=='string')throw new Error('Invalid action');return hub.action(action,id);});
    ipcMain.handle('services:open-url',async(event,id)=>{trusted(event);await shell.openExternal(await hub.url(id));});
-   ipcMain.handle('services:select-project',async(event,path)=>{trusted(event);if(path!==undefined&&!hub.registry.some(p=>p.path===path))throw new Error('Unknown project');if(!path){const selection=await dialog.showOpenDialog(window,{title:'Open RT-App project',properties:['openDirectory']});if(selection.canceled)return hub.snapshot();path=selection.filePaths[0];}return hub.select(path);});
+   ipcMain.handle('services:select-project',async(event,path)=>{trusted(event);if(path!==undefined&&!(await hub.projects()).some(p=>p.path===path))throw new Error('Unknown project');if(!path){const selection=await dialog.showOpenDialog(window,{title:'Open RT-App project',properties:['openDirectory']});if(selection.canceled)return hub.snapshot();path=selection.filePaths[0];}return hub.select(path);});
    ipcMain.handle('services:catalog',(event,action,id)=>{trusted(event);return hub.catalogAction(action,id);});
    ipcMain.handle('services:discover',event=>{trusted(event);return hub.discover();});
    ipcMain.handle('services:add-discovered',(event,id)=>{trusted(event);return hub.addDiscovered(id);});

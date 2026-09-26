@@ -77,3 +77,22 @@ test('settings.json createCommand selects a local initializer unless the environ
  await fresh.initialize();
  assert.equal(fresh.env.RT_APP_CREATE_COMMAND,undefined);
 });
+
+test('workspace projects are listed without opening them; registered ones keep their entry',async t=>{
+ const {ServiceHub}=await import('../hub.mjs');
+ const home=await mkdtemp(join(tmpdir(),'sm-ws-home-')),ws=await mkdtemp(join(tmpdir(),'sm-ws-'));
+ t.after(()=>Promise.all([rm(home,{recursive:true,force:true}),rm(ws,{recursive:true,force:true})]));
+ const {mkdir}=await import('node:fs/promises');
+ for(const [name,settings] of [['beta-app',{version:1}],['alpha-app',{version:1}],['old-app',{version:0}],['plain',null]]){
+  await mkdir(join(ws,name));
+  if(settings){await writeFile(join(ws,name,'rt-app.settings.json'),JSON.stringify(settings));await writeFile(join(ws,name,'package.json'),JSON.stringify({name}));}
+ }
+ await mkdir(join(ws,'.hidden'));await writeFile(join(ws,'file.txt'),'x');
+ const hub=new ServiceHub({home});hub.registry=[{path:join(ws,'beta-app'),name:'beta (opened)'}];
+ assert.deepEqual(await hub.projects(),[{path:join(ws,'beta-app'),name:'beta (opened)'}],'no workspace configured');
+ await writeFile(join(home,'workspace.json'),JSON.stringify({path:ws}));
+ assert.deepEqual(await hub.projects(),[{path:join(ws,'beta-app'),name:'beta (opened)'},{path:join(ws,'alpha-app'),name:'alpha-app',discovered:true}]);
+ await writeFile(join(home,'workspace.json'),JSON.stringify({path:join(ws,'missing')}));
+ assert.equal((await hub.projects()).length,1);
+ assert.deepEqual((await hub.snapshot()).projects,[{path:join(ws,'beta-app'),name:'beta (opened)'}]);
+});
