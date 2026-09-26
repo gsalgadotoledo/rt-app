@@ -9,6 +9,7 @@ import {LaunchAgents,agentLabel} from './launchd.mjs';
 import {MachineProcesses} from './processes.mjs';
 import {adminFor} from './admins.mjs';
 import {TerraformRunner,findStacks} from './terraform.mjs';
+import {ContractRunner,findConfigs,describe as describeContracts} from './contracts.mjs';
 import {createHash as hashOf} from 'node:crypto';
 const jobs=new Map();
 import {readFile,writeFile,mkdir,rename,realpath,readdir} from 'node:fs/promises';
@@ -38,7 +39,7 @@ async function apply(root,config){
 }
 /** Main-process coordinator. Each project retains its own native daemon; common services have one per user. */
 export class ServiceHub {
- constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine,terraform}={}){this.home=home;this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();this.terraform=terraform??new TerraformRunner({home});}
+ constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine,terraform,contracts}={}){this.home=home;this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();this.terraform=terraform??new TerraformRunner({home});this.contracts=contracts??new ContractRunner({home});}
  exclusive(fn){const job=this.queue.then(fn);this.queue=job.catch(()=>{});return job;}
  async initialize(){await mkdir(this.home,{recursive:true,mode:0o700});this.registry=await read(join(this.home,'projects.json'),[]);this.global=await read(join(this.home,'settings.json'),{version:1,ports:{smtp:1025,mail:8025},extra:[]});validatePorts(this.global.ports);}
  async select(root){return this.exclusive(async()=>{
@@ -245,6 +246,21 @@ export class ServiceHub {
  async terraformRun(id,command){return this.terraform.run(await this.terraformStack(id),command);}
  async terraformGetRun(id,runId){return this.terraform.getRun(await this.terraformStack(id),runId);}
  async terraformHistory(id){return this.terraform.history(await this.terraformStack(id));}
+
+ // -- Contracts ------------------------------------------------------------------
+
+ /** contracts.json configs of known projects plus the ones added by hand, with their last run. */
+ async contractConfigs(){
+  const configs=await findConfigs((await this.projects()).filter(p=>p.kind!=='missing'),await this.contracts.extra());
+  return Promise.all(configs.map(async c=>({...c,lastRun:(await this.contracts.history(c))[0]??null})));
+ }
+ async contractConfig(id){const config=(await this.contractConfigs()).find(c=>c.id===id);if(!config)throw new Error('Unknown contracts config');return config;}
+ async contractDescribe(id){return describeContracts((await this.contractConfig(id)).path);}
+ async contractRun(id,options){return this.contracts.run(await this.contractConfig(id),options);}
+ async contractGetRun(id,runId){return this.contracts.getRun(await this.contractConfig(id),runId);}
+ async contractHistory(id){return this.contracts.history(await this.contractConfig(id));}
+ async contractAdd(path){await this.contracts.addConfig(path);return this.contractConfigs();}
+ async contractRemove(id){await this.contracts.removeConfig((await this.contractConfig(id)).path);return this.contractConfigs();}
 
  async discover(){if(await this.isGeneric(this.root)){const saved=await this.genericConfig(this.root);const known=new Set(saved.services.map(s=>s.id));return (await genericServices(this.root)).filter(s=>!known.has(s.id));}const settings=await read(join(this.root,'rt-app.settings.json'));const existing=new Set((settings.services?.extra??[]).map(s=>s.id));return (await discover(this.root)).filter(s=>!existing.has(s.id));}
  addDiscovered(id){return this.exclusive(async()=>{

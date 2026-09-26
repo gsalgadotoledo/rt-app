@@ -257,3 +257,35 @@ ol.rt-wizard-steps li button:disabled{cursor:default}
 .rt-tf-input input,.rt-tf-input textarea{flex:1;min-width:0;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:8px;font:inherit}
 .rt-services .rt-modal>footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;margin:0;border-top:1px solid var(--line)}
 @media(max-width:850px){.rt-tf-layout{grid-template-columns:1fr}}
+
+/* Contracts */
+.rt-contract-controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0 10px}
+.rt-contract-filter{flex:1;min-width:180px;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:6px 8px;font:inherit}
+.rt-contract-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:8px 0 12px}
+.rt-services .rt-contract-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none}
+.rt-services .rt-contract-tabs button[aria-selected=true]{border-bottom-color:var(--accent);color:var(--accent)}
+.rt-contract-summary{margin-bottom:12px}
+.rt-services .rt-contract-summary td,.rt-services .rt-contract-summary th{padding:5px 10px;text-align:center}
+.rt-services .rt-contract-summary td:first-child,.rt-services .rt-contract-summary th:first-child{text-align:left}
+.rt-contract-bad td{color:var(--danger,#ff7a7a)}
+.rt-contract-matrix{max-height:460px}
+.rt-services .rt-contract-matrix td{white-space:normal}
+.rt-contract-matrix td small{display:block;color:var(--muted);font-size:10px}
+.rt-services .rt-contract-matrix th:not(:first-child),.rt-services .rt-contract-matrix td:not(:first-child){text-align:center;width:1%}
+.rt-services button.rt-contract-cell{border:0;background:none;padding:2px 8px;font-size:14px}
+.rt-contract-passed{color:#5fcf80}
+.rt-contract-failed{color:var(--danger,#ff7a7a);font-weight:700}
+.rt-contract-missing{color:var(--muted)}
+.rt-contract-unrecorded{color:#e5b454}
+.rt-contract-skipped{color:var(--muted)}
+.rt-contract-tags{color:var(--muted);font-size:10px;margin-left:6px}
+.rt-contract-cases details{border:1px solid var(--line);border-radius:6px;margin-bottom:8px;padding:8px 12px}
+.rt-contract-cases summary{cursor:pointer;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.rt-contract-cases summary small{color:var(--muted)}
+.rt-contract-description{white-space:pre-wrap}
+.rt-contract-case{border-top:1px solid var(--line);padding:8px 0}
+.rt-contract-case table{border-collapse:collapse;width:100%}
+.rt-services .rt-contract-case td{border:0;padding:2px 6px;white-space:normal;vertical-align:top;font-size:11px}
+.rt-contract-case code{overflow-wrap:anywhere}
+.rt-contract-init{display:block;color:var(--muted);font-size:11px;margin:2px 0}
+.rt-contract-error{color:var(--danger,#ff7a7a)}

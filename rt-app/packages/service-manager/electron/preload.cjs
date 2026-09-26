@@ -28,6 +28,16 @@ contextBridge.exposeInMainWorld('rtAppServices',{
  deployInfo:()=>ipcRenderer.invoke('deploy:info'),
  connectGithub:()=>ipcRenderer.invoke('deploy:connect-github'),
  openDeployments:()=>ipcRenderer.invoke('deploy:open-admin'),
+ contracts:{
+  configs:()=>ipcRenderer.invoke('contracts:configs'),
+  describe:id=>ipcRenderer.invoke('contracts:describe',id),
+  run:(id,options)=>ipcRenderer.invoke('contracts:run',id,options),
+  getRun:(id,runId)=>ipcRenderer.invoke('contracts:get-run',id,runId),
+  history:id=>ipcRenderer.invoke('contracts:history',id),
+  add:()=>ipcRenderer.invoke('contracts:add'),
+  remove:id=>ipcRenderer.invoke('contracts:remove',id),
+  openFile:(id,file)=>ipcRenderer.invoke('contracts:open-file',id,file),
+ },
  terraform:{
   stacks:()=>ipcRenderer.invoke('terraform:stacks'),
   variables:id=>ipcRenderer.invoke('terraform:variables',id),

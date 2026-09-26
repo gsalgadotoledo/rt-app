@@ -76,6 +76,14 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('terraform:get-run',(event,id,runId)=>{trusted(event);if(typeof id!=='string'||typeof runId!=='string')throw new Error('Invalid run');return hub.terraformGetRun(id,runId);});
    ipcMain.handle('terraform:history',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid stack');return hub.terraformHistory(id);});
    ipcMain.handle('terraform:open-link',async(event,link)=>{trusted(event);const url=new URL(String(link));if(url.protocol!=='https:')throw new Error('Only https links can be opened');await shell.openExternal(url.href);});
+   ipcMain.handle('contracts:configs',event=>{trusted(event);return hub.contractConfigs();});
+   ipcMain.handle('contracts:describe',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid config');return hub.contractDescribe(id);});
+   ipcMain.handle('contracts:run',(event,id,options)=>{trusted(event);if(typeof id!=='string'||!options||typeof options!=='object')throw new Error('Invalid request');const {targets=[],filter='',record=false}=options;if(!Array.isArray(targets)||targets.some(t=>typeof t!=='string')||typeof filter!=='string'||typeof record!=='boolean')throw new Error('Invalid options');return hub.contractRun(id,{targets,filter,record});});
+   ipcMain.handle('contracts:get-run',(event,id,runId)=>{trusted(event);if(typeof id!=='string'||typeof runId!=='string')throw new Error('Invalid run');return hub.contractGetRun(id,runId);});
+   ipcMain.handle('contracts:history',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid config');return hub.contractHistory(id);});
+   ipcMain.handle('contracts:add',async event=>{trusted(event);const chosen=await dialog.showOpenDialog(window,{title:'Choose a contracts.json',properties:['openFile'],filters:[{name:'Contracts config',extensions:['json']}]});return chosen.canceled?hub.contractConfigs():hub.contractAdd(chosen.filePaths[0]);});
+   ipcMain.handle('contracts:remove',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid config');return hub.contractRemove(id);});
+   ipcMain.handle('contracts:open-file',async(event,id,file)=>{trusted(event);const {contracts}=await hub.contractDescribe(id);const match=contracts.find(c=>c.file===file);if(!match)throw new Error('Unknown contract file');await shell.openPath(match.file);});
    ipcMain.handle('services:ports',(event,scope,ports)=>{trusted(event);return hub.setPorts(scope,ports);});
    window.on('close',event=>{if(!quitting){event.preventDefault();window.hide();}});
    tray=await createServiceTray({hub,show,quit});
