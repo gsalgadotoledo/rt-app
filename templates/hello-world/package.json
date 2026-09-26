@@ -15,6 +15,8 @@
     "lambda:build": "node apps/lambda-ts/build.mjs",
     "migrate": "node apps/server/dist/migrate.js",
     "seed": "node apps/server/dist/seed.js",
+    "stripe:plans": "node apps/server/dist/stripe-plans.js export",
+    "stripe:link": "node apps/server/dist/stripe-plans.js link",
     "dev:dynamo": "RT_APP_MODE=dynamodb-local npm run dev",
     "setup": "rta install",
     "setup:terminal": "rta setup-terminal",

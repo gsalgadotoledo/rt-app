@@ -67,6 +67,15 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('machine:stop',(event,pid)=>{trusted(event);return hub.stopProcess(pid);});
    ipcMain.handle('machine:detach',(event,label)=>{trusted(event);if(typeof label!=='string')throw new Error('Invalid label');return hub.detachAgent(label);});
    ipcMain.handle('machine:open-port',async(event,port)=>{trusted(event);if(!Number.isInteger(port)||port<1||port>65535)throw new Error('Invalid port');await openLocal(`http://localhost:${port}`);});
+   ipcMain.handle('terraform:stacks',event=>{trusted(event);return hub.terraformStacks();});
+   ipcMain.handle('terraform:variables',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid stack');return hub.terraformVariables(id);});
+   ipcMain.handle('terraform:set-variables',(event,id,values)=>{trusted(event);if(typeof id!=='string'||!values||typeof values!=='object'||Object.values(values).some(v=>typeof v!=='string'))throw new Error('Invalid variables');return hub.terraformSetVariables(id,values);});
+   ipcMain.handle('terraform:globals',event=>{trusted(event);return hub.terraformGlobals();});
+   ipcMain.handle('terraform:set-globals',(event,values)=>{trusted(event);if(!values||typeof values!=='object'||Object.values(values).some(v=>typeof v!=='string'))throw new Error('Invalid variables');return hub.terraformSetGlobals(values);});
+   ipcMain.handle('terraform:run',(event,id,command)=>{trusted(event);if(typeof id!=='string'||typeof command!=='string')throw new Error('Invalid command');return hub.terraformRun(id,command);});
+   ipcMain.handle('terraform:get-run',(event,id,runId)=>{trusted(event);if(typeof id!=='string'||typeof runId!=='string')throw new Error('Invalid run');return hub.terraformGetRun(id,runId);});
+   ipcMain.handle('terraform:history',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid stack');return hub.terraformHistory(id);});
+   ipcMain.handle('terraform:open-link',async(event,link)=>{trusted(event);const url=new URL(String(link));if(url.protocol!=='https:')throw new Error('Only https links can be opened');await shell.openExternal(url.href);});
    ipcMain.handle('services:ports',(event,scope,ports)=>{trusted(event);return hub.setPorts(scope,ports);});
    window.on('close',event=>{if(!quitting){event.preventDefault();window.hide();}});
    tray=await createServiceTray({hub,show,quit});

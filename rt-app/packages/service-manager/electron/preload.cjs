@@ -28,4 +28,15 @@ contextBridge.exposeInMainWorld('rtAppServices',{
  deployInfo:()=>ipcRenderer.invoke('deploy:info'),
  connectGithub:()=>ipcRenderer.invoke('deploy:connect-github'),
  openDeployments:()=>ipcRenderer.invoke('deploy:open-admin'),
+ terraform:{
+  stacks:()=>ipcRenderer.invoke('terraform:stacks'),
+  variables:id=>ipcRenderer.invoke('terraform:variables',id),
+  setVariables:(id,values)=>ipcRenderer.invoke('terraform:set-variables',id,values),
+  globals:()=>ipcRenderer.invoke('terraform:globals'),
+  setGlobals:values=>ipcRenderer.invoke('terraform:set-globals',values),
+  run:(id,command)=>ipcRenderer.invoke('terraform:run',id,command),
+  getRun:(id,runId)=>ipcRenderer.invoke('terraform:get-run',id,runId),
+  history:id=>ipcRenderer.invoke('terraform:history',id),
+  openLink:url=>ipcRenderer.invoke('terraform:open-link',url),
+ },
 });

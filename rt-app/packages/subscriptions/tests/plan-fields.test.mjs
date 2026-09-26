@@ -16,3 +16,17 @@ test('currency catalog and minor units cover zero, two and three decimal currenc
  assert.equal(majorAmount(500,'isk'),5);assert.equal(validMinorAmount(501,'isk'),false);
  assert.equal(currencyDecimals('mga'),0);
 });
+test('Stripe prices created outside the app (Terraform) link to plans without changing versions',async()=>{
+ const {MemoryStore}=await import('@gsalgadotoledo/rt-app-dynamodb');
+ const {Subscriptions}=await import('../dist/index.js');
+ const store=new MemoryStore();const service=new Subscriptions(store,undefined,async()=>{},()=>Date.UTC(2026,8,1));
+ assert.deepEqual(await service.linkStripePrices({pro:{productId:'prod_1',priceId:'price_1'},max:{productId:'prod_2',priceId:'price_2'}},'terraform'),['pro','max']);
+ const plans=(await service.settings()).values.plans;
+ assert.deepEqual(plans.filter(p=>p.stripePriceId).map(p=>[p.id,p.stripeProductId,p.stripePriceId,p.version]),[['pro','prod_1','price_1','0.0.1'],['max','prod_2','price_2','0.0.1']]);
+ assert.deepEqual(await service.linkStripePrices({pro:{productId:'prod_1',priceId:'price_1'}},'terraform'),[],'linking again changes nothing');
+ await assert.rejects(service.linkStripePrices({missing:{productId:'prod_1',priceId:'price_1'}},'t'),/Plan not found/);
+ await assert.rejects(service.linkStripePrices({pro:{productId:'prod_1',priceId:'sk_live_x'}},'t'),/Invalid Stripe ids/);
+ await assert.rejects(service.linkStripePrices({pro:{productId:'prod_1',priceId:'price_2'}},'t'),/one plan only/);
+ const audit=(await store.list('SUB_AUDIT')).items.map(r=>r.data.action);
+ assert.deepEqual(audit,['link-stripe-prices']);
+});

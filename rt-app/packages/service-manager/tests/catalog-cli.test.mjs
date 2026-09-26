@@ -4,7 +4,7 @@ import {createHash} from 'node:crypto';
 import {mkdtemp,rm,mkdir,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {catalog,githubClis,downloadFollowing,checksumFor,installGithubCli,cliPaths,toolService} from '../catalog.mjs';
+import {catalog,githubClis,downloadFollowing,checksumFor,installGithubCli,terraformRelease,cliPaths,toolService} from '../catalog.mjs';
 
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 
@@ -20,8 +20,8 @@ function releaseFetch({tamper=false,version='2.101.0'}={}){
  return async(url,init)=>{assert.equal(init.redirect,'manual');const r=routes[url];if(!r)throw new Error('unexpected '+url);return new Response(r.body??null,{status:r.status,headers:r.location?{location:r.location}:{}});};
 }
 
-test('catalog lists gh and flyctl as CLIs with official release naming',()=>{
- assert.deepEqual(catalog.filter(t=>t.kind==='cli').map(t=>t.id),['gh','flyctl']);
+test('catalog lists gh, flyctl and terraform as CLIs with official release naming',()=>{
+ assert.deepEqual(catalog.filter(t=>t.kind==='cli').map(t=>t.id),['gh','flyctl','terraform']);
  assert.equal(githubClis.gh.asset('2.101.0','arm64'),'gh_2.101.0_macOS_arm64.zip');
  assert.equal(githubClis.gh.asset('2.101.0','x64'),'gh_2.101.0_macOS_amd64.zip');
  assert.equal(githubClis.flyctl.asset('0.4.108','arm64'),'flyctl_0.4.108_macOS_arm64.tar.gz');
@@ -57,4 +57,21 @@ test('installed CLIs are added to PATH and never become services',async t=>{
  await mkdir(join(home,'tools/gh/bin'),{recursive:true});await writeFile(join(home,'tools/gh/bin/gh'),'');
  assert.deepEqual(await cliPaths(home),[join(home,'tools/gh/bin')]);
  assert.equal(await toolService(home,{id:'gh',binary:join(home,'tools/gh/bin/gh')},undefined),null);
+});
+
+test('terraform installs the latest stable HashiCorp release verified by SHA256SUMS',async()=>{
+ const zip=Buffer.from('terraform-zip');
+ const fetchFor=({tamper=false}={})=>async(url,init)=>{
+  assert.equal(init.redirect,'manual');
+  const routes={
+   'https://releases.hashicorp.com/terraform/index.json':JSON.stringify({versions:{'1.9.8':{},'1.16.4':{},'1.10.0':{},'1.17.0-beta1':{},'1.16.10':{}}}),
+   'https://releases.hashicorp.com/terraform/1.16.10/terraform_1.16.10_SHA256SUMS':`${tamper?'0'.repeat(64):sha(zip)}  terraform_1.16.10_darwin_arm64.zip\n${'1'.repeat(64)}  terraform_1.16.10_linux_amd64.zip\n`,
+   'https://releases.hashicorp.com/terraform/1.16.10/terraform_1.16.10_darwin_arm64.zip':zip,
+  };
+  if(!(url in routes))throw new Error('unexpected '+url);
+  return new Response(routes[url]);
+ };
+ const release=await terraformRelease({fetchImpl:fetchFor(),arch:'arm64'});
+ assert.deepEqual([release.version,release.asset,release.binary,release.bytes.toString()],['1.16.10','terraform_1.16.10_darwin_arm64.zip','terraform','terraform-zip'],'numeric order, betas skipped');
+ await assert.rejects(terraformRelease({fetchImpl:fetchFor({tamper:true}),arch:'arm64'}),/checksum mismatch/);
 });

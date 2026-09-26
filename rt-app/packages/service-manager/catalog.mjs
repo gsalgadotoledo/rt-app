@@ -13,6 +13,7 @@ export const catalog=[
  {id:'sqlite',name:'SQLite',kind:'embedded',description:'Local database file and system SQLite CLI. Embedded: no server process or port.'},
  {id:'gh',name:'GitHub CLI',kind:'cli',description:'Official release (checksum verified). Used by rta github connect/sync and deploy workflows. Sign in with gh auth login.'},
  {id:'flyctl',name:'Fly.io CLI',kind:'cli',description:'Official flyctl release (checksum verified). Needed by the Fly.io deploy provider.'},
+ {id:'terraform',name:'Terraform',kind:'cli',description:'Official HashiCorp release (SHA256SUMS verified). Used by the Terraform panel: init, validate, test, plan, apply.'},
  {id:'pgweb',name:'pgweb · PostgreSQL admin',kind:'service',port:8081,description:'Web admin for the local PostgreSQL (official release, SHA-256 verified). Opens with View admin on PostgreSQL.'},
 ];
 
@@ -23,7 +24,7 @@ export const githubClis={
  // No checksum file: verified against the SHA-256 digest GitHub publishes for each release asset.
  pgweb:{repo:'sosedoff/pgweb',asset:(v,arch)=>`pgweb_darwin_${arch==='arm64'?'arm64':'amd64'}.zip`,checksums:null,binary:'pgweb',archiveBinary:arch=>`pgweb_darwin_${arch==='arm64'?'arm64':'amd64'}`},
 };
-const hostAllowed=new Set(['registry.npmjs.org','downloads.mongodb.org','fastdl.mongodb.org','raw.githubusercontent.com','download.redis.io','api.github.com','github.com','release-assets.githubusercontent.com','objects.githubusercontent.com']);
+const hostAllowed=new Set(['registry.npmjs.org','downloads.mongodb.org','fastdl.mongodb.org','raw.githubusercontent.com','download.redis.io','api.github.com','github.com','release-assets.githubusercontent.com','objects.githubusercontent.com','releases.hashicorp.com']);
 async function download(url,max=350*1024*1024){if(!hostAllowed.has(new URL(url).hostname)||new URL(url).protocol!=='https:')throw new Error('Untrusted download URL');const r=await fetch(url,{redirect:'error',signal:AbortSignal.timeout(120000)});if(!r.ok)throw new Error(`Download failed: ${r.status}`);const chunks=[];let size=0;for await(const c of r.body){size+=c.length;if(size>max)throw new Error('Download exceeds size limit');chunks.push(c);}return Buffer.concat(chunks);}
 const json=async url=>JSON.parse((await download(url,12*1024*1024)).toString());
 /** GitHub release assets redirect to a CDN: follow at most 5 hops, each to an allowed HTTPS host. */
@@ -39,6 +40,17 @@ export async function downloadFollowing(url,{fetchImpl=fetch,max=200*1024*1024}=
 }
 /** Expected SHA-256 of one file from a goreleaser-style checksums.txt. */
 export function checksumFor(text,file){const line=text.split('\n').find(l=>l.trim().endsWith('  '+file)||l.trim().endsWith(' '+file));const hash=line?.trim().split(/\s+/)[0];if(!hash||!/^[a-f0-9]{64}$/.test(hash))throw new Error('No checksum for '+file);return hash;}
+/** Latest stable Terraform from releases.hashicorp.com, verified against its SHA256SUMS. */
+export async function terraformRelease({fetchImpl=fetch,arch=process.arch,report=()=>{}}={}){
+ report('Resolving latest Terraform release…');
+ const index=JSON.parse((await downloadFollowing('https://releases.hashicorp.com/terraform/index.json',{fetchImpl,max:8*1024*1024})).toString());
+ const version=Object.keys(index.versions).filter(v=>/^\d+\.\d+\.\d+$/.test(v)).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})).at(-1);
+ if(!version)throw new Error('No stable Terraform release');
+ const asset=`terraform_${version}_darwin_${arch==='arm64'?'arm64':'amd64'}.zip`,base=`https://releases.hashicorp.com/terraform/${version}/`;
+ const expected=checksumFor((await downloadFollowing(base+`terraform_${version}_SHA256SUMS`,{fetchImpl,max:1024*1024})).toString(),asset);
+ report(`Downloading Terraform ${version}…`);const bytes=await downloadFollowing(base+asset,{fetchImpl});verify(bytes,'sha256',expected);
+ return {version,asset,bytes,binary:'terraform',archiveBinary:'terraform',source:base+asset,integrity:expected};
+}
 /** Install a CLI from its latest official release into dest (binary at dest/bin/<name>). */
 export async function installGithubCli(id,stage,{fetchImpl=fetch,arch=process.arch,report=()=>{}}={}){
  const spec=githubClis[id];
@@ -79,8 +91,8 @@ export async function installTool(home,id,report=()=>{}){
    if(!archive?.sha256)throw new Error('No compatible MongoDB archive');report(`Downloading MongoDB ${release}…`);const bytes=await download(archive.url);verify(bytes,'sha256',archive.sha256);await extract(bytes,stage);info={id,version:release,binary:join(dest,'bin/mongod'),source:archive.url,integrity:archive.sha256};
   }else if(id==='redis'){
    await exec('xcrun',['--find','clang']);report('Resolving latest Redis source release…');const hashes=(await download('https://raw.githubusercontent.com/redis/redis-hashes/master/README')).toString();const releases=[...hashes.matchAll(/^hash redis-(\d+\.\d+\.\d+)\.tar\.gz sha256 ([a-f0-9]{64}) /gm)].sort((a,b)=>b[1].localeCompare(a[1],undefined,{numeric:true}));if(!releases.length)throw new Error('No verified Redis release');const [,version,hash]=releases[0],url=`https://download.redis.io/releases/redis-${version}.tar.gz`;report(`Downloading Redis ${version}…`);const bytes=await download(url);verify(bytes,'sha256',hash);await extract(bytes,stage);report('Compiling Redis (this may take a few minutes)…');await exec('make',['-C','src','-j','4','redis-server','redis-cli','BUILD_TLS=no','MALLOC=libc'],{cwd:stage,timeout:600000,maxBuffer:16*1024*1024});info={id,version,binary:join(dest,'src/redis-server'),source:url,integrity:hash};
-  }else if(githubClis[id]){
-   const cli=await installGithubCli(id,stage,{report});
+  }else if(githubClis[id]||id==='terraform'){
+   const cli=id==='terraform'?await terraformRelease({report}):await installGithubCli(id,stage,{report});
    const archive=join(stage,cli.asset);await writeFile(archive,cli.bytes);
    if(cli.asset.endsWith('.zip'))await exec('/usr/bin/ditto',['-x','-k',archive,stage]);else await extract(cli.bytes,stage);
    await rm(archive,{force:true});
@@ -112,7 +124,7 @@ export async function toolService(home,info,port){
   base.command=[info.binary,'--bind','127.0.0.1','--listen','${PGWEB_PORT}','--url',`postgres://rtapp@127.0.0.1:${pgPort}/postgres?sslmode=disable`];
   base.url=`http://localhost:${port}`;base.dependencies=['postgres'];
  }
- else if(githubClis[info.id])return null;
+ else if(githubClis[info.id]||info.id==='terraform')return null;
  else{const file=join(data,'database.sqlite');try{await access(file);}catch(e){if(e.code!=='ENOENT')throw e;await exec(info.binary,[file,'VACUUM;']);}return null;}
  return base;
 }
@@ -120,6 +132,6 @@ export async function toolService(home,info,port){
 /** bin folders of installed CLIs (gh, flyctl), to prepend to PATH for project commands. */
 export async function cliPaths(home){
  const paths=[];
- for(const id of Object.keys(githubClis)){try{await access(join(home,'tools',id,'bin',githubClis[id].binary));paths.push(join(home,'tools',id,'bin'));}catch{}}
+ for(const [id,binary] of [...Object.entries(githubClis).map(([id,spec])=>[id,spec.binary]),['terraform','terraform']]){try{await access(join(home,'tools',id,'bin',binary));paths.push(join(home,'tools',id,'bin'));}catch{}}
  return paths;
 }

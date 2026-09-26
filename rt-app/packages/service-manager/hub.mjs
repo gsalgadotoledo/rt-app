@@ -8,6 +8,7 @@ import {detectProject,projectName,genericServices,genericManifest,excludeFromGit
 import {LaunchAgents,agentLabel} from './launchd.mjs';
 import {MachineProcesses} from './processes.mjs';
 import {adminFor} from './admins.mjs';
+import {TerraformRunner,findStacks} from './terraform.mjs';
 import {createHash as hashOf} from 'node:crypto';
 const jobs=new Map();
 import {readFile,writeFile,mkdir,rename,realpath,readdir} from 'node:fs/promises';
@@ -37,7 +38,7 @@ async function apply(root,config){
 }
 /** Main-process coordinator. Each project retains its own native daemon; common services have one per user. */
 export class ServiceHub {
- constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine}={}){this.home=home;this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();}
+ constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine,terraform}={}){this.home=home;this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();this.terraform=terraform??new TerraformRunner({home});}
  exclusive(fn){const job=this.queue.then(fn);this.queue=job.catch(()=>{});return job;}
  async initialize(){await mkdir(this.home,{recursive:true,mode:0o700});this.registry=await read(join(this.home,'projects.json'),[]);this.global=await read(join(this.home,'settings.json'),{version:1,ports:{smtp:1025,mail:8025},extra:[]});validatePorts(this.global.ports);}
  async select(root){return this.exclusive(async()=>{
@@ -227,6 +228,23 @@ export class ServiceHub {
   if(admin.kind==='start'){await request(this.home,'start',admin.tool);for(let i=0;i<50;i++){const pg=(await request(this.home,'status')).services.find(s=>s.id===admin.tool);if(pg?.state==='running'&&pg.url)return pg.url;await delay(200);}throw new Error(admin.name+' did not start; see its logs in Shared services');}
   throw new Error(admin.kind==='install'?`Install ${admin.name} from Add tools & services first`:admin.description);
  }
+
+ // -- Terraform ----------------------------------------------------------------
+
+ /** Terraform stacks (folders with *.tf, `infra/` first) of every known project. */
+ async terraformStacks(){
+  const stacks=[];
+  for(const project of await this.projects())if(project.kind!=='missing')stacks.push(...await findStacks(project));
+  return Promise.all(stacks.map(async stack=>({...stack,lastRun:(await this.terraform.history(stack))[0]??null})));
+ }
+ async terraformStack(id){const stack=(await this.terraformStacks()).find(s=>s.id===id);if(!stack)throw new Error('Unknown Terraform stack');return stack;}
+ async terraformVariables(id){return this.terraform.variables(await this.terraformStack(id));}
+ async terraformSetVariables(id,values){const stack=await this.terraformStack(id);for(const [name,value] of Object.entries(values))await this.terraform.setVariable(stack,name,value);return this.terraform.variables(stack);}
+ terraformGlobals(){return this.terraform.globals();}
+ async terraformSetGlobals(values){for(const [key,value] of Object.entries(values))await this.terraform.setGlobal(key,value);return this.terraform.globals();}
+ async terraformRun(id,command){return this.terraform.run(await this.terraformStack(id),command);}
+ async terraformGetRun(id,runId){return this.terraform.getRun(await this.terraformStack(id),runId);}
+ async terraformHistory(id){return this.terraform.history(await this.terraformStack(id));}
 
  async discover(){if(await this.isGeneric(this.root)){const saved=await this.genericConfig(this.root);const known=new Set(saved.services.map(s=>s.id));return (await genericServices(this.root)).filter(s=>!known.has(s.id));}const settings=await read(join(this.root,'rt-app.settings.json'));const existing=new Set((settings.services?.extra??[]).map(s=>s.id));return (await discover(this.root)).filter(s=>!existing.has(s.id));}
  addDiscovered(id){return this.exclusive(async()=>{

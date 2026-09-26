@@ -505,6 +505,48 @@ export class Subscriptions {
     });
   }
 
+  /**
+   * Attach Stripe ids created outside the app (e.g. by infra/stripe with Terraform) to plans.
+   * Plan content and versions do not change; returns the ids of the plans that changed.
+   * @example await subscriptions.linkStripePrices({ pro: { productId: "prod_1", priceId: "price_1" } }, "terraform")
+   */
+  async linkStripePrices(
+    links: Record<string, { productId: string; priceId: string }>,
+    actorId: string,
+  ) {
+    const old = await this.store.get("SUB_CONFIG", "settings");
+    if (old?.data.catalogOperation)
+      throw new HttpError(409, "Resume the pending Stripe synchronization before linking prices");
+    const plans: Plan[] = old?.data.plans ?? structuredClone(defaults.plans);
+    for (const [planId, ids] of Object.entries(links)) {
+      if (!plans.some((p) => p.id === planId)) throw new HttpError(404, "Plan not found: " + planId);
+      if (!/^prod_[A-Za-z0-9]{1,250}$/.test(ids?.productId) || !/^price_[A-Za-z0-9]{1,250}$/.test(ids?.priceId))
+        throw new HttpError(400, "Invalid Stripe ids for " + planId);
+    }
+    const linked = plans.filter(
+      (p) => links[p.id] && (p.stripePriceId !== links[p.id].priceId || p.stripeProductId !== links[p.id].productId),
+    );
+    if (!linked.length) return [];
+    const taken = new Set(plans.filter((p) => !links[p.id]).map((p) => p.stripePriceId).filter(Boolean));
+    if (linked.some((p) => taken.has(links[p.id].priceId)) || new Set(Object.values(links).map((l) => l.priceId)).size !== Object.keys(links).length)
+      throw new HttpError(400, "A Stripe price can belong to one plan only");
+    await this.store.transact([
+      write(old ?? undefined, "SUB_CONFIG", "settings", {
+        ...(old?.data ?? structuredClone(defaults)),
+        plans: plans.map((p) =>
+          links[p.id] ? { ...p, stripeProductId: links[p.id].productId, stripePriceId: links[p.id].priceId } : p,
+        ),
+      }),
+      write(undefined, "SUB_AUDIT", randomUUID(), {
+        action: "link-stripe-prices",
+        plans: linked.map((p) => p.id),
+        actorId,
+        at: this.now(),
+      }),
+    ]);
+    return linked.map((p) => p.id);
+  }
+
   private async account(userId: string) {
     return this.store.get("SUB_ACCOUNTS", userId);
   }
