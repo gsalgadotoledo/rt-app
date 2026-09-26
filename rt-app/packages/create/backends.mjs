@@ -2,7 +2,7 @@ import {cp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 export const backends=[
  {id:'node-ts',name:'Node · TypeScript',tools:['node'],description:'Existing RT-App modules and Lambda deployment in TypeScript.'},
- {id:'python',name:'Python',tools:['node','python'],description:'Native local API + Node core for admin/auth/CRUD. AWS deployment pending.'},
+ {id:'python',name:'Python',tools:['node','python'],description:'Native Python API (health, feature flags and your modules) with server, Lambda and CLI modes; other routes use the Node core.'},
  {id:'go',name:'Go',tools:['node','go'],description:'Native local API + Node core for admin/auth/CRUD. AWS deployment pending.'},
  {id:'java',name:'Java',tools:['node','java'],description:'JDK 21 local API + Node core for admin/auth/CRUD. AWS deployment pending.'}
 ];
@@ -33,5 +33,15 @@ export async function generateBackend(target,id,packageRoot){
  // Refuse to silently publish only the TS core while omitting the selected application API.
  if(['go','python'].includes(id))await cp(join(packageRoot,'languages','core-'+id),join(target,'packages','core-'+id),{recursive:true});
  for(const path of ['.github/workflows/deploy.yml','.gitlab-ci.yml'])await rm(join(target,path),{force:true});
- await writeFile(join(directory,'README.md'),`# ${selected.name} API\n\nRun from the project root:\n\n\`\`\`sh\nnpm run dev\n\`\`\`\n\nAWS deployment pending. Existing admin/auth/CRUD routes use the Node core.\n`);
+ await writeFile(join(directory,'README.md'),backendReadme(selected));
+}
+
+/** README of a generated native backend. */
+function backendReadme(selected){
+ const modes={
+  python:'```sh\nnpm run dev                                            # from the project root (with the Node core)\npython main.py                                         # HTTP server on $PORT\npython -m rt_app.web lambda-local app:create_app       # the Lambda handler behind local HTTP\npython -m rt_app.web call app:create_app GET /hello     # one request from the command line\n```\n\nAWS Lambda: `lambda_function.handler`.',
+  go:'```sh\nnpm run dev                          # from the project root (with the Node core)\ngo run . -mode=serve                 # HTTP server on $PORT\ngo run . -mode=lambda-local         # the Lambda handler behind local HTTP\ngo run . -mode=cli GET /hello        # one request from the command line\n```\n\nAWS Lambda: build with `GOOS=linux GOARCH=arm64 go build -tags lambda.norpc -o bootstrap .` (runs as Lambda automatically).',
+ }[selected.id];
+ if(!modes)return `# ${selected.name} API\n\nRun from the project root:\n\n\`\`\`sh\nnpm run dev\n\`\`\`\n\nAWS deployment pending. Existing admin/auth/CRUD routes use the Node core.\n`;
+ return `# ${selected.name} API\n\nThe composition root is \`${selected.id==='python'?'app.py':'main.go'}\`: one line per component (store, feature flags, your modules). Change a line to swap an implementation.\n\nRoutes implemented natively answer here; every other route (admin, auth, users, CRUD…) is forwarded to the RT-App Node core (\`RT_APP_CORE_API_URL\`), so modules can move to ${selected.name} one at a time. The RT-App contracts keep each native module equivalent to its TypeScript reference.\n\n${modes}\n\nStores: memory by default; \`DATABASE_URL\` selects PostgreSQL and \`TABLE_NAME\` DynamoDB, using the same rows as the Node core.\n`;
 }
