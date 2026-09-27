@@ -172,6 +172,7 @@ cases:
     requests:
       - { request: { method: POST, path: /echo, body: { id: 7 } }, expect: { status: 200, body: { $partial: { body: { id: 7 } } } } }
       - { request: { method: POST, path: /echo, query: { q: "1" }, body: { again: { $ref: "0.body.body.id" } } }, expect: { status: 200, body: { body: { again: 7 }, url: "/echo?q=1" } } }
+      - { request: { method: POST, path: "/echo/{{0.body.body.id}}/a b", query: { r: { $ref: "0.body.body.id" } } }, expect: { status: 200, body: { $partial: { url: "/echo/7/a%20b?r=7" } } } }
   - name: raw
     request: { method: POST, path: /echo, raw: "{nope" }
     expect: { status: 400, body: { error: Invalid JSON } }

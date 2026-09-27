@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Case, Contract, Expectation, HttpExpectation } from "./contract.js";
 import { READY } from "./host.js";
-import { compare, expand, type Json } from "./values.js";
+import { compare, expand, lookup, type Json } from "./values.js";
 
 /**
  * A language implementation under test. `host` serves module contracts (host protocol);
@@ -155,7 +155,9 @@ async function runModuleCase(url: string, c: Case, recorded?: Map<string, Expect
 async function runHttpCase(api: string, c: Case): Promise<{ status: Status; message?: string }> {
   const results: Json[] = [];
   for (const [i, { request, expect }] of c.requests.entries()) {
-    const path = request.path + (request.query ? "?" + new URLSearchParams(request.query) : "");
+    // {{0.body.id}} in the path is an earlier result, URL-encoded.
+    const target = request.path.replace(/\{\{([^}]+)\}\}/g, (_, ref: string) => encodeURIComponent(String(lookup(results, ref.trim()))));
+    const path = target + (request.query ? "?" + new URLSearchParams(expand(request.query as Json, results) as Record<string, string>) : "");
     const body = typeof request.raw === "string" ? request.raw : request.body === undefined ? undefined : JSON.stringify(expand(request.body, results));
     const response = await fetch(api + path, { method: request.method, headers: { ...(body ? { "content-type": "application/json" } : {}), ...request.headers }, body });
     const text = await response.text();

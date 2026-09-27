@@ -28,7 +28,8 @@ import type { Json } from "./values.js";
  * Postgres and DynamoDB); `optionalSubjects` lists the ones a host may not provide.
  *
  * `kind: http` contracts test a running API instead: each case has `request` and `expect`
- * (`status`, `body`, `headers`).
+ * (`status`, `body`, `headers`). In a request path, `{{0.body.id}}` is an earlier response of
+ * the same case (URL-encoded); bodies and query values accept `$ref`.
  */
 export interface Expectation {
   value?: Json;
