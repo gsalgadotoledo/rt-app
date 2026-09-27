@@ -14,9 +14,11 @@ from ..errors import HttpError
 
 log = logging.getLogger("rt_app.web")
 
-Access = Literal["guest", "authenticated", "permission", "owner"]
+Access = Literal["guest", "authenticated", "permission", "owner", "service"]
 DEFAULT_BODY_LIMIT = 16 * 1024
 ADMIN_PREFIX = "/admin/app"
+#: Service endpoints (scoped service keys) live under this prefix, and nothing else does.
+SERVICE_PREFIX = "/service/"
 
 
 class Actor(TypedDict):
@@ -86,6 +88,15 @@ class Feature:
     admin: Mapping[str, Any] | None = None
 
 
+class ServicePolicy(Protocol):
+    """What ``App`` needs to serve ``access="service"`` endpoints (``rt_app.service_keys.ServiceKeys``):
+    the service actor of a request and the scope check."""
+
+    def actor_from_request(self, request: Request) -> Any: ...
+
+    def check(self, endpoint: Endpoint, actor: Any = None) -> None: ...
+
+
 class AccessPolicy(Protocol):
     """What ``App`` needs to authorize a request (``rt_app.acl.ACL`` implements it)."""
 
@@ -136,6 +147,7 @@ def admin_only(endpoint: Endpoint) -> bool:
         or path.startswith("/aws/")
         or path in ("/observer/report", "/observer/logs")
         or path.startswith("/subscriptions/admin/")
+        or path.startswith("/service-keys")
     )
 
 
@@ -152,7 +164,10 @@ class App:
       ``auth.actor_from_request``; it may raise ``HttpError`` (401 for a bad token);
     - ``acl`` (e.g. ``rt_app.acl.ACL``) authorizes requests instead of the built-in policy;
     - ``fallback(request)`` answers requests that match no endpoint instead of 404, e.g.
-      ``proxy_to("http://127.0.0.1:4000")`` forwards not-yet-ported routes to the Node core.
+      ``proxy_to("http://127.0.0.1:4000")`` forwards not-yet-ported routes to the Node core;
+    - ``access="service"`` endpoints (paths under ``/service/``, never under ``/admin/app``) take
+      only scoped service keys through ``service`` (e.g. ``rt_app.service_keys.ServiceKeys``);
+      without it they answer 401.
     """
 
     def __init__(
@@ -164,6 +179,7 @@ class App:
         admin_authenticate: Callable[[Request], Actor | None] | None = None,
         acl: AccessPolicy | None = None,
         fallback: Fallback | None = None,
+        service: ServicePolicy | None = None,
     ) -> None:
         self.features = tuple(features)
         self.local_admin = local_admin
@@ -171,12 +187,16 @@ class App:
         self.admin_authenticate = admin_authenticate
         self.acl = acl
         self.fallback = fallback
+        self.service = service
         declared = [endpoint for feature in self.features for endpoint in feature.endpoints]
         endpoints: list[Endpoint] = [e for e in declared if not admin_only(e)] + [
             replace(e, path=ADMIN_PREFIX + e.path) for e in declared if e.access in ("owner", "permission")
         ]
         seen: set[str] = set()
         for endpoint in endpoints:
+            # Service endpoints live under /service/ and nothing else does: one prefix, one credential.
+            if (endpoint.access == "service") != endpoint.path.startswith(SERVICE_PREFIX):
+                raise ValueError(f"Service endpoints must use /service/ paths: {endpoint.method} {endpoint.path}")
             signature = f"{endpoint.method} {endpoint.path}"
             if signature in seen:
                 raise ValueError(f"Duplicate endpoint {signature}")
@@ -217,6 +237,12 @@ class App:
     def _actor(self, endpoint: Endpoint, request: Request) -> Actor | None:
         if endpoint.access == "guest":
             return None
+        if endpoint.access == "service":
+            if self.service is not None:
+                return self.service.actor_from_request(request)
+            if not request.headers.get("authorization"):
+                raise HttpError(401, "Service key required")
+            raise HttpError(401, "Invalid service key")
         if endpoint.path.startswith("/admin/"):
             # The admin has its own identity (TypeScript AdminIdentity): the local root in local
             # mode, otherwise admin_authenticate (e.g. the admin password session).
@@ -226,6 +252,10 @@ class App:
         return self.authenticate(request) if self.authenticate else None
 
     def _check(self, endpoint: Endpoint, actor: Actor | None) -> None:
+        if endpoint.access == "service":
+            assert self.service is not None
+            self.service.check(endpoint, actor)
+            return
         # Admin routes use the admin identity's policy (TypeScript AdminIdentity.acl): only the
         # admin root may call them; roles, grants and explicit grants do not apply there.
         if endpoint.path.startswith("/admin/"):

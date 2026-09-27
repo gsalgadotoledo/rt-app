@@ -39,3 +39,8 @@ __all__ += [
     "AuthVault",
     "LocalMailbox",
 ]
+
+# Scoped service keys for backends (Bearer rtsk_<id>.<secret> on /service/ endpoints).
+from .service_keys import ServiceKeys, parse_service_keys, service_keys_from_env  # noqa: E402
+
+__all__ += ["ServiceKeys", "parse_service_keys", "service_keys_from_env"]
