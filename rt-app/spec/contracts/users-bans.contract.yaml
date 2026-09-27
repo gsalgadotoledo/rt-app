@@ -1,0 +1,341 @@
+contract: 1
+module: users-bans
+subject: userBans
+title: Account bans - suspend users at once, lift temporary bans at until, append-only history
+description: |
+  Reference: packages/users-bans/src/index.ts (writes, history, endpoints), packages/users/src/suspension.ts
+  (row format, activeBan, parseInstant, the admin view) and the gate in packages/auth/src/index.ts.
+  Design and rows: docs/polyglot/users-bans.md. Clock: every method reads the subject clock (init.now,
+  setNow); now = epoch ms.
+
+  Stored ban, on the user row: USERS/<id>.data.ban = {reason, category, until, at, by} (until: ISO
+  8601 with milliseconds and Z, or null = permanent; at: ISO; by: actor id), or null/missing.
+  activeBan(data) = data.ban when it is an object (not an array) and (until == null, or until cannot
+  be read by parseInstant (fail closed), or now < parseInstant(until)); else null. until <= now is
+  lifted: nothing is written when a temporary ban ends. The returned ban has exactly the five fields
+  (missing ones null).
+
+  parseInstant(value): a string matching
+    ^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$
+  (ASCII digits), year >= 1970, a real calendar date (Gregorian leap years), hour <= 23, minute and
+  second <= 59, offset hours <= 23 and minutes <= 59; the fraction is right-padded to milliseconds;
+  the result (epoch ms, offset applied) must be within 0..253402300799999 (9999-12-31T23:59:59.999Z);
+  anything else → null. Never a lenient Date.parse.
+
+  ban(userId, input, actor), in order:
+    1. reason: a string; after JavaScript trim() 3..500 UTF-16 units; else 400 "A reason of 3 to 500
+       characters is required". A non-object input counts as {}.
+    2. until: null/missing → null (permanent); else parseInstant → else 400 "Invalid until: use an
+       ISO 8601 date and time"; <= now → 400 "until must be in the future". Stored normalized
+       (toISOString: milliseconds, Z).
+    3. category: null/missing → null; else a string matching ^[a-z][a-z0-9_-]{0,39}$, else 400
+       "Invalid category".
+    4. user: userId must be a string of at most 100 units, USERS/<id> must exist without deletedAt;
+       else 404 "User not found".
+    5. rules: user id == actor.id → 403 "You cannot ban your own account"; user role "owner" and
+       actor.id != "rt-app-root" (the admin root) → 403 "Only the admin root can ban an owner"; user
+       role "admin" and actor.role != "owner" → 403 "Only an owner can ban an administrator".
+    6. one transaction, the user row expected at its version, the audit row expected absent:
+       USERS/<id>: version + 1, data + {ban: {reason, category, until, at: ISO(now), by: actor.id},
+         tokenVersion: tokenVersion + 1, updatedAt: ISO(now), updatedBy: actor.id}
+       USER_BANS#<id>/pad15(now)-pad10(new user version), version 1:
+         {userId, action, reason, category, until, actorId: actor.id, at: ISO(now)}
+       action = "update" when activeBan(data before) is not null (re-banning replaces reason,
+       until and category; it is not an error), else "ban". A version conflict re-reads the user
+       and repeats 4..6 (4 attempts), then 409 "Conflict: refresh and try again".
+    7. afterwards every live SESSIONS#<id> row gets revokedAt = now, revokedReason = "ban"
+       (separate version-guarded writes; the tokenVersion bump already ended them).
+    → the admin view of the account (below).
+  unban(userId, input, actor): 1 (reason) only, then 4 and 5 with "unban" in the messages
+  ("You cannot unban your own account", "Only the admin root can unban an owner", "Only an owner
+  can unban an administrator"); activeBan(data) null → 409 "User is not banned" (also once a
+  temporary ban expired); then one transaction: data.ban = null, updatedAt/updatedBy (tokenVersion
+  unchanged: sessions ended by the ban stay ended) + audit {userId, action: "unban", reason,
+  category: null, until: null, actorId, at} → the admin view.
+  history(userId): 404 "User not found" when the id is not a short string or USERS/<id> is missing
+  (deleted users keep their history) → {items} of USER_BANS#<id> (all pages), sort key descending
+  (newest first); item {id: sk, userId, action, reason, category, until, actorId, at}.
+
+  Admin view (view = GET /users/:id, list = GET /users; filters gain "banned"): viewUser(data) +
+  {banned: activeBan != null, ban: activeBan}.
+
+  The gate (auth, every language), 403 "Account suspended", only once the credential is proven:
+    login: after the password matched an active account (wrong passwords stay 401), before MFA.
+    consume(login): after the code matched (the code stays unused); consume(reset) is allowed and
+      does not lift the ban; issue sends codes as usual (its reply never changes).
+    verifyMfa: after the challenge and the code format are checked.
+    actor: after the existing checks (a ban always bumps tokenVersion, so old tokens are 401
+      "Invalid session" first).
+    refresh: after the rate limits and the format, when SESSION/<id> and the session row exist and
+      the user is active and banned: 403 when the token's secret hash equals the session's
+      secretHash or previousHash (constant time), else 401 "Invalid session"; nothing is written.
+      This runs before the liveness check (the ban revoked the session).
+
+  Facade helpers: login(email, password, ip), issue(email, purpose, ip), consume(email, code, purpose,
+  ip, password?), refresh(token, ip), actor(header), sessions(userId) are the auth methods over the
+  same store; activeBan(data), parseInstant(value), view(id), list(query), mailbox(), row(pk, sk),
+  endpoints(), setNow(iso).
+init:
+  secret: rt-app-contract-secret-0123456789abcdef
+  now: "2026-01-02T03:04:05.000Z"
+  rows:
+    - &alice { pk: USERS, sk: u-alice, version: 1, data: { id: u-alice, email: alice@example.test, name: Alice, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 1, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: u-alice, deletedAt: null, deletedBy: null } }
+    - &alice-email { pk: EMAIL, sk: alice@example.test, version: 1, data: { id: u-alice } }
+    - &bob { pk: USERS, sk: u-bob, version: 1, data: { id: u-bob, email: bob@example.test, name: Bob, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 1 } }
+    - &bob-email { pk: EMAIL, sk: bob@example.test, version: 1, data: { id: u-bob } }
+    - &olga { pk: USERS, sk: u-olga, version: 1, data: { id: u-olga, email: olga@example.test, name: Olga, role: owner, grants: [], active: true, tokenVersion: 1 } }
+    - &oscar { pk: USERS, sk: u-oscar, version: 1, data: { id: u-oscar, email: oscar@example.test, name: Oscar, role: owner, grants: [], active: true, tokenVersion: 1 } }
+    - &adam { pk: USERS, sk: u-adam, version: 1, data: { id: u-adam, email: adam@example.test, name: Adam, role: admin, grants: [ users.ban ], active: true, tokenVersion: 1 } }
+    - &ada { pk: USERS, sk: u-ada, version: 1, data: { id: u-ada, email: ada@example.test, name: Ada, role: admin, grants: [ users.ban ], active: true, tokenVersion: 1 } }
+    - &dora { pk: USERS, sk: u-dora, version: 3, data: { id: u-dora, email: dora@example.test, name: Dora, role: user, grants: [], active: false, tokenVersion: 2, deletedAt: "2026-01-01T12:00:00.000Z", deletedBy: rt-app-root } }
+    # sessionAlice0000000001 (as in auth-sessions.contract.yaml): live until 2026-01-05T03:04:05Z;
+    # current secret secretTwo2222…, previous secretOne1111….
+    - &a1-pointer { pk: SESSION, sk: sessionAlice0000000001, version: 1, ttl: 1767582245, data: { userId: u-alice } }
+    - &a1 { pk: "SESSIONS#u-alice", sk: sessionAlice0000000001, version: 1, ttl: 1767582245, data: { userId: u-alice, provider: local, tokenVersion: 1, secretHash: a22213d5d1f5f0bd41f7e78cf05c48a7e27ce66e70ab217f512b2e3fb4bfe731, previousHash: 6739169ea1e7c1816f255b48ae4accaebd9dd6e9551cabd56e505dbd9f5edb2e, rotatedAt: 1767322985000, createdAt: 1767236645000, lastUsedAt: 1767322985000, expiresAt: 1767582245000, revokedAt: null, revokedReason: null, ip: 1.1.1.1, userAgent: Fixture/1.0 } }
+x-fixtures:
+  root: &root { id: rt-app-root, role: owner }
+  olgaActor: &olgaActor { id: u-olga, role: owner }
+  adamActor: &adamActor { id: u-adam, role: admin }
+  current: &current "sessionAlice0000000001.secretTwo2222222222222222222222222222222222"
+  previous: &previous "sessionAlice0000000001.secretOne1111111111111111111111111111111111"
+  forged: &forged "sessionAlice0000000001.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  noBan: &noBan { banned: false, ban: null }
+cases:
+  # --- the stored format ----------------------------------------------------------------------
+  - name: parseInstant reads one strict ISO 8601 grammar in every language
+    tags: [ interop, validation ]
+    steps:
+      - { call: parseInstant, args: [ "2026-01-02T03:04:05Z" ], expect: { value: 1767323045000 } }
+      - { call: parseInstant, args: [ "2026-01-02T03:04:05.1Z" ], expect: { value: 1767323045100 } }
+      - { call: parseInstant, args: [ "2026-01-02T03:04:05.123+01:30" ], expect: { value: 1767317645123 } }
+      - { call: parseInstant, args: [ "2026-01-02T03:04:05-05:00" ], expect: { value: 1767341045000 } }
+      - { call: parseInstant, args: [ "2024-02-29T00:00:00Z" ], expect: { value: 1709164800000 } }
+      - { call: parseInstant, args: [ "2000-02-29T23:59:59.999Z" ], expect: { value: 951868799999 } }
+      - { call: parseInstant, args: [ "1970-01-01T00:00:00Z" ], expect: { value: 0 } }
+      - { call: parseInstant, args: [ "9999-12-31T23:59:59.999Z" ], expect: { value: 253402300799999 } }
+      - { call: parseInstant, args: [ "9999-12-31T23:59:59-00:01" ], expect: { value: null }, note: after the maximum once the offset applies }
+      - { call: parseInstant, args: [ "1970-01-01T00:00:00+00:01" ], expect: { value: null }, note: before the epoch }
+      - { call: parseInstant, args: [ "1969-12-31T23:59:59Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2025-02-29T00:00:00Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2100-02-29T00:00:00Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-04-31T00:00:00Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-13-01T00:00:00Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-00T00:00:00Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T24:00:00Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T00:60:00Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T00:00:60Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T00:00:00+24:00" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T00:00:00+01:60" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T03:04:05.1234Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T03:04:05z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T03:04:05" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T03:04Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02 03:04:05Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ " 2026-01-02T03:04:05Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "2026-01-02T03:04:05Z\n" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "+02026-01-02T00:00:00Z" ], expect: { value: null } }
+      - { call: parseInstant, args: [ "٢٠٢٦-01-02T00:00:00Z" ], expect: { value: null }, note: ASCII digits only }
+      - { call: parseInstant, args: [ 1767323045000 ], expect: { value: null } }
+      - { call: parseInstant, args: [ null ], expect: { value: null } }
+
+  - name: activeBan - permanent, temporary until the boundary, fail closed
+    tags: [ clock, interop ]
+    steps:
+      - { call: activeBan, args: [ null ], expect: { value: null } }
+      - { call: activeBan, args: [ {} ], expect: { value: null } }
+      - { call: activeBan, args: [ { ban: null } ], expect: { value: null } }
+      - { call: activeBan, args: [ { ban: "yes" } ], expect: { value: null } }
+      - { call: activeBan, args: [ { ban: [ 1 ] } ], expect: { value: null } }
+      - call: activeBan
+        args: [ { ban: { reason: Spam, category: spam, until: null, at: "2026-01-01T00:00:00.000Z", by: rt-app-root } } ]
+        expect: { value: { reason: Spam, category: spam, until: null, at: "2026-01-01T00:00:00.000Z", by: rt-app-root } }
+      - call: activeBan
+        args: [ { ban: { reason: Spam, category: null, until: "2026-01-02T03:04:05.001Z", at: "2026-01-01T00:00:00.000Z", by: rt-app-root } } ]
+        expect: { value: { reason: Spam, category: null, until: "2026-01-02T03:04:05.001Z", at: "2026-01-01T00:00:00.000Z", by: rt-app-root } }
+      - { call: activeBan, args: [ { ban: { reason: Spam, until: "2026-01-02T03:04:05.000Z" } } ], expect: { value: null }, note: until == now is lifted }
+      - { call: activeBan, args: [ { ban: { reason: Spam, until: "2026-01-02T04:04:05+01:00" } } ], expect: { value: null } }
+      - { call: activeBan, args: [ { ban: { reason: Spam, until: next week } } ], expect: { value: { reason: Spam, category: null, until: next week, at: null, by: null } }, note: an unreadable until keeps the ban }
+      - { call: activeBan, args: [ { ban: {} } ], expect: { value: { reason: null, category: null, until: null, at: null, by: null } } }
+
+  # --- validation and permissions -------------------------------------------------------------
+  - name: ban input is validated in order, before the user is read
+    tags: [ validation ]
+    steps:
+      - { call: ban, args: [ nobody, {}, *root ], expect: { error: { status: 400, message: A reason of 3 to 500 characters is required } } }
+      - { call: ban, args: [ u-bob, { reason: 12345 }, *root ], expect: { error: { status: 400, message: A reason of 3 to 500 characters is required } } }
+      - { call: ban, args: [ u-bob, { reason: "  ab \t" }, *root ], expect: { error: { status: 400, message: A reason of 3 to 500 characters is required } } }
+      - { call: ban, args: [ u-bob, { reason: { $text: { repeat: x, count: 501 } } }, *root ], expect: { error: { status: 400, message: A reason of 3 to 500 characters is required } } }
+      - { call: ban, args: [ u-bob, { reason: { $text: { repeat: "😀", count: 251 } } }, *root ], expect: { error: { status: 400, message: A reason of 3 to 500 characters is required } }, note: 502 UTF-16 units }
+      - { call: ban, args: [ u-bob, { reason: Spam, until: tomorrow }, *root ], expect: { error: { status: 400, message: "Invalid until: use an ISO 8601 date and time" } } }
+      - { call: ban, args: [ u-bob, { reason: Spam, until: 1767409445000 }, *root ], expect: { error: { status: 400, message: "Invalid until: use an ISO 8601 date and time" } } }
+      - { call: ban, args: [ u-bob, { reason: Spam, until: "2026-02-30T00:00:00Z" }, *root ], expect: { error: { status: 400, message: "Invalid until: use an ISO 8601 date and time" } } }
+      - { call: ban, args: [ u-bob, { reason: Spam, until: "2026-01-02T03:04:05.000Z" }, *root ], expect: { error: { status: 400, message: until must be in the future } } }
+      - { call: ban, args: [ u-bob, { reason: Spam, until: "2026-01-02T04:04:05+01:00" }, *root ], expect: { error: { status: 400, message: until must be in the future } } }
+      - { call: ban, args: [ u-bob, { reason: Spam, category: Fraud }, *root ], expect: { error: { status: 400, message: Invalid category } } }
+      - { call: ban, args: [ u-bob, { reason: Spam, category: 5 }, *root ], expect: { error: { status: 400, message: Invalid category } } }
+      - { call: ban, args: [ u-bob, { reason: Spam, category: { $text: { repeat: a, count: 41 } } }, *root ], expect: { error: { status: 400, message: Invalid category } } }
+      - { call: ban, args: [ nobody, { reason: Spam }, *root ], expect: { error: { status: 404, message: User not found } } }
+      - { call: ban, args: [ 42, { reason: Spam }, *root ], expect: { error: { status: 404, message: User not found } } }
+      - { call: ban, args: [ { $text: { repeat: u, count: 101 } }, { reason: Spam }, *root ], expect: { error: { status: 404, message: User not found } } }
+      - { call: ban, args: [ u-dora, { reason: Spam }, *root ], expect: { error: { status: 404, message: User not found } }, note: deleted }
+      - { call: unban, args: [ u-bob, { reason: ab }, *root ], expect: { error: { status: 400, message: A reason of 3 to 500 characters is required } } }
+      - { call: unban, args: [ u-bob, null, *root ], expect: { error: { status: 400, message: A reason of 3 to 500 characters is required } } }
+      - { call: unban, args: [ u-bob, { reason: Nothing to lift }, *root ], expect: { error: { status: 409, message: User is not banned } } }
+      - { call: row, args: [ USERS, u-bob ], expect: { value: *bob }, note: nothing written }
+
+  - name: who can ban whom
+    tags: [ security ]
+    steps:
+      - { call: ban, args: [ u-olga, { reason: Self ban }, *olgaActor ], expect: { error: { status: 403, message: You cannot ban your own account } } }
+      - { call: ban, args: [ u-oscar, { reason: Owner fight }, *olgaActor ], expect: { error: { status: 403, message: Only the admin root can ban an owner } } }
+      - { call: ban, args: [ u-olga, { reason: Coup }, *adamActor ], expect: { error: { status: 403, message: Only the admin root can ban an owner } } }
+      - { call: ban, args: [ u-ada, { reason: Peer ban }, *adamActor ], expect: { error: { status: 403, message: Only an owner can ban an administrator } } }
+      - { call: ban, args: [ u-adam, { reason: Self ban }, *adamActor ], expect: { error: { status: 403, message: You cannot ban your own account } } }
+      - { call: ban, args: [ u-bob, { reason: Admin ban }, *adamActor ], expect: { value: { $partial: { id: u-bob, banned: true, ban: { $partial: { by: u-adam } } } } } }
+      - { call: ban, args: [ u-ada, { reason: Owner ban }, *olgaActor ], expect: { value: { $partial: { id: u-ada, banned: true } } } }
+      - { call: ban, args: [ u-oscar, { reason: Root ban }, *root ], expect: { value: { $partial: { id: u-oscar, banned: true } } } }
+      - { call: unban, args: [ u-oscar, { reason: Owner unban }, *olgaActor ], expect: { error: { status: 403, message: Only the admin root can unban an owner } } }
+      - { call: unban, args: [ u-ada, { reason: Admin unban }, *adamActor ], expect: { error: { status: 403, message: Only an owner can unban an administrator } } }
+      - { call: unban, args: [ u-olga, { reason: Self unban }, *olgaActor ], expect: { error: { status: 403, message: You cannot unban your own account } } }
+      - { call: unban, args: [ u-oscar, { reason: Root unban }, *root ], expect: { value: { $partial: { id: u-oscar, banned: false, ban: null } } } }
+      - { call: unban, args: [ u-bob, { reason: Admin unban }, *adamActor ], expect: { value: { $partial: { id: u-bob, banned: false } } } }
+
+  # --- the immediate cut-off ------------------------------------------------------------------
+  - name: a ban ends every session and access token at once and pins the rows
+    tags: [ sessions, interop ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - call: ban
+        args: [ u-alice, { reason: "  Chargeback fraud  ", until: "2026-01-09T04:04:05+01:00", category: fraud }, *root ]
+        expect:
+          value: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: rt-app-root, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null, banned: true, ban: { reason: Chargeback fraud, category: fraud, until: "2026-01-09T03:04:05.000Z", at: "2026-01-02T03:04:05.000Z", by: rt-app-root } }
+      - call: row
+        args: [ USERS, u-alice ]
+        expect:
+          value: { pk: USERS, sk: u-alice, version: 2, data: { id: u-alice, email: alice@example.test, name: Alice, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 2, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: rt-app-root, deletedAt: null, deletedBy: null, ban: { reason: Chargeback fraud, category: fraud, until: "2026-01-09T03:04:05.000Z", at: "2026-01-02T03:04:05.000Z", by: rt-app-root } } }
+      - call: row
+        args: [ "USER_BANS#u-alice", 001767323045000-0000000002 ]
+        expect:
+          value: { pk: "USER_BANS#u-alice", sk: 001767323045000-0000000002, version: 1, data: { userId: u-alice, action: ban, reason: Chargeback fraud, category: fraud, until: "2026-01-09T03:04:05.000Z", actorId: rt-app-root, at: "2026-01-02T03:04:05.000Z" } }
+      - call: row
+        args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ]
+        expect: { value: { $partial: { version: 2, data: { $partial: { revokedAt: 1767323045000, revokedReason: ban } } } } }
+      - call: row
+        args: [ "SESSIONS#u-alice", sessionAlice0000000001 ]
+        expect: { value: { $partial: { version: 2, data: { $partial: { secretHash: a22213d5d1f5f0bd41f7e78cf05c48a7e27ce66e70ab217f512b2e3fb4bfe731, revokedAt: 1767323045000, revokedReason: ban } } } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] } ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: sessions, args: [ u-alice ], expect: { value: { items: [] } } }
+
+  - name: refresh answers 403 to the holder of the secret and 401 to anyone else, writing nothing
+    tags: [ sessions, security ]
+    steps:
+      - { call: ban, args: [ u-alice, { reason: Abuse reports }, *root ], expect: { value: { $partial: { banned: true } } } }
+      - { call: row, args: [ "SESSIONS#u-alice", sessionAlice0000000001 ], expect: { value: { $partial: { version: 2 } } } }
+      - { call: refresh, args: [ *current, 9.9.9.9 ], expect: { error: { status: 403, message: Account suspended } } }
+      - { call: refresh, args: [ *previous, 9.9.9.9 ], expect: { error: { status: 403, message: Account suspended } }, note: the previous secret still identifies the holder }
+      - { call: refresh, args: [ *forged, 9.9.9.9 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: refresh, args: [ "AAAAAAAAAAAAAAAAAAAAAA.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 9.9.9.9 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: refresh, args: [ garbage, 9.9.9.9 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: row, args: [ "SESSIONS#u-alice", sessionAlice0000000001 ], expect: { value: { $partial: { version: 2, data: { $partial: { revokedReason: ban, previousHash: 6739169ea1e7c1816f255b48ae4accaebd9dd6e9551cabd56e505dbd9f5edb2e } } } } }, note: no rotation and no reuse revocation }
+      - { call: unban, args: [ u-alice, { reason: Appeal accepted }, *root ], expect: { value: { $partial: { banned: false } } } }
+      - { call: refresh, args: [ *current, 9.9.9.9 ], expect: { error: { status: 401, message: Invalid session } }, note: unban never revives a session }
+
+  - name: sign-in is refused only after the credential is proven
+    tags: [ security ]
+    steps:
+      - { call: ban, args: [ u-alice, { reason: Abuse reports }, *root ], expect: { value: { $partial: { banned: true } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 403, message: Account suspended } } }
+      - { call: login, args: [ alice@example.test, wrong horse battery, 1.1.1.1 ], expect: { error: { status: 401, message: Incorrect email or password } } }
+      - { call: issue, args: [ alice@example.test, login, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: mailbox, args: [], expect: { value: [ { email: alice@example.test, code: { $regex: "^\\d{6}$" }, purpose: login } ] } }
+      - { call: consume, args: [ alice@example.test, { $ref: "4.value[0].code" }, login, 1.1.1.1 ], expect: { error: { status: 403, message: Account suspended } } }
+      - { call: unban, args: [ u-alice, { reason: Appeal accepted }, *root ], expect: { value: { $partial: { banned: false } } } }
+      - { call: consume, args: [ alice@example.test, { $ref: "4.value[0].code" }, login, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: the refused code was left unused }
+
+  - name: a password reset works while banned and does not lift the ban
+    tags: [ security ]
+    steps:
+      - { call: ban, args: [ u-alice, { reason: Abuse reports }, *root ], expect: { value: { $partial: { banned: true } } } }
+      - { call: issue, args: [ alice@example.test, reset, 1.1.1.1 ], expect: { value: { message: "If the account supports this method, you will receive a code." } } }
+      - { call: mailbox, args: [], expect: { value: [ { email: alice@example.test, code: { $regex: "^\\d{6}$" }, purpose: reset } ] } }
+      - { call: consume, args: [ alice@example.test, { $ref: "2.value[0].code" }, reset, 1.1.1.1, correct horse battery 2 ], expect: { value: { message: Password updated. Sign in to continue. } } }
+      - { call: login, args: [ alice@example.test, correct horse battery 2, 1.1.1.1 ], expect: { error: { status: 403, message: Account suspended } } }
+      - { call: view, args: [ u-alice ], expect: { value: { $partial: { banned: true } } } }
+
+  # --- temporary bans, unban and idempotency --------------------------------------------------
+  - name: a temporary ban lifts by itself exactly at until
+    tags: [ clock ]
+    steps:
+      - { call: ban, args: [ u-alice, { reason: Cool-down, until: "2026-01-02T04:04:05.000Z" }, *root ], expect: { value: { $partial: { banned: true, ban: { $partial: { until: "2026-01-02T04:04:05.000Z" } } } } } }
+      - { call: setNow, args: [ "2026-01-02T04:04:04.999Z" ], expect: { value: null } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 403, message: Account suspended } } }
+      - { call: view, args: [ u-alice ], expect: { value: { $partial: { banned: true } } } }
+      - { call: setNow, args: [ "2026-01-02T04:04:05.000Z" ], expect: { value: null } }
+      - { call: view, args: [ u-alice ], expect: { value: { $partial: *noBan } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: unban, args: [ u-alice, { reason: Too late }, *root ], expect: { error: { status: 409, message: User is not banned } } }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 2, data: { $partial: { tokenVersion: 2, ban: { reason: Cool-down, category: null, until: "2026-01-02T04:04:05.000Z", at: "2026-01-02T03:04:05.000Z", by: rt-app-root } } } } } }, note: an expiry writes nothing }
+      - { call: ban, args: [ u-alice, { reason: New incident }, *root ], expect: { value: { $partial: { banned: true } } } }
+      - { call: history, args: [ u-alice ], expect: { value: { items: [ { $partial: { action: ban, reason: New incident } }, { $partial: { action: ban, reason: Cool-down } } ] } }, note: after an expiry a ban is new, not an update }
+
+  - name: unban restores sign-in, not the old sessions
+    tags: [ sessions ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: ban, args: [ u-alice, { reason: Abuse reports }, *root ], expect: { value: { $partial: { banned: true } } } }
+      - { call: unban, args: [ u-alice, { reason: "  Appeal accepted  " }, *olgaActor ], expect: { value: { $partial: { banned: false, ban: null, updatedBy: u-olga } } } }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 3, data: { $partial: { tokenVersion: 2, ban: null, updatedBy: u-olga } } } } }, note: unban never bumps tokenVersion }
+      - call: row
+        args: [ "USER_BANS#u-alice", 001767323045000-0000000003 ]
+        expect: { value: { pk: "USER_BANS#u-alice", sk: 001767323045000-0000000003, version: 1, data: { userId: u-alice, action: unban, reason: Appeal accepted, category: null, until: null, actorId: u-olga, at: "2026-01-02T03:04:05.000Z" } } }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] } ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900, user: { $partial: { id: u-alice } } } } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "7.value.token" } ] } ], expect: { value: { $partial: { id: u-alice, tokenVersion: 2 } } } }
+
+  - name: banning a banned account updates it; the history is append-only and newest first
+    tags: [ idempotency, interop ]
+    steps:
+      - { call: ban, args: [ u-bob, { reason: First reason, category: spam }, *root ], expect: { value: { $partial: { banned: true } } } }
+      - { call: setNow, args: [ "2026-01-02T03:05:05.000Z" ], expect: { value: null } }
+      - call: ban
+        args: [ u-bob, { reason: Second reason, until: "2026-02-01T00:00:00Z" }, *adamActor ]
+        expect: { value: { $partial: { banned: true, ban: { reason: Second reason, category: null, until: "2026-02-01T00:00:00.000Z", at: "2026-01-02T03:05:05.000Z", by: u-adam } } } }
+      - { call: row, args: [ USERS, u-bob ], expect: { value: { $partial: { version: 3, data: { $partial: { tokenVersion: 3 } } } } }, note: every ban bumps tokenVersion }
+      - { call: setNow, args: [ "2026-01-02T03:06:05.000Z" ], expect: { value: null } }
+      - { call: unban, args: [ u-bob, { reason: Resolved }, *root ], expect: { value: { $partial: { banned: false } } } }
+      - call: history
+        args: [ u-bob ]
+        expect:
+          value:
+            items:
+              - { id: 001767323165000-0000000004, userId: u-bob, action: unban, reason: Resolved, category: null, until: null, actorId: rt-app-root, at: "2026-01-02T03:06:05.000Z" }
+              - { id: 001767323105000-0000000003, userId: u-bob, action: update, reason: Second reason, category: null, until: "2026-02-01T00:00:00.000Z", actorId: u-adam, at: "2026-01-02T03:05:05.000Z" }
+              - { id: 001767323045000-0000000002, userId: u-bob, action: ban, reason: First reason, category: spam, until: null, actorId: rt-app-root, at: "2026-01-02T03:04:05.000Z" }
+      - { call: history, args: [ u-alice ], expect: { value: { items: [] } } }
+      - { call: history, args: [ u-dora ], expect: { value: { items: [] } }, note: deleted users keep their history }
+      - { call: history, args: [ nobody ], expect: { error: { status: 404, message: User not found } } }
+      - { call: history, args: [ 7 ], expect: { error: { status: 404, message: User not found } } }
+
+  # --- views and endpoints ---------------------------------------------------------------------
+  - name: the user list and view show the ban status; banned is a filter
+    steps:
+      - { call: ban, args: [ u-bob, { reason: Spam, category: spam }, *root ], expect: { value: { $partial: { banned: true } } } }
+      - call: view
+        args: [ u-bob ]
+        expect: { value: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: rt-app-root, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null, banned: true, ban: { reason: Spam, category: spam, until: null, at: "2026-01-02T03:04:05.000Z", by: rt-app-root } } }
+      - { call: view, args: [ u-alice ], expect: { value: { $partial: { id: u-alice, banned: false, ban: null } } } }
+      - { call: view, args: [ u-dora ], expect: { error: { status: 404, message: User not found } } }
+      - { call: list, args: [ { banned: "true" } ], expect: { value: { items: [ { $partial: { id: u-bob, banned: true } } ] } } }
+      - { call: list, args: [ { email: alice } ], expect: { value: { items: [ { $partial: { id: u-alice, banned: false, ban: null } } ] } } }
+
+  - name: endpoints and admin tools
+    steps:
+      - call: endpoints
+        args: []
+        expect:
+          value:
+            - { method: POST, path: "/users/:id/ban", access: permission, resource: users.ban, tool: users_ban }
+            - { method: POST, path: "/users/:id/unban", access: permission, resource: users.ban, tool: users_unban }
+            - { method: GET, path: "/users/:id/bans", access: permission, resource: users.bans.read, tool: users_bans }

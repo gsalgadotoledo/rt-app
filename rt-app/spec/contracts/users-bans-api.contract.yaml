@@ -1,0 +1,85 @@
+contract: 1
+kind: http
+module: users-bans-api
+title: Account bans over HTTP (local mode)
+description: |
+  The users-bans endpoints as every backend language serves them (algorithms, validation order and
+  row formats: users-bans.contract.yaml). Local admin access: /admin/app/* runs as the admin root
+  "rt-app-root"; the plain paths need a signed-in user holding the permission. Users are created with
+  POST /admin/app/users and sign in with POST /auth/login; each case uses its own email.
+    POST /users/:id/ban     permission users.ban        {reason, until?, category?} → admin user view
+    POST /users/:id/unban   permission users.ban        {reason} → admin user view
+    GET  /users/:id/bans    permission users.bans.read  → {items} newest first
+  The admin user view (GET /users, GET /users/:id) = the user view + {banned, ban}. A banned
+  account gets 403 "Account suspended" from sign-in and refresh; its old access tokens are 401.
+cases:
+  - name: ban endpoints need a signed-in user with the permission
+    tags: [ security ]
+    requests:
+      - { request: { method: POST, path: /users/anyone/ban, body: { reason: Spam spam } }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: /users/anyone/unban, body: { reason: Spam spam } }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: GET, path: /users/anyone/bans }, expect: { status: 401, body: { error: Sign in } } }
+      - request: { method: POST, path: /admin/app/users, body: { name: Plain User, email: bans-0@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: POST, path: /auth/login, body: { email: bans-0@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: POST, path: "/users/{{3.body.id}}/ban", headers: { authorization: "Bearer {{4.body.token}}" }, body: { reason: Self ban } }
+        expect: { status: 403, body: { error: You do not have permission to access this resource } }
+
+  - name: validation and missing users
+    tags: [ validation ]
+    requests:
+      - { request: { method: POST, path: /admin/app/users/nobody/ban, body: {} }, expect: { status: 400, body: { error: A reason of 3 to 500 characters is required } } }
+      - { request: { method: POST, path: /admin/app/users/nobody/ban, body: { reason: Spam, until: tomorrow } }, expect: { status: 400, body: { error: "Invalid until: use an ISO 8601 date and time" } } }
+      - { request: { method: POST, path: /admin/app/users/nobody/ban, body: { reason: Spam, until: "2020-01-01T00:00:00Z" } }, expect: { status: 400, body: { error: until must be in the future } } }
+      - { request: { method: POST, path: /admin/app/users/nobody/ban, body: { reason: Spam, category: Not Valid } }, expect: { status: 400, body: { error: Invalid category } } }
+      - { request: { method: POST, path: /admin/app/users/nobody/ban, body: { reason: Spam } }, expect: { status: 404, body: { error: User not found } } }
+      - { request: { method: POST, path: /admin/app/users/nobody/unban, body: { reason: Spam } }, expect: { status: 404, body: { error: User not found } } }
+      - { request: { method: GET, path: /admin/app/users/nobody/bans }, expect: { status: 404, body: { error: User not found } } }
+
+  - name: ban cuts the sessions, refuses sign-in and refresh; unban restores sign-in only
+    tags: [ sessions ]
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: Ban Tester, email: bans-1@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { email: bans-1@example.test } } }
+      - request: { method: POST, path: /auth/login, body: { email: bans-1@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { expiresIn: 900 } } }
+      - request: { method: POST, path: "/admin/app/users/{{0.body.id}}/ban", body: { reason: "  Chargeback fraud  ", category: fraud } }
+        expect:
+          status: 200
+          body: { $partial: { id: { $ref: "0.body.id" }, email: bans-1@example.test, updatedBy: rt-app-root, banned: true, ban: { reason: Chargeback fraud, category: fraud, until: null, at: { $type: iso-date }, by: rt-app-root } } }
+      - request: { method: GET, path: /users/me, headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect: { status: 401, body: { error: Invalid session } }
+        note: the access token stops working at once
+      - request: { method: POST, path: /auth/refresh, body: { refreshToken: { $ref: "1.body.refreshToken" } } }
+        expect: { status: 403, body: { error: Account suspended } }
+      - request: { method: POST, path: /auth/login, body: { email: bans-1@example.test, password: correct horse battery } }
+        expect: { status: 403, body: { error: Account suspended } }
+      - request: { method: POST, path: /auth/login, body: { email: bans-1@example.test, password: wrong horse battery } }
+        expect: { status: 401, body: { error: Incorrect email or password } }
+      - request: { method: GET, path: "/admin/app/users/{{0.body.id}}" }
+        expect: { status: 200, body: { $partial: { banned: true, ban: { $partial: { reason: Chargeback fraud } } } } }
+      - request: { method: GET, path: /admin/app/users, query: { email: bans-1@example.test, banned: "true" } }
+        expect: { status: 200, body: { $partial: { items: [ { $partial: { id: { $ref: "0.body.id" }, banned: true } } ] } } }
+      - request: { method: POST, path: "/admin/app/users/{{0.body.id}}/ban", body: { reason: Second look, until: "2099-01-01T01:00:00+01:00" } }
+        expect: { status: 200, body: { $partial: { banned: true, ban: { reason: Second look, category: null, until: "2099-01-01T00:00:00.000Z", at: { $type: iso-date }, by: rt-app-root } } } }
+        note: banning a banned account updates it
+      - request: { method: POST, path: "/admin/app/users/{{0.body.id}}/unban", body: { reason: Appeal accepted } }
+        expect: { status: 200, body: { $partial: { banned: false, ban: null } } }
+      - request: { method: POST, path: "/admin/app/users/{{0.body.id}}/unban", body: { reason: Again } }
+        expect: { status: 409, body: { error: User is not banned } }
+      - request: { method: POST, path: /auth/refresh, body: { refreshToken: { $ref: "1.body.refreshToken" } } }
+        expect: { status: 401, body: { error: Invalid session } }
+        note: sessions ended by the ban stay ended
+      - request: { method: POST, path: /auth/login, body: { email: bans-1@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { expiresIn: 900 } } }
+      - request: { method: GET, path: /users/me, headers: { authorization: "Bearer {{13.body.token}}" } }
+        expect: { status: 200, body: { $partial: { email: bans-1@example.test } } }
+      - request: { method: GET, path: "/admin/app/users/{{0.body.id}}/bans" }
+        expect:
+          status: 200
+          body:
+            items:
+              - { id: { $regex: "^\\d{15}-0000000004$" }, userId: { $ref: "0.body.id" }, action: unban, reason: Appeal accepted, category: null, until: null, actorId: rt-app-root, at: { $type: iso-date } }
+              - { id: { $regex: "^\\d{15}-0000000003$" }, userId: { $ref: "0.body.id" }, action: update, reason: Second look, category: null, until: "2099-01-01T00:00:00.000Z", actorId: rt-app-root, at: { $type: iso-date } }
+              - { id: { $regex: "^\\d{15}-0000000002$" }, userId: { $ref: "0.body.id" }, action: ban, reason: Chargeback fraud, category: fraud, until: null, actorId: rt-app-root, at: { $type: iso-date } }
