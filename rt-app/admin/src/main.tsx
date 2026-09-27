@@ -158,7 +158,8 @@ function AdminApp({
       void api("/admin/features")
         .then((ids) => setFeatureIds(Array.isArray(ids) ? ids : []))
         .catch(() => setFeatureIds([]));
-  }, [session?.sessionId ?? session?.token, installer]);
+  // Local admin access has no token: key on the user too, or the modules never load.
+  }, [session?.sessionId ?? session?.token ?? session?.user?.id, installer]);
   if (startup === "loading")
     return (
       <main className="setup-shell">

@@ -55,7 +55,8 @@ SESSIONS#<userId> / <sessionId>   {userId, provider, tokenVersion, secretHash, p
 - `provider` is the credential provider at sign-in: `"local"`, the identity provider id
   (`"cognito"`), or `"admin:<16 hex>"` for the admin root (below).
 - `revokedReason`: `"logout"` (current-session logout), `"revoked"` (DELETE /auth/sessions/:id),
-  `"reuse"` (theft detection). Expiry and `tokenVersion` changes write nothing.
+  `"reuse"` (theft detection), `"ban"` (account ban, after its `tokenVersion` bump; see
+  `users-bans.md`). Expiry and other `tokenVersion` changes write nothing.
 - `ip` / `userAgent`: strings only; remove every character outside U+0020–U+007E, then keep the first
   64 / 200 characters; an empty result is `null`. They are informational, never authorization.
 - Every update is `version + 1` with `expected = version read`.
@@ -86,7 +87,10 @@ boundary rule as JWT `exp`).
    new token is now "older" and is theft if used — clients share rotations between tabs (below).
 8. Respond with the same `sessionId` and `refreshExpiresAt`.
 
-Every refresh failure is 401 with the single message **`Invalid session`** (no detail leaks).
+Every refresh failure is 401 with the single message **`Invalid session`** (no detail leaks). The
+one exception is a banned account: right after step 4 (before liveness), when the user is active and
+banned, refresh answers 403 `Account suspended` to whoever presents the session's current or
+previous secret and 401 to anyone else, writing nothing (`docs/polyglot/users-bans.md`).
 
 **actor(header)**: unchanged for tokens without `sid`. With `sid`: after the existing user checks,
 read `SESSIONS#<sub>/<sid>`; not live → 401 `Invalid session`; the actor gets `sessionId`.

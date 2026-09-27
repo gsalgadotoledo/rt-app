@@ -59,9 +59,9 @@ Every sign-in (password, email code, password + TOTP, email change) returns
   send the user to sign in.
 - **Lifetime:** a session ends 4 days after sign-in no matter how often it is refreshed
   (`new Auth(..., {sessionTtlMs})` changes it). Then the user signs in again.
-- **Immediate cut-off:** refresh re-reads the user every time. Deactivating a user, changing their
-  role or grants, a password reset, MFA changes and "log out everywhere" end every session and
-  every access token at once. Revoking one session also stops its access tokens immediately.
+- **Immediate cut-off:** refresh re-reads the user every time. Deactivating or banning a user,
+  changing their role or grants, a password reset, MFA changes and "log out everywhere" end every
+  session and every access token at once. Revoking one session also stops its access tokens immediately.
 - **Your sessions:** `GET /auth/sessions` lists your active sessions (`id, createdAt, lastUsedAt,
   expiresAt, current, ip, userAgent`; never secrets). `DELETE /auth/sessions/:id` ends one.
 - **Logout:** `POST /auth/logout` now ends only the current session (the device you are on);
@@ -96,6 +96,32 @@ Storage choices and XSS trade-offs:
   /auth/sessions` + `DELETE` let users end sessions they do not recognize. An HttpOnly cookie
   would hide the token from scripts, but it needs a same-site API and CSRF protection, which the
   split SPA/API deployment does not have; prefer a strict Content-Security-Policy.
+
+## Account bans
+
+Owners and administrators with the `users.ban` permission suspend an application account at once
+(module `users-bans`, enabled in the starter's `modules.json`): Admin → Users → a user → **Bans**,
+or `POST /users/:id/ban` `{reason, until?, category?}` (tools `users_ban`, `users_unban`,
+`users_bans` for the CLI and MCP).
+
+- **Immediate:** every access token and refresh session of the account stops working on its next
+  request (the ban bumps `tokenVersion`; session rows are marked revoked with reason `ban`).
+- **Refused sign-in:** password, email code, TOTP and refresh answer 403 `Account suspended`, but
+  only after the credential was proven (a wrong password is still 401), so a ban does not reveal
+  which emails exist. The reason is kept for administrators and never shown to the user.
+- **Temporary bans:** with `until` (ISO 8601, in the future) the ban lifts by itself at that
+  instant. Unban (`POST /users/:id/unban {reason}`) lifts a ban early; sessions ended by the ban stay
+  ended and the user signs in again. Banning a banned account updates reason, until and category.
+- **Who:** nobody bans themselves; owners are banned only by the admin root (`ADMIN_PASSWORD`, the
+  admin console); administrators only by owners. A password reset still works while banned and does
+  not lift the ban.
+- **History:** `GET /users/:id/bans` lists every ban, update and unban (who, when, reason, until),
+  newest first; rows are append-only (`USER_BANS#<userId>`). The user list shows a `banned` column
+  and filter.
+
+With Cognito, RT-App enforces the ban on its own sessions; the Cognito user itself is not disabled
+(RT-App never issues a session to a banned account). Formats and algorithms:
+`docs/polyglot/users-bans.md`.
 
 ## Service keys (backend credentials)
 
