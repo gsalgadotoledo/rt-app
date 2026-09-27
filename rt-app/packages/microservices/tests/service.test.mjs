@@ -245,6 +245,20 @@ test("remote feature encodes parameters and forwards only authorization", async 
     ).endpoints[0].handle(c),
     /Remote service/,
   );
+  // "." and ".." would be removed from the URL path and reach another remote route.
+  for (const id of [".", ".."])
+    await assert.rejects(
+      remoteFeature(feature, "https://example.test/api", async () => {
+        throw new Error("must not be called");
+      }).endpoints[0].handle({ ...c, params: { id } }),
+      { status: 400, message: "Invalid route parameter" },
+    );
   assert.throws(() => remoteFeature(feature, "http://example.test"));
+  for (const timeoutMs of [0, 1.5, 2 ** 31, NaN, Infinity])
+    assert.throws(
+      () => remoteFeature(feature, "https://example.test", fetch, timeoutMs),
+      /Invalid remote service configuration/,
+    );
+  assert.ok(remoteFeature(feature, "https://example.test", fetch, 2 ** 31 - 1));
   assert.ok(remoteFeature(feature, "https://example.test"));
 });

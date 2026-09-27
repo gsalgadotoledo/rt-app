@@ -1,0 +1,657 @@
+contract: 1
+module: microservices
+title: Feature hosting and forwarding (createMicroservice, authenticators, remoteFeature)
+description: |
+  @gsalgadotoledo/rt-app-microservices. Reference: packages/microservices/src/index.ts. The module
+  has no endpoints of its own (it hosts other features), so there is no HTTP contract.
+
+  createMicroservice({features, authenticate, invokeMetered?, observe?}). Routes are every endpoint
+  of every feature in declaration order; ":name" segments match [^/]+, other segments literally, and
+  one trailing "/" is allowed. The first declared match wins (no literal-over-parameter priority);
+  methods compare exactly. Two endpoints with the same method and path string → TypeError
+  "Duplicate service route" when the service is created. handle(request) → {status, body, headers:
+  {"x-request-id": <random UUID v4>}}, in this order:
+  1. no route → 404 "Not found" (route "/unmatched");
+  2. a present (truthy) authorization header must match /^Bearer [^\s]+$/i (JavaScript \s) →
+     401 "Invalid authorization"; the token is the header from its 8th character and is passed to
+     authenticate.authenticate(token), whose errors propagate (non-HTTP errors become 500);
+  3. access: guest passes; otherwise a missing or inactive actor → 401 "Sign in"; owner needs role
+     owner (403 "Owner permission required"); permission needs the resource in grants or, unless
+     explicitGrant, role owner (403 "Permission required"); any other access only needs the actor;
+  4. params: decodeURIComponent of each match (last duplicate name wins) → 400 "Invalid route
+     encoding" on malformed escapes or UTF-8;
+  5. the handler gets {request: {...request, headers: {...headers, "x-request-id": id}}, actor,
+     params}; an endpoint with a subscription (any non-null value) runs through
+     invokeMetered(endpoint, actor, work) and fails with 503 "Metering adapter required" without one;
+  6. success → 200 with the handler value; an HttpError → its status and {error: message};
+     anything else → 500 {error: "Internal error"}.
+  observe({requestId, route, status, durationMs}) runs after every request; its failure is ignored.
+
+  SessionAuthenticator(tokens, resolve): tokens.verify(token) (JwtTokens: 401 "Invalid or expired
+  session"), then resolve(claims.id); a missing actor, another id, an inactive actor or tokenVersion
+  !== claims.version → 401 "Invalid or revoked session".
+  SignedJwtAuthenticator(key, issuer, audience, resolve): issuer and audience must be non-empty
+  (TypeError "JWT issuer and audience required"). authenticate verifies a compact JWS as jose
+  jwtVerify does with algorithms [RS256, ES256] and requiredClaims [exp, iat, sub], plus iss and
+  aud (string, or array containing the audience); exp <= now (seconds) is expired, nbf > now is
+  refused, iat/nbf/exp must be numbers when present, a future iat is accepted; crit may only list
+  b64 (b64 false is refused); RSA keys need >= 2048 bits. JWK Set key selection: kty from alg (RSA /
+  EC with crv P-256), kid equal when the token has one, jwk.alg equal when present, use "sig" when
+  present, key_ops containing "verify" when present, public keys only; exactly one candidate.
+  Every failure → 401 "Invalid service JWT". Then resolve(payload); a missing actor, actor.id !==
+  payload.sub or an inactive actor → 401 "Inactive service identity".
+  remoteJwtAuthenticator(jwksUrl, …): the URL must parse (TypeError "Invalid URL") and be https:
+  without credentials (TypeError "JWKS requires HTTPS"); keys are fetched from that URL only.
+
+  remoteFeature(feature, baseUrl, transport = fetch, timeoutMs = 10000): baseUrl must parse
+  ("Invalid URL") and be https: without username, password, query or fragment, and timeoutMs an
+  integer from 1 to 2147483647 (TypeError "Invalid remote service configuration"). The result keeps
+  the feature and every endpoint field, with migrations: [] and forwarding handlers: path = endpoint
+  path with each :name (/[A-Za-z0-9_]+/) replaced by encodeURIComponent(params[name])
+  ("undefined" when missing; "." or ".." → 400 "Invalid route parameter"); URL = base with pathname
+  base.pathname minus one trailing "/" + path, and search = URLSearchParams(request.query) (form
+  encoding: space "+", everything but *-._ and alphanumerics escaped, nothing when empty). Headers
+  {content-type: application/json, authorization (only when present)}; no other header is
+  forwarded. Body: JSON.stringify(request.body) except for GET and HEAD. Redirects are errors; the
+  request times out after timeoutMs. A non-2xx answer → HttpError(status, "Remote service request
+  failed") (the body is discarded); 204 → null; otherwise the JSON body. Transport errors propagate.
+
+  Facades. microservice: init {features: [{id, endpoints: [{method, path, access, resource,
+  explicitGrant?, subscription?, reply?}]}], tokens: {token: actor | {error: {status?, message}}}
+  (unknown tokens → 401 "Unknown token"), metering: null | {} (runs the work) | {error}, observe:
+  "record" | "fail" | "none"}. reply {value} returns it, {error: {status?, message}} throws
+  (HttpError with status), none echoes {params, actor, headers}. Methods: handle(request) (defaults
+  method GET, path /, headers {}, query {}, body {}), authentications(), observations(), metered()
+  ({resource, subscription, actor id}). session-authenticator: init {secret, now, issuer?, audience?,
+  actors: {id: actor}}; authenticate(token), issue(user), resolved() (ids), setNow(iso).
+  signed-jwt-authenticator: init {jwks, issuer, audience, actors: {String(sub): actor}};
+  authenticate(token), resolved() (payloads), remote(url, issuer, audience) → null.
+  remote-feature: init {feature, baseUrl, timeoutMs?, responses: [{status, json} | {status, text} |
+  {status} | {network: message}]}; call(index, {params, request}), requests() ({url, method, headers,
+  body, redirect, timeout: true when a timeout applies}), feature() (without handlers).
+subject: microservice
+fixtures:
+  actor: &actor { id: u, role: user, grants: [ x.read ], active: true, tokenVersion: 1 }
+  owner: &owner { id: o, role: owner, grants: [], active: true, tokenVersion: 1 }
+  feature: &xfeature
+    id: x
+    endpoints:
+      - { method: GET, path: "/x/:id", resource: x.read, access: permission }
+  features: &x [ *xfeature ]
+  jwks: &jwks { "keys": [ { "kty": "RSA", "n": "2c69hn3A5anv3tR4oN6zVeXi5Y6gzvh_VT2tEus9Esane7ZPBoCA1jiAWwEnhN-YEtsVwp_CnSGMA-_ebl6fAFrMdbyT9pjXjCycQX5Jcsl-1kYw08zqzpvlaG8SYpJ_qlkgUXznRkjginGqoJEh9KiEZCMAkpBqRhoPCwZghM1mwPSYVvqgDLusOQ_WBIANr7c69VKTr6cFEQmNViBIoof1OCOoE13BHT95iBWvNrHbhfIdvhKDkcL6JakTS-QsIgz7MukqUWf-RubtDKcvlZDWnlorvcHEyNdysbMtH3_wv8miGKXaQl5Hsi6APb5xSY7DwTU2pHWbyHeD7E074Q", "e": "AQAB", "kid": "rsa-1", "alg": "RS256", "use": "sig" }, { "kty": "EC", "x": "TggizCAqGeduFzf-HVYXUZOAxazeF0lQchig43EgKXQ", "y": "5_KWNH7NmqNb2qc3iCCl3Wp4Go6mwlTyssuiAZnLsqk", "crv": "P-256", "kid": "ec-1" }, { "kty": "EC", "x": "hogImzrhfr0u77rhZlznLrsKhrJ9Z3G87mo4XQhhXZvcGOPjS0AFDHGFwArT9OOB", "y": "KQqMq8FqU2hkWlqNtsY-TwncEwp21W0zyUmSbOAq0FNRFxR5jAUaDrIGPFS64l2K", "crv": "P-384", "kid": "ec-384" }, { "kty": "RSA", "n": "xeDijak5xUbO9HTGlArZb81mGiI2dZBpiGHedlLnjAlQR0WuPEJCXDEoJyiRKrzPLi1a3J20X2l-43-SYMxySurUNCKJCQ02umS0xkt4aBgpTMpPyZ5vRaxsNlET97bj8Ve5HciDRrxlyr7sOtYZde2134qdZ2Ucjd-wVcvBkOlxn_yQSMYn0itw2Zpi3WUHwElYtjDTfVjQo2TGhka_3jWtoY55U91iw8w3qNifQybFmLp-7Q0Zg-dF5nRw-INPku8u72hJqdTQ65RU_hiC5AiLpJeK6yPd8zcKQHqDDm9dlQbTvJqvmmow9M7IhDYCvVKoEvYGi7QlpizqH8xx0w", "e": "AQAB", "kid": "rsa-enc", "use": "enc" }, { "kty": "RSA", "n": "xeDijak5xUbO9HTGlArZb81mGiI2dZBpiGHedlLnjAlQR0WuPEJCXDEoJyiRKrzPLi1a3J20X2l-43-SYMxySurUNCKJCQ02umS0xkt4aBgpTMpPyZ5vRaxsNlET97bj8Ve5HciDRrxlyr7sOtYZde2134qdZ2Ucjd-wVcvBkOlxn_yQSMYn0itw2Zpi3WUHwElYtjDTfVjQo2TGhka_3jWtoY55U91iw8w3qNifQybFmLp-7Q0Zg-dF5nRw-INPku8u72hJqdTQ65RU_hiC5AiLpJeK6yPd8zcKQHqDDm9dlQbTvJqvmmow9M7IhDYCvVKoEvYGi7QlpizqH8xx0w", "e": "AQAB", "kid": "rsa-384", "alg": "RS384" }, { "kty": "RSA", "n": "xeDijak5xUbO9HTGlArZb81mGiI2dZBpiGHedlLnjAlQR0WuPEJCXDEoJyiRKrzPLi1a3J20X2l-43-SYMxySurUNCKJCQ02umS0xkt4aBgpTMpPyZ5vRaxsNlET97bj8Ve5HciDRrxlyr7sOtYZde2134qdZ2Ucjd-wVcvBkOlxn_yQSMYn0itw2Zpi3WUHwElYtjDTfVjQo2TGhka_3jWtoY55U91iw8w3qNifQybFmLp-7Q0Zg-dF5nRw-INPku8u72hJqdTQ65RU_hiC5AiLpJeK6yPd8zcKQHqDDm9dlQbTvJqvmmow9M7IhDYCvVKoEvYGi7QlpizqH8xx0w", "e": "AQAB", "kid": "rsa-ops", "key_ops": [ "sign" ] }, { "kty": "RSA", "n": "xeDijak5xUbO9HTGlArZb81mGiI2dZBpiGHedlLnjAlQR0WuPEJCXDEoJyiRKrzPLi1a3J20X2l-43-SYMxySurUNCKJCQ02umS0xkt4aBgpTMpPyZ5vRaxsNlET97bj8Ve5HciDRrxlyr7sOtYZde2134qdZ2Ucjd-wVcvBkOlxn_yQSMYn0itw2Zpi3WUHwElYtjDTfVjQo2TGhka_3jWtoY55U91iw8w3qNifQybFmLp-7Q0Zg-dF5nRw-INPku8u72hJqdTQ65RU_hiC5AiLpJeK6yPd8zcKQHqDDm9dlQbTvJqvmmow9M7IhDYCvVKoEvYGi7QlpizqH8xx0w", "e": "AQAB", "kid": "rsa-ops-ok", "key_ops": [ "verify" ] }, { "kty": "RSA", "n": "yosNs0q3lxfhjvICK97iLLcYW0V-VACBIJy7-PqtkMhTcexAi8Fo52gOoOzaEvKrRaqFVddrZHrWs4B0b69HCRvL7HFYrSi6XSgZuxYGqhsMHw0f2VZzxPUH84qEQylijpWKm4IN_APHnHUDEkE3pt-8IxDMrG1JOxJGt9Z-W0E", "e": "AQAB", "kid": "rsa-small" }, { "kty": "RSA", "n": "xeDijak5xUbO9HTGlArZb81mGiI2dZBpiGHedlLnjAlQR0WuPEJCXDEoJyiRKrzPLi1a3J20X2l-43-SYMxySurUNCKJCQ02umS0xkt4aBgpTMpPyZ5vRaxsNlET97bj8Ve5HciDRrxlyr7sOtYZde2134qdZ2Ucjd-wVcvBkOlxn_yQSMYn0itw2Zpi3WUHwElYtjDTfVjQo2TGhka_3jWtoY55U91iw8w3qNifQybFmLp-7Q0Zg-dF5nRw-INPku8u72hJqdTQ65RU_hiC5AiLpJeK6yPd8zcKQHqDDm9dlQbTvJqvmmow9M7IhDYCvVKoEvYGi7QlpizqH8xx0w", "e": "AQAB", "d": "Vv8I-7kTwgzgfg89IucmM4Y9Rm4WPVexXhmRIbpPPHz3w236LVoALOIbwiOOtxhtieK82NOo8m3CMKjspQwdj5xwkT9Bui4KCqat56RUmodM2Qr1SzIRv7MPnE3HFphc3MVxiIuYU6gOpLWNzExGw1cwJ8icbVHB3QokT4QWZOvGqmbHiuV1CKtucNlpqZMsS3q2tPb79tkSDnokPvSZ0dRwYkZttJsgukCPOgpFAzWy8D8oX7yXWMEWk13yzXC9GPd0nzbge4n2WYicEcJmneeEDkxywzjGYn2u__zDB2Q8GqeorPbaq71qSidfcbOClV5jFGmqr-4FjAOR-XA3UQ", "p": "9ixlr-4zdOmh6vXFLGMBZ0EWnlDw2SRazEdsF8r8DUnS883mwcVHwVCnUtpp1gq8-5Gom8y4z-6YWqJlBniVBQaH2W6tlRmhw4cVsZ1ekWn6TUoI7HfbFHNHfFq_cZx6nDjns6rZ3wGqZJGT6NyM6dcVOkxMR5GIixFLYPg-OGk", "q": "zcb4UT0zG2lB1r1oNWTsvVKPecdVNFvF3Y3bth96oiygMIgCzhIpgfMTLpTBsLq4r4G5ihL3eapF0WXfFK1fRoIp0ZnTHWIlKEhdknwB861x0RbSvR-1WJaeRWQMljXkVy16Y0clhzYQaR7mPWhSFcpuOHfx_zfuhByEOhQ6sNs", "dp": "SQOWDX5LCMwa2EOY_bdHvUZS3RYIuX7M53Xvm4b7Bz30MZfKb4KB69ZuKmbZqUB6GOt05PDth86upYMxD6BIIrtzI4xuM6Dsl7_DMXEJkXurX60rxGcwNXqTo1CPI7VTsG44WtO71yb5UObUxeZUbS77_tSOc1O4-fZhMxut6LE", "dq": "bSaskxMeZ9zWUpzXiPMG7Im9l0AXvxUrCJF1yM4704hOVE_hBQP3Rnn0Y9H-R8tTqazrCQV0hfG-5QrfYO1xy0nB-u9YX46u3QY9tDTZKDOJWvp7QFxwahRC0dX3Izpk66Uw9TZI_sa7v7bnNA2A9RQSkRt2nwVBHIyvysruMt8", "qi": "8JFXBobW83D8o3Q_Ce2A5IWRPtHtR2LnRPUkO0alnQQng-3SoAkpR4wx5s5lHzrQowIanIS2RwBwYRmezuX6IidyQfGgadqQBD9aagL9kpjf8wzGhgnhPaEpKHaKUh1WSZC-dauCpy1oXL_gZ4mriMe_szhwOPWXNqptIVHaUD8", "kid": "rsa-private" } ] }
+  single: &single { "keys": [ { "kty": "RSA", "n": "2c69hn3A5anv3tR4oN6zVeXi5Y6gzvh_VT2tEus9Esane7ZPBoCA1jiAWwEnhN-YEtsVwp_CnSGMA-_ebl6fAFrMdbyT9pjXjCycQX5Jcsl-1kYw08zqzpvlaG8SYpJ_qlkgUXznRkjginGqoJEh9KiEZCMAkpBqRhoPCwZghM1mwPSYVvqgDLusOQ_WBIANr7c69VKTr6cFEQmNViBIoof1OCOoE13BHT95iBWvNrHbhfIdvhKDkcL6JakTS-QsIgz7MukqUWf-RubtDKcvlZDWnlorvcHEyNdysbMtH3_wv8miGKXaQl5Hsi6APb5xSY7DwTU2pHWbyHeD7E074Q", "e": "AQAB", "kid": "rsa-1", "alg": "RS256", "use": "sig" }, { "kty": "EC", "x": "TggizCAqGeduFzf-HVYXUZOAxazeF0lQchig43EgKXQ", "y": "5_KWNH7NmqNb2qc3iCCl3Wp4Go6mwlTyssuiAZnLsqk", "crv": "P-256", "kid": "ec-1" }, { "kty": "EC", "x": "hogImzrhfr0u77rhZlznLrsKhrJ9Z3G87mo4XQhhXZvcGOPjS0AFDHGFwArT9OOB", "y": "KQqMq8FqU2hkWlqNtsY-TwncEwp21W0zyUmSbOAq0FNRFxR5jAUaDrIGPFS64l2K", "crv": "P-384", "kid": "ec-384" } ] }
+  serviceActors: &serviceActors { svc: { id: svc, role: user, grants: [ inventory.read ], active: true }, "5": { id: "5", role: user, grants: [], active: true }, sleepy: { id: sleepy, role: user, grants: [], active: false } }
+init:
+  features: *x
+  tokens: { good: *actor, boss: *owner }
+cases:
+  # --- hosting ----------------------------------------------------------------------------------
+  - name: hosts a feature endpoint with the authenticated actor and a generated request id
+    steps:
+      - call: handle
+        args: [ { method: GET, path: /x/42, headers: { authorization: Bearer good, x-user-id: evil, x-request-id: forged } } ]
+        expect:
+          value:
+            status: 200
+            body:
+              params: { id: "42" }
+              actor: *actor
+              headers: { authorization: Bearer good, x-user-id: evil, x-request-id: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" } }
+            headers: { x-request-id: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" } }
+      - { call: authentications, expect: { value: [ good ] } }
+      - { call: observations, expect: { value: [ { requestId: { $ref: "0.value.headers.x-request-id" }, route: "/x/:id", status: 200, durationMs: { $type: number } } ] } }
+      - { call: handle, args: [ { path: /x/42, headers: { authorization: Bearer good } } ], expect: { value: { $partial: { status: 200 } } } }
+
+  - name: the handler sees the same request id as the response
+    steps:
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: Bearer good } } ], expect: { value: { $partial: { status: 200 } } } }
+      - { call: observations, expect: { value: [ { requestId: { $ref: "0.value.body.headers.x-request-id" }, route: "/x/:id", status: 200, durationMs: { $type: number } } ] } }
+      - { call: observations, expect: { value: [ { requestId: { $ref: "0.value.headers.x-request-id" }, route: "/x/:id", status: 200, durationMs: { $type: number } } ] } }
+
+  - name: unknown routes answer 404 before authentication
+    steps:
+      - { call: handle, args: [ { path: /no, headers: { authorization: Bearer good } } ], expect: { value: { status: 404, body: { error: Not found }, headers: { x-request-id: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" } } } } }
+      - { call: handle, args: [ { method: POST, path: /x/1 } ], expect: { value: { $partial: { status: 404, body: { error: Not found } } } }, note: methods compare exactly }
+      - { call: handle, args: [ { method: get, path: /x/1 } ], expect: { value: { $partial: { status: 404 } } } }
+      - { call: handle, args: [ { path: /x/1/2 } ], expect: { value: { $partial: { status: 404 } } } }
+      - { call: handle, args: [ { path: /x/ } ], expect: { value: { $partial: { status: 404 } } } }
+      - { call: handle, args: [ { path: /x/1// } ], expect: { value: { $partial: { status: 404 } } } }
+      - { call: authentications, expect: { value: [] } }
+      - { call: observations, expect: { value: [ { $partial: { route: /unmatched, status: 404 } }, { $partial: { route: /unmatched, status: 404 } }, { $partial: { route: /unmatched, status: 404 } }, { $partial: { route: /unmatched, status: 404 } }, { $partial: { route: /unmatched, status: 404 } }, { $partial: { route: /unmatched, status: 404 } } ] } }
+
+  - name: routes allow one trailing slash and escape literal segments
+    init:
+      tokens: { good: *actor }
+      features:
+        - id: f
+          endpoints:
+            - { method: GET, path: /files/a.b, resource: f.read, access: guest, reply: { value: literal } }
+            - { method: GET, path: "/files/:name/raw", resource: f.read, access: guest }
+            - { method: GET, path: "/pairs/:id/sub/:id", resource: f.read, access: guest }
+            - { method: GET, path: "/u/:id", resource: f.read, access: guest }
+            - { method: GET, path: /u/me, resource: f.read, access: guest, reply: { value: me } }
+    steps:
+      - { call: handle, args: [ { path: /files/a.b/ } ], expect: { value: { $partial: { status: 200, body: literal } } } }
+      - { call: handle, args: [ { path: /files/aXb } ], expect: { value: { $partial: { status: 404 } } } }
+      - { call: handle, args: [ { path: /files/x%20y/raw/ } ], expect: { value: { $partial: { status: 200, body: { params: { name: x y }, actor: null, headers: { x-request-id: { $type: string } } } } } } }
+      - { call: handle, args: [ { path: /pairs/1/sub/2 } ], expect: { value: { $partial: { status: 200, body: { $partial: { params: { id: "2" } } } } } }, note: the last duplicate name wins }
+      - { call: handle, args: [ { path: /u/me } ], expect: { value: { $partial: { status: 200, body: { $partial: { params: { id: me } } } } } }, note: the first declared route wins }
+
+  - name: parameters are URL-decoded after authorization
+    init:
+      tokens: { good: *actor }
+      features:
+        - id: x
+          endpoints:
+            - { method: GET, path: "/x/:id", resource: x.read, access: permission }
+            - { method: GET, path: "/g/:id", resource: g.read, access: guest }
+    steps:
+      - { call: handle, args: [ { path: /x/%E0, headers: { authorization: Bearer good } } ], expect: { value: { status: 400, body: { error: Invalid route encoding }, headers: { x-request-id: { $type: string } } } } }
+      - { call: handle, args: [ { path: /x/%E0 } ], expect: { value: { $partial: { status: 401, body: { error: Sign in } } } }, note: access is checked first }
+      - { call: handle, args: [ { path: /g/a%2Fb%20%C3%A9+%F0%9F%98%80 } ], expect: { value: { $partial: { status: 200, body: { $partial: { params: { id: "a/b é+😀" } } } } } } }
+      - { call: handle, args: [ { path: /g/%zz } ], expect: { value: { $partial: { status: 400, body: { error: Invalid route encoding } } } } }
+      - { call: handle, args: [ { path: /g/% } ], expect: { value: { $partial: { status: 400 } } } }
+      - { call: handle, args: [ { path: /g/%C0%AF } ], expect: { value: { $partial: { status: 400 } } }, note: overlong UTF-8 }
+      - { call: handle, args: [ { path: /g/%ED%A0%80 } ], expect: { value: { $partial: { status: 400 } } }, note: an encoded surrogate }
+      - { call: handle, args: [ { path: /g/%F4%90%80%80 } ], expect: { value: { $partial: { status: 400 } } }, note: above U+10FFFF }
+      - { call: handle, args: [ { path: /g/%41%62 } ], expect: { value: { $partial: { status: 200, body: { $partial: { params: { id: Ab } } } } } } }
+      - { call: handle, args: [ { path: /g/é } ], expect: { value: { $partial: { status: 200, body: { $partial: { params: { id: é } } } } } } }
+      - { call: observations, expect: { value: [ { $partial: { route: "/x/:id", status: 400 } }, { $partial: { route: "/x/:id", status: 401 } }, { $partial: { route: "/g/:id", status: 200 } }, { $partial: { route: "/g/:id", status: 400 } }, { $partial: { route: "/g/:id", status: 400 } }, { $partial: { route: "/g/:id", status: 400 } }, { $partial: { route: "/g/:id", status: 400 } }, { $partial: { route: "/g/:id", status: 400 } }, { $partial: { route: "/g/:id", status: 200 } }, { $partial: { route: "/g/:id", status: 200 } } ] } }
+
+  - name: duplicate routes are refused when the service is created
+    init:
+      features:
+        - { id: a, endpoints: [ { method: GET, path: "/x/:id", resource: a, access: guest } ] }
+        - { id: b, endpoints: [ { method: GET, path: "/x/:id", resource: b, access: guest } ] }
+    create: { error: { message: Duplicate service route } }
+
+  - name: routes differing in method, parameter name or trailing slash are distinct
+    init:
+      features:
+        - id: a
+          endpoints:
+            - { method: GET, path: "/x/:id", resource: a, access: guest, reply: { value: 1 } }
+            - { method: POST, path: "/x/:id", resource: a, access: guest, reply: { value: 2 } }
+            - { method: GET, path: "/x/:other", resource: a, access: guest, reply: { value: 3 } }
+            - { method: GET, path: "/x/:id/", resource: a, access: guest, reply: { value: 4 } }
+    steps:
+      - { call: handle, args: [ { path: /x/1 } ], expect: { value: { $partial: { status: 200, body: 1 } } } }
+      - { call: handle, args: [ { method: POST, path: /x/1 } ], expect: { value: { $partial: { status: 200, body: 2 } } } }
+
+  # --- authentication ---------------------------------------------------------------------------
+  - name: the authorization header must be one Bearer token
+    steps:
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: Basic good } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } } }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: "Bearer good extra" } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } } }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: "Bearer  good" } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } } }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: "Bearer\tgood" } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } } }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: "Bearer good " } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } }, note: JavaScript \s includes NBSP }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: "Bearer good\n" } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } }, note: $ accepts no trailing newline }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: "Bearer " } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } } }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: Bearer } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } } }
+      - { call: authentications, expect: { value: [] } }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: bEARER good } } ], expect: { value: { $partial: { status: 200 } } }, note: the scheme is case-insensitive }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: "Bearer go​od" } } ], expect: { value: { $partial: { status: 401, body: { error: Unknown token } } } }, note: U+200B is not whitespace }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: "Bearer a.b-c_~+/=" } } ], expect: { value: { $partial: { status: 401, body: { error: Unknown token } } } } }
+      - { call: authentications, expect: { value: [ good, "go​od", "a.b-c_~+/=" ] } }
+
+  - name: requests without authorization are anonymous
+    init:
+      tokens: {}
+      features:
+        - id: x
+          endpoints:
+            - { method: GET, path: /public, resource: x.public, access: guest }
+            - { method: GET, path: /private, resource: x.private, access: authenticated }
+    steps:
+      - { call: handle, args: [ { path: /public } ], expect: { value: { $partial: { status: 200, body: { params: {}, actor: null, headers: { x-request-id: { $type: string } } } } } } }
+      - { call: handle, args: [ { path: /public, headers: { authorization: "" } } ], expect: { value: { $partial: { status: 200 } } }, note: an empty header is absent }
+      - { call: handle, args: [ { path: /private } ], expect: { value: { $partial: { status: 401, body: { error: Sign in } } } } }
+      - { call: handle, args: [ { path: /public, headers: { authorization: Bearer nobody } } ], expect: { value: { $partial: { status: 401, body: { error: Unknown token } } } }, note: a present token is verified even on guest endpoints }
+      - { call: handle, args: [ { path: /public, headers: { authorization: Basic x } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid authorization } } } } }
+
+  - name: authenticator failures keep HTTP errors and hide the others
+    init:
+      features: *x
+      tokens: { revoked: { error: { status: 401, message: Invalid or revoked session } }, teapot: { error: { status: 418, message: short and stout } }, broken: { error: { message: database password leaked } } }
+    steps:
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: Bearer revoked } } ], expect: { value: { $partial: { status: 401, body: { error: Invalid or revoked session } } } } }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: Bearer teapot } } ], expect: { value: { $partial: { status: 418, body: { error: short and stout } } } } }
+      - { call: handle, args: [ { path: /x/1, headers: { authorization: Bearer broken } } ], expect: { value: { status: 500, body: { error: Internal error }, headers: { x-request-id: { $type: string } } } } }
+      - { call: observations, expect: { value: [ { $partial: { route: "/x/:id", status: 401 } }, { $partial: { route: "/x/:id", status: 418 } }, { $partial: { route: "/x/:id", status: 500 } } ] } }
+
+  # --- access -----------------------------------------------------------------------------------
+  - name: access policies match the framework
+    init:
+      tokens:
+        user: *actor
+        owner: *owner
+        ownerWithGrant: { id: o2, role: owner, grants: [ x.read ], active: true }
+        admin: { id: a, role: admin, grants: [], active: true }
+        inactive: { id: i, role: owner, grants: [ x.read ], active: false }
+        noActive: { id: n, role: owner, grants: [ x.read ] }
+      features:
+        - id: x
+          endpoints:
+            - { method: GET, path: /permission, resource: x.read, access: permission, reply: { value: ok } }
+            - { method: GET, path: /other, resource: x.write, access: permission, reply: { value: ok } }
+            - { method: GET, path: /explicit, resource: x.read, access: permission, explicitGrant: true, reply: { value: ok } }
+            - { method: GET, path: /explicit-other, resource: x.write, access: permission, explicitGrant: true, reply: { value: ok } }
+            - { method: GET, path: /owner, resource: x.admin, access: owner, reply: { value: ok } }
+            - { method: GET, path: /authenticated, resource: x.me, access: authenticated, reply: { value: ok } }
+            - { method: GET, path: /custom, resource: x.custom, access: admin, reply: { value: ok } }
+            - { method: GET, path: /guest, resource: x.guest, access: guest, reply: { value: ok } }
+    steps:
+      - { call: handle, args: [ { path: /permission, headers: { authorization: Bearer user } } ], expect: { value: { $partial: { status: 200, body: ok } } } }
+      - { call: handle, args: [ { path: /other, headers: { authorization: Bearer user } } ], expect: { value: { $partial: { status: 403, body: { error: Permission required } } } } }
+      - { call: handle, args: [ { path: /other, headers: { authorization: Bearer owner } } ], expect: { value: { $partial: { status: 200 } } }, note: owners pass permission endpoints }
+      - { call: handle, args: [ { path: /other, headers: { authorization: Bearer admin } } ], expect: { value: { $partial: { status: 403, body: { error: Permission required } } } } }
+      - { call: handle, args: [ { path: /explicit, headers: { authorization: Bearer owner } } ], expect: { value: { $partial: { status: 403, body: { error: Permission required } } } }, note: explicitGrant needs the grant even for owners }
+      - { call: handle, args: [ { path: /explicit, headers: { authorization: Bearer ownerWithGrant } } ], expect: { value: { $partial: { status: 200 } } } }
+      - { call: handle, args: [ { path: /explicit, headers: { authorization: Bearer user } } ], expect: { value: { $partial: { status: 200 } } } }
+      - { call: handle, args: [ { path: /explicit-other, headers: { authorization: Bearer user } } ], expect: { value: { $partial: { status: 403 } } } }
+      - { call: handle, args: [ { path: /owner, headers: { authorization: Bearer user } } ], expect: { value: { $partial: { status: 403, body: { error: Owner permission required } } } } }
+      - { call: handle, args: [ { path: /owner, headers: { authorization: Bearer admin } } ], expect: { value: { $partial: { status: 403, body: { error: Owner permission required } } } } }
+      - { call: handle, args: [ { path: /owner, headers: { authorization: Bearer owner } } ], expect: { value: { $partial: { status: 200 } } } }
+      - { call: handle, args: [ { path: /authenticated, headers: { authorization: Bearer admin } } ], expect: { value: { $partial: { status: 200 } } } }
+      - { call: handle, args: [ { path: /custom, headers: { authorization: Bearer user } } ], expect: { value: { $partial: { status: 200 } } }, note: unknown access values only need an active actor }
+      - { call: handle, args: [ { path: /custom } ], expect: { value: { $partial: { status: 401, body: { error: Sign in } } } } }
+      - { call: handle, args: [ { path: /owner, headers: { authorization: Bearer inactive } } ], expect: { value: { $partial: { status: 401, body: { error: Sign in } } } } }
+      - { call: handle, args: [ { path: /authenticated, headers: { authorization: Bearer noActive } } ], expect: { value: { $partial: { status: 401, body: { error: Sign in } } } } }
+      - { call: handle, args: [ { path: /guest, headers: { authorization: Bearer inactive } } ], expect: { value: { $partial: { status: 200 } } }, note: guest endpoints accept any verified actor }
+      - { call: handle, args: [ { path: /permission } ], expect: { value: { $partial: { status: 401, body: { error: Sign in } } } } }
+
+  # --- handlers, metering, telemetry -----------------------------------------------------------
+  - name: handler errors keep HTTP errors and hide the others
+    init:
+      tokens: {}
+      features:
+        - id: h
+          endpoints:
+            - { method: GET, path: /secret, resource: h, access: guest, reply: { error: { message: secret connection string } } }
+            - { method: GET, path: /conflict, resource: h, access: guest, reply: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+            - { method: GET, path: /null, resource: h, access: guest, reply: { value: null } }
+            - { method: GET, path: /list, resource: h, access: guest, reply: { value: [ 1, "two", { three: 3 } ] } }
+    steps:
+      - { call: handle, args: [ { path: /secret } ], expect: { value: { status: 500, body: { error: Internal error }, headers: { x-request-id: { $type: string } } } } }
+      - { call: handle, args: [ { path: /conflict } ], expect: { value: { $partial: { status: 409, body: { error: "Conflict: refresh and try again" } } } } }
+      - { call: handle, args: [ { path: /null } ], expect: { value: { status: 200, body: null, headers: { x-request-id: { $type: string } } } } }
+      - { call: handle, args: [ { path: /list } ], expect: { value: { $partial: { status: 200, body: [ 1, "two", { three: 3 } ] } } } }
+      - { call: observations, expect: { value: [ { $partial: { route: /secret, status: 500 } }, { $partial: { route: /conflict, status: 409 } }, { $partial: { route: /null, status: 200 } }, { $partial: { route: /list, status: 200 } } ] } }
+
+  - name: metered endpoints fail closed without a metering adapter
+    init:
+      tokens: { good: *actor }
+      features: &metered
+        - id: m
+          endpoints:
+            - { method: GET, path: /m, resource: x.read, access: permission, subscription: { product: x, credits: 1 }, reply: { value: done } }
+            - { method: GET, path: /empty, resource: x.read, access: guest, subscription: {}, reply: { value: done } }
+            - { method: GET, path: /free, resource: x.read, access: guest, reply: { value: free } }
+    steps:
+      - { call: handle, args: [ { path: /m, headers: { authorization: Bearer good } } ], expect: { value: { $partial: { status: 503, body: { error: Metering adapter required } } } } }
+      - { call: handle, args: [ { path: /empty } ], expect: { value: { $partial: { status: 503, body: { error: Metering adapter required } } } }, note: an empty subscription object is still metered }
+      - { call: handle, args: [ { path: /m } ], expect: { value: { $partial: { status: 401 } } }, note: access is checked before metering }
+      - { call: handle, args: [ { path: /free } ], expect: { value: { $partial: { status: 200, body: free } } } }
+
+  - name: metered endpoints run through invokeMetered
+    init:
+      tokens: { good: *actor }
+      metering: {}
+      features: *metered
+    steps:
+      - { call: handle, args: [ { path: /m, headers: { authorization: Bearer good } } ], expect: { value: { $partial: { status: 200, body: done } } } }
+      - { call: handle, args: [ { path: /empty } ], expect: { value: { $partial: { status: 200, body: done } } } }
+      - { call: handle, args: [ { path: /free } ], expect: { value: { $partial: { status: 200, body: free } } } }
+      - { call: metered, expect: { value: [ { resource: x.read, subscription: { product: x, credits: 1 }, actor: u }, { resource: x.read, subscription: {}, actor: null } ] } }
+
+  - name: metering failures are answered like handler failures
+    init:
+      tokens: { good: *actor }
+      metering: { error: { status: 402, message: Insufficient credits } }
+      features: *metered
+    steps:
+      - { call: handle, args: [ { path: /m, headers: { authorization: Bearer good } } ], expect: { value: { $partial: { status: 402, body: { error: Insufficient credits } } } } }
+      - { call: metered, expect: { value: [ { resource: x.read, subscription: { product: x, credits: 1 }, actor: u } ] } }
+
+  - name: telemetry failures and a missing observer never change the answer
+    init:
+      tokens: {}
+      observe: fail
+      features: [ { id: g, endpoints: [ { method: GET, path: /g, resource: g, access: guest, reply: { value: { public: true } } } ] } ]
+    steps:
+      - { call: handle, args: [ { path: /g } ], expect: { value: { $partial: { status: 200, body: { public: true } } } } }
+      - { call: handle, args: [ { path: /nope } ], expect: { value: { $partial: { status: 404 } } } }
+      - { call: observations, expect: { value: [ { $partial: { route: /g, status: 200 } }, { $partial: { route: /unmatched, status: 404 } } ] } }
+
+  - name: without an observer requests are still answered
+    init:
+      tokens: {}
+      observe: none
+      features: [ { id: g, endpoints: [ { method: GET, path: /g, resource: g, access: guest, reply: { value: 1 } } ] } ]
+    steps:
+      - { call: handle, args: [ { path: /g } ], expect: { value: { $partial: { status: 200, body: 1 } } } }
+      - { call: observations, expect: { value: [] } }
+
+  - name: every request gets a new request id
+    init:
+      tokens: {}
+      features: [ { id: g, endpoints: [ { method: GET, path: /g, resource: g, access: guest, reply: { value: 1 } } ] } ]
+    steps:
+      - { call: handle, args: [ { path: /g } ], expect: { value: { $partial: { status: 200 } } } }
+      - { call: handle, args: [ { path: /g } ], expect: { value: { $partial: { status: 200 } } } }
+      - { call: observations, expect: { value: [ { $partial: { requestId: { $ref: "0.value.headers.x-request-id" } } }, { $partial: { requestId: { $ref: "1.value.headers.x-request-id" } } } ] } }
+
+  # --- session authenticator --------------------------------------------------------------------
+  - name: session tokens resolve the current actor
+    subject: session-authenticator
+    init:
+      secret: ssssssssssssssssssssssssssssssss
+      now: "2026-09-24T10:00:00.000Z"
+      actors:
+        u: *actor
+        revoked: { id: revoked, role: user, grants: [], active: true, tokenVersion: 2 }
+        off: { id: off, role: user, grants: [], active: false, tokenVersion: 1 }
+        alias: { id: someone-else, role: user, grants: [], active: true, tokenVersion: 1 }
+    steps:
+      - { call: issue, args: [ { id: u, tokenVersion: 1 } ], expect: { value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1IiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc5MDI0NDAwMCwiZXhwIjoxNzkwMjQ0OTAwfQ.HcHF_N2LVH7do7OrLE_Nt5rB34U40XLS8kAe8Bi0NDQ } }
+      - { call: authenticate, args: [ { $ref: "0.value" } ], expect: { value: *actor } }
+      - { call: issue, args: [ { id: revoked, tokenVersion: 1 } ], expect: { value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJyZXZva2VkIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc5MDI0NDAwMCwiZXhwIjoxNzkwMjQ0OTAwfQ.NwpuXdqWRJ4XHy9xnG_Bvzyuk_n99Ylc1RTzE19ckbA } }
+      - { call: authenticate, args: [ { $ref: "2.value" } ], expect: { error: { status: 401, message: Invalid or revoked session } }, note: tokenVersion changed }
+      - { call: issue, args: [ { id: off, tokenVersion: 1 } ], expect: { value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJvZmYiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzkwMjQ0MDAwLCJleHAiOjE3OTAyNDQ5MDB9._t0lTesdE9ALsZGxjegqpItfKNa_XLUU9Zy8KmAUu7k } }
+      - { call: authenticate, args: [ { $ref: "4.value" } ], expect: { error: { status: 401, message: Invalid or revoked session } } }
+      - { call: issue, args: [ { id: alias, tokenVersion: 1 } ], expect: { value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJhbGlhcyIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3OTAyNDQwMDAsImV4cCI6MTc5MDI0NDkwMH0.gYN8bMzc1cvu5hLMSv2DsU-qxY2zx26vpaPL-uZcPFM } }
+      - { call: authenticate, args: [ { $ref: "6.value" } ], expect: { error: { status: 401, message: Invalid or revoked session } }, note: the resolver returned another id }
+      - { call: issue, args: [ { id: ghost, tokenVersion: 1 } ], expect: { value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJnaG9zdCIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3OTAyNDQwMDAsImV4cCI6MTc5MDI0NDkwMH0.nlWgWZ5MV3alVx2S9wICbEu1VhN2HrfDKYSvfRZ4L5E } }
+      - { call: authenticate, args: [ { $ref: "8.value" } ], expect: { error: { status: 401, message: Invalid or revoked session } } }
+      - { call: resolved, expect: { value: [ u, revoked, off, alias, ghost ] } }
+      - { call: authenticate, args: [ not-a-token ], expect: { error: { status: 401, message: Invalid or expired session } } }
+      - { call: setNow, args: [ "2026-09-24T10:15:00.000Z" ], expect: { value: null } }
+      - { call: authenticate, args: [ { $ref: "0.value" } ], expect: { error: { status: 401, message: Invalid or expired session } }, note: 15 minutes later the token expired }
+      - { call: resolved, expect: { value: [ u, revoked, off, alias, ghost ] } }
+
+  - name: session tokens of another issuer or audience are refused
+    subject: session-authenticator
+    init: { secret: ssssssssssssssssssssssssssssssss, now: "2026-09-24T10:00:00.000Z", issuer: billing, audience: billing-api, actors: { u: *actor } }
+    steps:
+      - { call: issue, args: [ { id: u, tokenVersion: 1 } ], expect: { value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1IiwiaXNzIjoiYmlsbGluZyIsImF1ZCI6ImJpbGxpbmctYXBpIiwiaWF0IjoxNzkwMjQ0MDAwLCJleHAiOjE3OTAyNDQ5MDB9.80U7RF493mPbJfkEKVS0un6lNYHdb7wbf6ywDW5NwCA } }
+      - { call: authenticate, args: [ { $ref: "0.value" } ], expect: { value: *actor } }
+      - { call: authenticate, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1IiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc5MDI0NDAwMCwiZXhwIjoxNzkwMjQ0OTAwfQ.HcHF_N2LVH7do7OrLE_Nt5rB34U40XLS8kAe8Bi0NDQ" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: a valid token of the default issuer and audience }
+
+  # --- signed JWT authenticator -----------------------------------------------------------------
+  - name: RS256 and ES256 service tokens resolve their subject
+    subject: signed-jwt-authenticator
+    init: { jwks: *jwks, issuer: issuer, audience: service, actors: *serviceActors }
+    steps:
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.Mq6qrlzF9YMxc0fwixxRdeQjuoPRqFd9WdziACZS3RZg7aKfMvjHXlNHiBV9TW6x0tescx_eUlhpt0HrYz86EuQ4skPW3hr5lPWWSlZgHyw42i8YS_LUyiYdDjdA76r-BjPfbg9_J-vIBlfwFBW8wExuOo_QL2OGzyMS0Xdof0AYajxLkL_7vYiaE1pXHKxH8vVsB5aa4zsDoB19rTLuy9ItKEpHCYKGSgF5YbB1nJEy7SRmvrUEPNFlTOuWL91deTd4hylhQBxmnGGzIW1JWFh02XeD1ZCgUsa-aZM78FsEVpXKOmf6WY7-zxxllNLR2EEwYhg9VKEqnV7yJY_6Rw" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } }, note: RS256, kid rsa-1 }
+      - { call: authenticate, args: [ "eyJhbGciOiJFUzI1NiIsImtpZCI6ImVjLTEiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.CvUisxeQaM6JvDQpl9HqoC3vgbTzo1fS7fMp1RjUUBs9cvh1Hn25CiddDbTRzGpTLIoGSiJY4H9jDU_GxwGfJA" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } }, note: ES256, kid ec-1 }
+      - { call: authenticate, args: [ "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.u9RZwS_lh5lt4UlzEm-zI61D3DG5PGMVN-qc7BNUPFkwzMwlHLljV9SI0B2swbJh1a51rLcn5vmuxiN86qYMsg" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } }, note: without kid only P-256 keys match ES256 }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOlsib3RoZXIiLCJzZXJ2aWNlIl0sImlhdCI6MTc5MDAwMDAwMCwiZXhwIjo0MTAyNDQ0ODAwfQ.lqPsKR9JRPdCtV9sK4UeKxDefCPkmHgFf4pQUCLsAiaEV6e8rRdl-rBeZXhALFidJ8tfcE00itEOfRv_Pv-aqIKAEV0tKCeNUJzI399jCO32eq6nKu_n0DPkv3TUPuhsTgB-cgK_-8_jPvNsrPqiaITFZjQZVk8kDYnBy1_IpSksNul2u223z4eMPaCAO0zdmyEcQ6sPk6QiTid5GZSI5SvvOprkZr3WW31HKu1xgerPxdPEh9A2uXYfJ3S5EOVSKcWVrw2SvS8kaqacvJAi5_7T2dF7JuvLdStv8YhdGdF6PORuj0O3o-Aq372rg5l9XRGitLzgr_QlLyKb4E8dGg" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } }, note: aud may be an array containing the audience }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDAuNX0.HzEOZvyqsVz6DsgY_J9PSLStAIYXo49srctngVmeNXMwA6qCK_aHgrz1t5ocdumJ3MDDK6dcsXNMmj2rSRzIH91t_EWYDcPjPZs9nJ_3KWe6jNo4nje7Seb_dur6pkswyGMlUAHV116ZgUkqjqY3eVm_u3qxJQySH-iqTg6hsnD5aBtWkqiWZJM4XJf_0Jbrj64o-fym53GNBff8Nv0RtqINniG-AlbAz7ahWALaBFdoGDoC142_wiMy5FgrbLNu6xr5em1c8cXGolXbrnnVsWDGhS7C8FtbTF91wVHYWy8t9XwjMt9AjWTzPzAD8HIxEp0ywmQRc9UjmCjP8qSpgg" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } } }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDAsIm5iZiI6MTcwMDAwMDAwMH0.GIfQsV2VId8FNaMtUNj4ARVFIyYU0fmPuG05UoSNAGOc4DvOhn0guBr-zcf_AYTqFlrFgdTnv3hrOXIN6xgGbpw9_W3_O-smbBvdTZrhzJaRqTdupjKr1GshlCgB7HWrx2pu5E3tZl0a5ijUYooOOPK_ZdSx-oxvbFueIWyTb76zilxDNWwaDZaxGo3yyo7EJSLDG9TfujFXFvW6k0rNQieuOk6ifd1poN0Oqs2P310n_Bt3lCBOfvbRiVKBSd7u3-cAcbI5eJfbnt0H9MHp2ENHt53VTRzhPzNLfF7vQsJvBzqNWkAbLWYthFI4-wsncDhc9AhCXHpSb5a-i1JOFQ" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } } }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0Ijo0MDAwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.qvM2Qa96OQ9XCpqrzo5mZ3vOr8XA4PQhm1AARxKjrq1rhjPw02CXaFUhM5ft-UPZHaVmY1FP1OA9h3VBM9bFnMQJCa8KHYIeYxTy3r4bgKhEsPY6rokLIJKbU35UuudHqpphcgVttYCOQlBcb99FsTsSFVJ3Ca_78guq3jdVqQkWRw1uWqwkunPZTRV7pv_j4F2o6IBIeoU_yUTYA-EcR-Q4XtNq8r1MOD8ca3rcRH8JNlzSwc0IqB5l1Ppc7OZzpj-8NJYgMw5saEPBa5jZfxORrdW0frQnsE6flsrG7iRGD3L1pmErG3bH62YohJ7BlVGIvHl5RR_8uCF7V3hl8g" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } }, note: a future iat is accepted }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS1vcHMtb2siLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.YUydAnDzaBzzdhgbBl1-Wdv9TbygPy9T7b8cPx3Ny4FllFTMxwuIzSwwLhk8mXcsapXr2q8ZgVxXFuO8R5dI0J6T247mf3nf4oj6hZHXiJV1TwuASIisZOtlBHPPTHh8dP3E28EEWi81Zycy8_6UTaI_KlHq-5__YL24eut4uhKmd-Uj0K1vOXmGRkmPpEsof6TnApQ4WhmkLu0pWZp0FODYWaSjgpTADTCc5Txe7z0nJU5CrPaHMbUdbG0O1qSg_WShhGWLX-juzdaDPoJ6KLQ66tfwAWO7Zn-47J2uuHRIPb3mjhSxy8F576xKwBG1vxJlYWdhrvJ-sfyZ1YbLsg" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } }, note: key_ops containing verify }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIiwiY3JpdCI6WyJiNjQiXSwiYjY0Ijp0cnVlfQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.0T1mbdCihskHIzKBpwwrGl_TBq81ri18EJT9KxEXtj29CpVbP1095BgqzqHvfNNBRBXLkYXtju-yjW2Myp0arfASIr3kT3e6EUiD7a7rwC-LVjvx8vG2c1n7-fHwQaxSXJKXoaU7XO_gCMJRV9RsmKxYPWPS1-RqHO9vPnHhEGxJha-ESPFSAUpQY_pJ1iN7Y9FlkRbaUs6l1qQpHRj4U4CmpUdPydXrA0r6JUhvZW_0AyG97PcMFyMx719ydWLJTvOzb3m-zivD8umbYxbln3oVZ-iS5vnh6pssWYH4Aorc3iSB774MOA2Ka_fNaju_3yuIScKvCSn2VlhOxYzOTg" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } }, note: crit may list b64 }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIiwiYjY0IjpmYWxzZX0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.eWNpBqgb-pfPCSnZENY5IccGuFhFaUSmIk3crBZIbffdArs01Di8asNRkNw4XFMqtsosc6tUCTFqJ1VFHQtNqtosSPrUI8ql-9PqLYv_t24o1m3mp65I0guXwuzY0VN9wHfbh56oX-3wCEAIppNWPwIY6FjQUlKxzClC9bAA6IOEqAijqBD98MqkaBsiRPbor1Fm-BkiLMJL7tWjVvv9SrBVwQs7GuFpAA20_gSok7mugd7Sst1P9UcexVQj-RebtmCvpWaSsCObH-bwbATdLdNR4vESnju3yMv5Me5sPZwv_JeAdEzQuCZ7Z_zsbe2l938xBgF3q27BMUEVfqT_Og" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } }, note: b64 is ignored unless crit lists it }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDAsInNjb3BlIjoiaW52ZW50b3J5LnJlYWQiLCJuIjoxLjV9.pDyDHlQgr0Wz2YA__0y1GpZVu5UevJM6w8VkTMQ2XvlzgW8BJmO1aoemPKcYW3YJ5kHuVb3LQnFpVW1opEO0RmtE5C2J7PSbvcmNxetGufdUER2nHdmlu7afzXCWbSwBUJpZldhOZxaTTiHFQSHmZunOlqGy4jSBOljfPQpIObwkptHNRUqoqPmN7-BM0fD3RArQSZ5zHaY7z3VdoqHSsqg-Cdc2SjSiU7Zc8RjMdgIIE5-03jPT3KwQaJ3zNILs-YiA-tgVaZ-Z2W707i1NsDGBlB-Wx1NgpbHOgwk0BeEy1zePwsWV85frb1WOFC2zrCptR6gr6Dm23xoFF5eLTg" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } } }
+      - call: resolved
+        expect:
+          value:
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800 }
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800 }
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800 }
+            - { sub: svc, iss: issuer, aud: [ other, service ], iat: 1790000000, exp: 4102444800 }
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800.5 }
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800, nbf: 1700000000 }
+            - { sub: svc, iss: issuer, aud: service, iat: 4000000000, exp: 4102444800 }
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800 }
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800 }
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800 }
+            - { sub: svc, iss: issuer, aud: service, iat: 1790000000, exp: 4102444800, scope: inventory.read, n: 1.5 }
+
+  - name: claims are checked before the subject is resolved
+    subject: signed-jwt-authenticator
+    init: { jwks: *jwks, issuer: issuer, audience: service, actors: *serviceActors }
+    steps:
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJvdGhlciIsImlhdCI6MTc5MDAwMDAwMCwiZXhwIjo0MTAyNDQ0ODAwfQ.dDCBydJ6X41NVGANgJUr8HWMSyxzJLD4MJSGPCDU1r1pWz9GCmXdlzRH5xhnHvqsbxoZ7c3tZVZr4JxZ7dTTZt4Ynh7uUSDXSTPyOrTcWlCDKSjDfHUqBppYO6fFAk_xgi_b2wiIJ3qUfAlhGNsnYW9ntco9YUWkVMuPLcqHBtz8UOc1O09pncqsZh2e7zsm9AK14YO-WZBdZVdwJJ5dGmodXtSBEqZtoKan3_d4ifhBuUlhVmZtA6NbRPVXMjcxtGpR_ggCyJUkVsW6q0jLus7XcSe7JQUaMXaofYcPumch6fP4baXvskWw8RVH1TxzNwu9k6bHcS29pIgfjYKamA" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: another audience }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOlsib3RoZXIiXSwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.v-eruoyZgE0VjSs6H_sSaG3nJ1CKIkFnZy3IthwHAm1d5wj6vTLQrqsTYfKDlR9b2FHhg58dLAOX38XQkNrQ13Qtntw74z0-DandE7emXW14StWP56Ejz9jxMM4Dlg3EM8QLNZ40dD3mdMi4EgmCInQfae3YdyxSLbvaCD2-A9I3uFmJfYuzTx5z12tfgge1JnEVOTiB467Y-5xZgl87oLyUvxbnoGLp0PzDvnKBjSeZZKaBD1Op5YFxH6DsfFUXFkiawLVY8qkF_8dQL04-jkXMvG6lhCHaEgBPG9NxnTuu--h0bQyGXus00sB2fg4AG1M7hL_c_YL2DR9Al2LgAw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: an audience array without ours }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJzb21lb25lIiwiYXVkIjoic2VydmljZSIsImlhdCI6MTc5MDAwMDAwMCwiZXhwIjo0MTAyNDQ0ODAwfQ.V5U8t6hKfKWFb4Xvje-uCbEt8v6P52C6bx_DZAZNZEX-hDB_uYEG3M2OITD3LMkrf15aTsItkkBf9XRvZjP2STT_2X7_-0_Nmas1JdQ4VBx3hkWh-0j7o8GZsnx4uWsngz5nMlCXEPu0-WPhUd_n6jebVBHTKLKbZ-E_VIh005ofCZANGBpAFLzdUlHiNCuJyhpcogn4bQeTKUgTe4cLtVVtVzzIS_vZXx_BMnQ94cwq8kuf860gr6rP2IYUGc4MgEWvalmT01AJy6imn9tk2V1t5FtCGH-YFDg-AA0DALxO00BQCKp3UfdtCeA-tgVc8fXdfOFaMqk4_AMTKdfh9A" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: another issuer }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjE3MDAwMDAwMDB9.chX3n6_o2P_8mOEE_2luuIpohsCJFFoJzfeC9fyqPt-iEUfW4Umzd27gHXeLhc38VaRblJEEoqVXajvpUyPq5nrdmoV-a9RQyQEtLRlAR3PGjcFinaA9TB_24Btx2PU_DroEhn2F5alQmoXoQtYZHqPAnHKJQLREOwJdoz-TNPnWFkQ4l4Gk37y7L8UL-ziI612C7A8eriEEDlM3-YgEMZdTrtrWdEm3LHnHCFjHg2AmL1_CCLCxj6b--FCX2MlnMH-hAJNUCvUc5CsjZBSPqG6Ju2VvyMEz6wowVocUSPM2pNzuAqXJIqsBhkwxaPXNzb-R-LQBuY476pXCmymfEg" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: exp in the past }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDAsIm5iZiI6NDEwMjQ0NDAwMH0.UXj4kxjRlchZz5DBmizmUK4mnYfoc7Jz8LzWSJEeMRoka4KSBUJPvm0KoGkVgmu1rZi4--MPM39pqbNnow2bN1UU_lKA4u50K5ynJ1hCt4NgFHXyv8QhBTcYCxDB31FASUnffmqQ3MiR6RpiuhgpeV1sbkxpPXBbDjKrTZr_CBtC_fC0yPnE2MOX8x4ApaHI4ozglHa2PbFiVEi1wSPF_ia3qeW8ZA4Qfr8tNV-iqwwoNMGtcyl4DaeDU3G54h7WoPNzmzYTiax2SV45BaBAshXcuP9rsUVPztbiCSPoKdz0lJCA1Kxg-lOied1_NZMGNgj__pFSk_SWA8Hz63BCQg" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: nbf in the future }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwfQ.UtmQYDU57FN5VNGiTIFUbl6lx1rlfJ-XWv1Dchk0SJzGLnsTK8ga16JzSdyXkiik-Cx3G-FoiPtiMVdiEufBM4HPjAx0qETF8Q0NiN4wWBe2dDxKWAD5oo1jqrza_YBxqGRin6uLUlKI1r2sCLZAYr0J-ReUUr-FOEHhnHA0VUTPMOBgkG61yHmdkjtYlSBMQp2SHqKQz04_Zs-7_FrSZIkZhkFqeX8HNbnFl7iFmqwsb4U5ceWOO6HKNrfaBfiJyAcmq6Cyd70NEiIStL08P3a60rLSHBa0I2uWRP2Yjh8GXKOsQC-2URvGrOLFByRNAqOP-QPlcxFSbrMbEnO3lQ" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: exp is required }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiZXhwIjo0MTAyNDQ0ODAwfQ.ZN6xtc9yMKCAvo8uSWTDzwc4IgXg2G2Vo4HJ5Ohz0DngK6oP_ZpfV6qs4RnELbbMgctkcIBKTLd551p6h-HmO7RYARwkfJ0C1wvIylyNIM6dIkJOAofBuhaIBbTE-wSVZ5sRF60Ru1Lz02MBAgZjqR-XErpFzd5jiOM8eaMLDWj7gk1yuKgEyEgsTzKfeWJ69OAHN9DDw6End-aHm6EgFelEKVhVRg9ZoP65AMhI3skiS89eMtBWMUkydoykh2P_VtGqKnPEEdD2sHLV6D_UKAJ2qQmclJsOn_o-6KSq0yy50h4OphpEUNeDtBMI2iL2W_dVha-gdevyxcdfpIEQWw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: iat is required }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.or-94-hUUk5QTVEPZKjfTr8xnsaSYnaLiFnxzRDZWF6Q96jbBXBBqeflMqfa8k_u__3rZdWnXljRHD98HWsAGLqiuit4xhp03mz-7cPmThJQM1B29wO_P_IspAE_O7kfCpwNg_iHNpqGKJj9rNFaRuful9d9oFK4Z-rSEEiWR3vJq737p8_0K7BCPRzACObQ724zUAsMWJilaIcTuPY1K89V8BwBFHJ7l3XBb8JydyIRLoQyXthe5YnutZ046d94eSYKgzqJeDy6a-Tp7dK9lc4Cw4n8M6T6pyNtRmOya9xTKrPkr1_7vAN8vTtJaUwaat13AIL-7ViCyg1hfo08IA" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: sub is required }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.NZySpisdwd4QbJlE8fshjVorjqgv-PbPuTNTwJWn0ewhOOiYTw43OmTiTOVhUXZXAx4rQnyIAR4o4qIpxQM1k8DSaqHHrqsSf8lWeTIXRb5Os0Vkbh-6UxdfDtGvJOwq_bNh6Ab9MaZ1jbfRir8ECx3wAMilZDj0-IIHhGL6LfUhcOUmsKeUYv8OjVjnxIdp1iYIhKc6Xt-e2p4s7mItAJyeh5vdJL1m4ooa7NMkrtlDzBqwAYefbnE-qdhyyTuqCcLMXjkdNRDZZOxPYffEIWawq5qyGS6x3d_cvHVmRq79xlNx7BbagNTsW_k188qQyrGzuUXfrHcnoSSJ28D8IQ" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: iss is required }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMH0.vJAdka_N_G5ZT5BrdbOE22jjVR3gYV4en9n-3NfkzfMfZn1kTvc7KgVtDXvTSWVua6-CU25bkUFJ9qkommZNF-PTZKlfuirAPVke-uxwdS5IyGAJ0hCG7eKfgMnLRcnd9SuRylw1cIqnbH1GhjM5RZk_xvoJb9u3iH7UVv295tiAuvyvJQZoxjDebobcZSNfo5KgjLoyaAGOUlmIYSy_aphfJxIeLHAM7cV9xzq0ViLfTr8CdhTo6zuAyc7HeO8NGfE4WITCVJ1-q8E4R7itflKq2H51CJBd7yHUIoBELfA2jdoputaxCEz0t32Xs-MTBKD7ZVkFLtLGpT-Bom8RUw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: aud is required }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoiMTc5MDAwMDAwMCIsImV4cCI6NDEwMjQ0NDgwMH0.0bZPyiK-RQ7KXY8E7309y09Wsl8lE9DncMisD3mSsI8tGhE6cDsGFnGingfJVLz-CA6RK4dJW_c2PzTePTKhI-Fn39Bs5Rmss5ZBZqIUcUKzutZ6XbMUh2Ufi9fUEq7evaaADCP_viTbbjCNDaopDK7J8jJrOWrxqk6DBx7x-wPZuVvCet3-hwkXlVS2D_UhgndFp7uwQpCfOOM8VMG5aR1R6pvKqFbHHt1BjpNnUhk5tdhpLXEhK5DoqKKX44kr_uocc3IQ2ocFMrsVkutH9EhqC1XWNeO28D77Wdiew0jBf9lfpZbDhlyVxqXgNLBM9HP8UEoQ0oiFmkLouIFNaA" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: iat must be a number }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOiI0MTAyNDQ0ODAwIn0.CjFsWvBV1vR6UwBve4UPtMZlpXjqG4R_0DFTI6RQ52YoPkxwck7Rw7t_51XiRu-wEKm-NhTUthJGGJ0IQjzxdgI_z2GW1iz3Tqxfvsul4X4BrLqpdGPf0PjuuJ89eHZ-ke5P0Z5-Fevd8DMrIzsdDUA4hJ6Uuv4zI_TdP-6Hn26oOoCVhzfDkRDe-lGJTlnRzlWitWO95NezL2xP63Ls89c02B4HhhW8O4wIu5bLDL0SP5H7QISyN7B9pY1g3Ht599hI6S6tx9sjgFi0p4Lf2hZpZxpv9SXiGCTni4Wqf7AO2snjX5tClpN7Qq0rVVhqRC9WzoUeBFh1ZAGPMV1lgw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: exp must be a number }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDAsIm5iZiI6IjEifQ.fkjFTAXaPUGCW7hGAEkx-Pchm3ieBrXlqj7zH0qnmpnk6DaXu0Y3llQIzk2tQuw69sEXXTprMJsgDIoZsvYDBvy6MCBSgiTDPwSJmubNiH_G-RP0Tb4cbOjUI34pXmGg2WLguJfCRiw7qXwCWGecr0cViGDARmy3lw97z8md3ZXx1k2Dm9IWeRzqX3DQJGGszSxQnXwahwpyp6Rx2w5FlrrDPPX61npmH0j2wmMhKMRwDOMgJjY8h30Lj32obLcqLwZaMypIc_VoZ28Y0CJzEOHdzglCj8_VVfKUjvgsdNM1XwyErsQ9tsD3EORn0tZRQSC5rZTKCs1X3LhzMedjbQ" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: nbf must be a number }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.WzEsMl0.XVNjkNcY5-BA6V5Xcnr0cgj_B-VMGvVQ-DGZOO6NUFdMF4iRjf6REof5-B9GeR5tX4m3OmJFiBF7y7ikQ6xBjtUMynxwhuwgdQix6A8a17NCmugxlE61dYd_NsmZfF6fhYlnIothesjKhzBLTvs4bKXwBXqD65ERpycNYv31YP92DgFtmRMv0ee7tyTwefc5aQENGpVBclA8XimuRMKTKAlSuT7vIEinE1vD-iWXLi9y3axcwi6xR_PzbJojMrTMOrLPytLfsKsysnR0uCxUWalwr_JqQLWTFqon2wCggV7oeqP6v9U4xMGezuXP3KOI2nkCaZHCPmwIPZmJQAtRJg" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: the payload must be an object }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIn0.bm90IGpzb24.hFINHMMGeyIu9PZAoBcAJcRpZc9I5-0-NI0QPhu5vU51dx34aGXqnb7Qrz3iC3o9trV4PcZLon4-AOIvMTY7S2YatawLkmTACtGnu1hD6H1lsghyDUFoWmepAmHbTarf3EXqeof9zy1tTrqPWKJgKUp6FSqPmiHn4ZpZ2pg-pvhv47g4gl5Fr4R1lGkeZoTME1mQ1Luxg3Jw0A6pnQyWW12sXFytREtsEyCDMct6Whqel3FG-uJ8qqoj7HIejECGPlphRQi3HezBxOEGr6l2Nz_21IJkKJ3NfOaQJOVQtOkSVeXjFbvX9e5W4BWsu5Lm-5MvfWK2snNFT9tkRsfO0w" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: the payload must be JSON }
+      - { call: resolved, expect: { value: [] } }
+
+  - name: signatures, algorithms and keys are checked
+    subject: signed-jwt-authenticator
+    init: { jwks: *jwks, issuer: issuer, audience: service, actors: *serviceActors }
+    steps:
+      - { call: authenticate, args: [ "eyJhbGciOiJIUzI1NiIsImtpZCI6InJzYS0xIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.5GtmfYwYKLddDbkbJEv0NKJu0EclHnL09kaGYkMZcGc" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: only RS256 and ES256 }
+      - { call: authenticate, args: [ "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9." ], expect: { error: { status: 401, message: Invalid service JWT } }, note: alg none }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiIsImlzcyI6Imlzc3VlciIsImF1ZCI6InNlcnZpY2UiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMH0.Mq6qrlzF9YMxc0fwixxRdeQjuoPRqFd9WdziACZS3RZg7aKfMvjHXlNHiBV9TW6x0tescx_eUlhpt0HrYz86EuQ4skPW3hr5lPWWSlZgHyw42i8YS_LUyiYdDjdA76r-BjPfbg9_J-vIBlfwFBW8wExuOo_QL2OGzyMS0Xdof0AYajxLkL_7vYiaE1pXHKxH8vVsB5aa4zsDoB19rTLuy9ItKEpHCYKGSgF5YbB1nJEy7SRmvrUEPNFlTOuWL91deTd4hylhQBxmnGGzIW1JWFh02XeD1ZCgUsa-aZM78FsEVpXKOmf6WY7-zxxllNLR2EEwYhg9VKEqnV7yJY_6Rw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: the payload was changed }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6Im5vcGUiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.DcCX_d4QiO88mfrTa54KQI0zXuSMn5xoo5fytQ7-T8UCu38v4z5kN5U5-P6Y_kk5lKX_ndfLt7WLSdjZ9j1zO7Scsd6MiiF8wdHkNyS4lwbtSryEZI5OByvSjhy1gTL83lG_dS0Y_aAxpj4Hv7Y7NhT8qcLq7e77FT0wlxyDuE2mFQpnwsMvUxDubkjis3Mo4aoufW1qtyQcuJn02kuaJpyxidmfgVitwBOSqC2keqLMvpDonflF7BX6OhOoNnk542hdRkhwlKf5eowqTeIsREMIdrrIR8gIS7P-mpvSLVcxL7TZJuH644VWrc5J26EXtL6-yNeySRGa2b8esUmJLg" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: no key has this kid }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.vtqw2AH16S_1mhAEeCcVylmJLc_qV4V7cTGN9DkGTNjje7pIwxRKLiygdr3DPS5zyaqP5570muqcbggh5ua14OuLOpO7brMxtqh_1Xe9TJ7MKc1SFvkcC79tHnPMy3ipRX2TrAQQx-VNB-PPCwjoNdwSAOv7VyyZJxJ6GDfql0INGuBlyLzoapSMFWTrRhI0JnoO98J0Z2pJllI-OrqPgetDr1fPBFhSKnNQr1ALTXteT1A9NdM4YlzYjnw1G2CZnok9wltW3KKPtoRm2IpmFRNpqbq0a411sFyo_ry29sjI2Rckl-HJpNu1PBv0QEqX9x_UShiwzzwrVFPzs0j5Iw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: signed by another key with the same kid }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.oMtT9kYNfrug3Fih0iKMbPA4hjG0_0Bgs0D1YBZE9TGJT561_0F-5VUQYupja7o43CxKGF1LRMPgXrpJ5wWOkC3AeSeTgKzg2HXO2rv7RKjH-K6GDb_EatQHVmGxK2TvtB5ZIb8iN8tOh4jv6IfS-GmlO-HDm573yoeRv7JQScdGj3GImCCJ-W2rSGA952ElUKFyaWPX3dEWKh8Sz7mMvkWOO9XmyOSOC-bnUSWYKZ2eExrr6fMSNOyZZbuOSg_pZi8hYFfC3x7dgJsUdio7zpXABuB-JRj-iZ2a4ZoqaRD9vWB6k7G9McVsnsvZI6pYEVL4CKvFoNnD0qvm4biqaQ" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: without kid several RSA keys match }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS1lbmMiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.jwMoTJoRWmyXZQy28x4gRuiacYblQC8mHHKvg00lsX5E2AwKRIKH9NMEZHWNrjdU3EyQ5qljzIoHOcG6AGFrs_vu20qQMGOnlHu-8cy2FVuq637qqGnMpHY7DFUWr6TkKImxu2BOpRuX_Tp3dW-ZLsXFcWpgTt3k8jF5PpshvSVFp8920yVUJjXPC0pUvcO-RVhCl6mhz7brcd1Chjir163108IjqTXtGpUPTW1NeCmc28Tb8aSVK_9-NGvBfLOleMBlomwEvGO5vysF38GnFs3QUJZsJnoOe-pPyhrhsO8btqFnWEdbOMVEm_4CWkKR8gg92rkwqIKl-PJGMZj2DA" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: use "enc" }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0zODQiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.ruXlLomhbcHEkMJ7KyqSlUVpAjqv5a6P-9IhU0B_FRzMLeDdKF9zWMOiViWd54hTqYACQyR3B68jQhIud-cjmY1_oUAQuXgbRFbR15BZlS-zireLL1kGFcgKblGUjQI_fJkVFcnZ-BacWQ1Aewim-3nmZc6_VIoYP_46rUNn6BjYUCWax6ZBQOgvpIkhtxQVczfco_c1iRusrQPQ6XPh1kiLPvPWoYAXu01Fx7D3D8LFKmqeLRfnnyHjc1uODdRxMKhR_nUHRUs-8_TkPaaG6iQMpm5VnX_opd-B-BMiJkWFeqiweGvIbkCxeZM65NRiiTd3e3rSjom4Iuof9q2TyA" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: the key is for RS384 }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS1vcHMiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.nJtb_kMXq4U84H3S4dPJLsy1zDCztFdDtSLDbbLvq9dKKN37HYN7wnawlzYqXb0mouYAP66JyNja9tHZVsyxB-iaGc_OYmzmUS79og4ACiLRoXThRYrtwkwW3Mdg-RaE0u5td_GrJ_jMI3k53eHCz4vRCvAFAe4tLDons97skmoAbIIX6HOH6acCNLXNRsdjXolQ69tKQfn0PvO215XtR8tJOeny1anxLrLnYeiWYtijCPp2N9-A1gAzm_ZP1qqIi5owr3zBiu3yNWeBJXQZqh7hbJPd9QUGwfOvk_N60Gdm3eE6u8UGw-tyqpP49yHQTQL0X40scxRJq1jReSvO4Q" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: key_ops without verify }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS1zbWFsbCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.waCfn3wuEhqE9Es2pHA1v-gSp9DdO9lGDGPQOzW8gPZsRQQOWD_s3v_2c4SsCBeLPUXvpuCknSF-D1dqGTFM98tX0woqpiWm3cFcxz5Uqikpjq1IF6joAYosnnQ09ZyaHZ6lgomWD6V9YotRKyIRjBg2CkTgrtK9tyFBwGdn8BA" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: RSA keys need 2048 bits }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS1wcml2YXRlIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.XGdNjUb0ffO-Xsj3edjnqcuBwMuv9_d4nCLOnNb4DV_90qwAnSyJcbCR7E66YhWq7iy4CfEkyA5Ap8IrvzcDomZGY8CMn5dqNnVPqYp7L4W8xP85HyV0DV2X_yCKraaihaSJDr8SKkPXip1VPDkIE4EozmemvM2Kg8LE0-YzRKj5a8SYXaSIfekqeruX1ct4SE6whc0kMWxr4Pn0FvLWk8h5sT4_yGoSs--r3maCqKiDe8xgnrFvDfT8DMBoN1WWcG7UTSB1lannqqMrG90HVcZAzrYrp_fbw5im3fhNr7yt5rm_0p2Y5w2EH5Yr2n4uFmY-4VCnzbjgghgEsxg5GQ" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: the set holds a private key }
+      - { call: authenticate, args: [ "eyJhbGciOiJFUzI1NiIsImtpZCI6ImVjLTM4NCJ9.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.W51wZ4xXIlZpam5RlEClR1ahwcyqkp-xDWF9G29iqVAu9o28DmYmukAl1ZGtxPFVI-4gPT0y_WviKS4HZOA_Mw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: a P-384 key for ES256 }
+      - { call: authenticate, args: [ "eyJhbGciOiJFUzI1NiIsImtpZCI6ImVjLTEiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.MEUCIA3VQq1RfBewkS3IjONTRjz92KGx7w3viSSp1AWcBYY9AiEAhVchjxqx5aA4pn0lqhN2lklwPImSPl7-K3DlQbfuYtw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: ES256 signatures are r||s, not DER }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6ImVjLTEifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.mREBg2FBUPnfmK0DhtOGmDZkNIWUa3wd7byrCZRYxFwMTr7CiCAmuM3_8aDSso7wdOm0-aYx3Mp_ZgeQPUWS2oc8QE1h_9-gFHDD0H1dAUsRCxSAA3PkeYCjLl-pJT5jsD5r8kMwrM5EawiaSLFXFPKmBu58ejRHvpSOEO4hKyuaNLZ4Oew9tqqqFY7ovi3K0PLgBiSkDw56oWixuJPSGoEH_iCV4Oze3OEbI_cdEUh9YPpxkAMbIoBNDfQW77ukkL5GjoRRBDTqqhop5986gj-iVtcosIHWS8NPmMCsRhcjHmSLflEgX64x5m1wCtM3RKMrk8Yidjh0m0jKLHB9Lg" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: an EC key for RS256 }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIiwiY3JpdCI6WyJleHAiXSwiZXhwIjoxfQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.OT90pjUuEehgy3QqeUlo0Hs5oo8D1ymR5eMVA36f3HIHeAevX93vIZQT3cKULzrVmLxwgQHMkrbkSSTQpXRmaUw3BznA0B3fOllscasvfsLF1dd6fzSIrGF8Dq_MndIE14_R4wx-b_puFAnZlIWFh3UG5lRsQMmwOntet4c109lqXNbUJ-yUEIa8BozIFAb7w1_H67zVC_OU-UydyFpUzsap1kMLhyqBD0HBvV_HWOB34EYBCQ5bffWhoyFNyqiIanb17-TIC-WT4zeqpEI0ghqQpgiP1pqCmLuBXsKPZzCB17Q1DyhktpIcoz9HmfI28lBmI0z8LR_O9tvTYRJRMA" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: crit lists an unknown extension }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIiwiY3JpdCI6WyJiNjQiXSwiYjY0IjpmYWxzZX0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.tavahWJC2QJbJV_Bc3gmNirtgfK2LE94CFNrIEU9Q82yR4i-zc6rINbHkyICzuYKwWKL9FAqID26XzgdzB9G9i23lhE3KRkT0AoTDGJ_iwlpFtnIEKjTej9bLgDJbJTSL-3yrzLSrAIXndGOUzR21pXdjCj8GUHgShs4tAzkBYirdhUywh_Cr_jLAR-Gv_q7S9gt6fxhxO66aMJ82cv-a3z8DeRjyyn6ttczDDloug4J_u0BPCrvZgQfGjeXj9iGCIltZmu4CLJrn_RKBNzbP5LgRozjK3Pb8dM_u3kzUiygCRMp_OSK8WDZi11bLQJcQ1_vhFqOcsYaS4zKk8xz2Q" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: b64 false (unencoded payload) }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIiwiY3JpdCI6W119.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.G3poqdOQij-64QV0n8aWcIPcLE7RGhOicbJwnv2JQQX_RmuNu10AZovA2G_WqdyVnp2WcEW3WE8iUjuPhfjahcICseHXIfz3WZ4aO0_s-ctLj4gS3YmVuWsLTJz2ND4F69o0XOz-tQWjZJJ7gqvBiasMUIIcqsh6ATTRsBK1R6Yb6OW0stMk6yhVQt8RQJjx6Q7stSz32dVMRkIOH0cB40PT0sxxoF5VmorENzAGcIeUz5EoItu03wkRBTooQOofQTcqNo0a3LQjTzXPymNDESw_OazpspkK4NBkZwCgyZJffvSJXTs7Ey4mk9EUaYwEG1q9QCrSqEFOw88V0zfelw" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: an empty crit list }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIiwiY3JpdCI6WyJiNjQiXX0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.exPcHRMB_kG9epBe5sV9uu_kgiJ6y4nBJTseyELBEyqZ_Q30RPcQFnWy0o8oszn6N9jgSzSpAJQiRnwiu2mKmk44vb3EY-3Z3k4vTLJtVrGh4_wz3sLldbl-7U6Q-lXNArjYQNVm1ZgkbJP9nTIXhEV8-uwdf5wCs01lQNUmgUmlytnxxCY-Ob8qXNDwCOoRry12IGphcRqhmC0ah118N2hpKQ_kasMK50RdH0_kLaOoZp5KqHWz38-ugdEnjJFUYg3gVB8QO9uMxq9JX5wmeNadLmPpqXrAWgWjOAFRYfYhgBDqm7Id2Y1VewPjg_lXA46uLM11gHUPSYi7hIp-BA" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: crit lists b64 without the b64 header }
+      - { call: authenticate, args: [ "W10.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.IjSXuHODDFmTPgPOj2ZgzsCmbJcA7M9w8uROhnHhqMJi-qvJx3qM9019_Hv7PTr4mOiPNCMhOm2wqzw1xNTRiNU5TyGeUNi3j4M81P_L3sGRBg3uwIAy4cjSMmFmJvoLLlR0ZD6fBXtaAFZkkeiTTpW8ZLa3AcuYzpv2X9yd2Acyq9hwX6qNIYjO48GZ4lkoqr7fbviLgEjvhO5kgrwkCHji2cEzz3gYlmnJH6ebcerFOzfoh_W88VCDDy4XhLh5RLkEik8Ux0DU0-Mjb1yo-o3GkgN3weSug_6yrdVDVpK4UX7XdiJUfZPcH-zUz1Zb2zoTe3Nx51Vw3E_8GyVd9A" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: the header must be an object }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: two segments }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.Mq6qrlzF9YMxc0fwixxRdeQjuoPRqFd9WdziACZS3RZg7aKfMvjHXlNHiBV9TW6x0tescx_eUlhpt0HrYz86EuQ4skPW3hr5lPWWSlZgHyw42i8YS_LUyiYdDjdA76r-BjPfbg9_J-vIBlfwFBW8wExuOo_QL2OGzyMS0Xdof0AYajxLkL_7vYiaE1pXHKxH8vVsB5aa4zsDoB19rTLuy9ItKEpHCYKGSgF5YbB1nJEy7SRmvrUEPNFlTOuWL91deTd4hylhQBxmnGGzIW1JWFh02XeD1ZCgUsa-aZM78FsEVpXKOmf6WY7-zxxllNLR2EEwYhg9VKEqnV7yJY_6Rw.x" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: four segments }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.***" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: the signature is not base64url }
+      - { call: authenticate, args: [ "" ], expect: { error: { status: 401, message: Invalid service JWT } } }
+      - { call: resolved, expect: { value: [] } }
+
+  - name: without kid the single RSA key of the set is used
+    subject: signed-jwt-authenticator
+    init: { jwks: *single, issuer: issuer, audience: service, actors: *serviceActors }
+    steps:
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.oMtT9kYNfrug3Fih0iKMbPA4hjG0_0Bgs0D1YBZE9TGJT561_0F-5VUQYupja7o43CxKGF1LRMPgXrpJ5wWOkC3AeSeTgKzg2HXO2rv7RKjH-K6GDb_EatQHVmGxK2TvtB5ZIb8iN8tOh4jv6IfS-GmlO-HDm573yoeRv7JQScdGj3GImCCJ-W2rSGA952ElUKFyaWPX3dEWKh8Sz7mMvkWOO9XmyOSOC-bnUSWYKZ2eExrr6fMSNOyZZbuOSg_pZi8hYFfC3x7dgJsUdio7zpXABuB-JRj-iZ2a4ZoqaRD9vWB6k7G9McVsnsvZI6pYEVL4CKvFoNnD0qvm4biqaQ" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } } }
+      - { call: authenticate, args: [ "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.u9RZwS_lh5lt4UlzEm-zI61D3DG5PGMVN-qc7BNUPFkwzMwlHLljV9SI0B2swbJh1a51rLcn5vmuxiN86qYMsg" ], expect: { value: { id: svc, role: user, grants: [ inventory.read ], active: true } } }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS1vcHMtb2siLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiJzdmMiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.YUydAnDzaBzzdhgbBl1-Wdv9TbygPy9T7b8cPx3Ny4FllFTMxwuIzSwwLhk8mXcsapXr2q8ZgVxXFuO8R5dI0J6T247mf3nf4oj6hZHXiJV1TwuASIisZOtlBHPPTHh8dP3E28EEWi81Zycy8_6UTaI_KlHq-5__YL24eut4uhKmd-Uj0K1vOXmGRkmPpEsof6TnApQ4WhmkLu0pWZp0FODYWaSjgpTADTCc5Txe7z0nJU5CrPaHMbUdbG0O1qSg_WShhGWLX-juzdaDPoJ6KLQ66tfwAWO7Zn-47J2uuHRIPb3mjhSxy8F576xKwBG1vxJlYWdhrvJ-sfyZ1YbLsg" ], expect: { error: { status: 401, message: Invalid service JWT } }, note: no such kid in this set }
+
+  - name: the resolved actor must be active and have the token subject as id
+    subject: signed-jwt-authenticator
+    init: { jwks: *jwks, issuer: issuer, audience: service, actors: *serviceActors }
+    steps:
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOjUsImlzcyI6Imlzc3VlciIsImF1ZCI6InNlcnZpY2UiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMH0.Rn5Lt7GluOBpAl9VsT6S8HVNlpfTGFq6lHC3xNSkD7V2TkJBBywHgQjhOCYGjQEQcP47kYJ2tHl4JgD8n-XP-A3Tg4nl7_wWLndMapsqZTn_pkBazfhjIrtbjOhwqHcu6uLUQH1iu3wH6CNeT_4RhdaisdrfeGUC0yAjkoHVsXQ4GWzanntcvLjOec1b00DgXDJi9KsyE8NhlpuhCh8XViNX2MbMppDahDDb2vQEmEPtfjpn2DFhbtZi14a4NSmF9Tz3F1AsLIZtiF2TJviybtzNI9wKsYb9JSciVopKtpLX0kT-L-CHP6uSKxL9yihL1fvj2WaixoJRXyOxtEqj-w" ], expect: { error: { status: 401, message: Inactive service identity } }, note: actor id "5" is not sub 5 }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJzbGVlcHkiLCJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJzZXJ2aWNlIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjQxMDI0NDQ4MDB9.oLmnGT0VI9_KkN_N95wwv7fdepX1MafqBKaGm1JD-SZUGtzJOxBL7RHQ4dNKDVgQlgtsy-bd2FhDV7lSnGEwm4-tvzbJ2gcj1QBiE95pVV5YJjvrPjXF4pVdigc7kWkEV5BcVZEJTqAUoeZdMJnG7MOBeINy5XQCVCtx-4gIOD2gQISnL40uBV53R2DLFZi1cILNAgJH6FOQPoMdTqXuJMX-Ki_tRF5FKYZ5fg1XCdxpuYmQLBF75xtm17ld_kq2Ip8iYYzLBLK7LDHisTkx_389cYRBIEKmwgd8_aIFfXPp-RWImNJtN46MfgBGPuL14szcRY-GzcpZrEiCcWS5Gw" ], expect: { error: { status: 401, message: Inactive service identity } } }
+      - { call: authenticate, args: [ "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJnaG9zdCIsImlzcyI6Imlzc3VlciIsImF1ZCI6InNlcnZpY2UiLCJpYXQiOjE3OTAwMDAwMDAsImV4cCI6NDEwMjQ0NDgwMH0.QDLxqVCc06o-KPH9LT7O1Ii_GooGtLvJdW1kCjgHA7lMiFmgLg1KB7QFcNjH5jlGRZ5HAyIM4_Da7k6c2swE1QRPtPIdD828ZL2cYgCL9elxRppnAaZyl6Qhddjs0-KfkRcOwyUTGk-LG1AlkrPxP8rLveScA2GR29lMbUhCSXGMsvv3tOlM3tBoI6vbd4gR6_ZTxImLBJ5vEFAMsvn0-ms6_emGsYphE7NIbtFGgMufHAeCbWvfC0d3Jl-PzPFh0pbFP2eIOcQVhIfVOAZ2FiykQpZxxuOaJgu6uM5U2W_aJcXOKuK7Um-sfiGtI9abDCxvBmZnz0_J6b0uN7Jtbw" ], expect: { error: { status: 401, message: Inactive service identity } }, note: unknown subject }
+      - { call: resolved, expect: { value: [ { $partial: { sub: 5 } }, { $partial: { sub: sleepy } }, { $partial: { sub: ghost } } ] } }
+
+  - name: issuer and audience are required
+    subject: signed-jwt-authenticator
+    init: { jwks: *single, issuer: "", audience: service }
+    create: { error: { message: JWT issuer and audience required } }
+
+  - name: an audience is required too
+    subject: signed-jwt-authenticator
+    init: { jwks: *single, issuer: issuer }
+    create: { error: { message: JWT issuer and audience required } }
+
+  - name: remote JWKS must be fetched over HTTPS without credentials
+    subject: signed-jwt-authenticator
+    init: { jwks: *single, issuer: issuer, audience: service }
+    steps:
+      - { call: remote, args: [ "https://example.test/.well-known/jwks.json", issuer, service ], expect: { value: null } }
+      - { call: remote, args: [ "HTTPS://Example.TEST:8443/jwks", issuer, service ], expect: { value: null } }
+      - { call: remote, args: [ "http://example.test/jwks", issuer, service ], expect: { error: { message: JWKS requires HTTPS } } }
+      - { call: remote, args: [ "https://user@example.test/jwks", issuer, service ], expect: { error: { message: JWKS requires HTTPS } } }
+      - { call: remote, args: [ "https://user:secret@example.test/jwks", issuer, service ], expect: { error: { message: JWKS requires HTTPS } } }
+      - { call: remote, args: [ "https://:secret@example.test/jwks", issuer, service ], expect: { error: { message: JWKS requires HTTPS } } }
+      - { call: remote, args: [ "file:///etc/jwks.json", issuer, service ], expect: { error: { message: JWKS requires HTTPS } } }
+      - { call: remote, args: [ "not a url", issuer, service ], expect: { error: { message: Invalid URL } } }
+      - { call: remote, args: [ "https://example.test/jwks", "", service ], expect: { error: { message: JWT issuer and audience required } } }
+      - { call: remote, args: [ "http://example.test/jwks", "", service ], expect: { error: { message: JWKS requires HTTPS } }, note: the URL is checked first }
+
+  # --- remote feature ---------------------------------------------------------------------------
+  - name: remote endpoints forward encoded parameters and only the authorization header
+    subject: remote-feature
+    init:
+      baseUrl: https://example.test/api
+      responses: [ { status: 200, json: { ok: true } } ]
+      feature: *xfeature
+    steps:
+      - call: call
+        args: [ 0, { params: { id: a/b }, request: { method: GET, path: /x/a%2Fb, headers: { authorization: Bearer token, x-user-id: evil, cookie: s=1 }, query: {}, body: { ignored: true } } } ]
+        expect: { value: { ok: true } }
+      - call: requests
+        expect:
+          value:
+            - { url: "https://example.test/api/x/a%2Fb", method: GET, headers: { content-type: application/json, authorization: Bearer token }, body: null, redirect: error, timeout: true }
+
+  - name: parameters and query strings are encoded like JavaScript
+    subject: remote-feature
+    init:
+      baseUrl: https://example.test/api/
+      responses: [ { status: 200, json: 1 }, { status: 200, json: 2 }, { status: 200, json: 3 } ]
+      feature:
+        id: y
+        endpoints:
+          - { method: GET, path: "/y/:id/:name_2.json", resource: y.read, access: guest }
+    steps:
+      - { call: call, args: [ 0, { params: { id: "a b?c#d&é~!*()'", name_2: "%2e%2E" }, request: { query: { "a b": "x y~*!()'é ", z: "", "&": "=" } } } ], expect: { value: 1 } }
+      - { call: call, args: [ 0, { params: { id: "1" }, request: { query: {} } } ], expect: { value: 2 } }
+      - { call: call, args: [ 0, { params: { id: "...", name_2: "x." } } ], expect: { value: 3 }, note: only whole "." or ".." values are refused }
+      - call: requests
+        expect:
+          value:
+            - { url: "https://example.test/api/y/a%20b%3Fc%23d%26%C3%A9~!*()'/%252e%252E.json?a+b=x+y%7E*%21%28%29%27%C3%A9%E2%80%A8&z=&%26=%3D", method: GET, headers: { content-type: application/json }, body: null, redirect: error, timeout: true }
+            - { url: "https://example.test/api/y/1/undefined.json", method: GET, headers: { content-type: application/json }, body: null, redirect: error, timeout: true }
+            - { url: "https://example.test/api/y/.../x..json", method: GET, headers: { content-type: application/json }, body: null, redirect: error, timeout: true }
+
+  - name: dot segments are refused before anything is sent
+    subject: remote-feature
+    init:
+      baseUrl: https://example.test/api
+      responses: [ { status: 200, json: 1 } ]
+      feature: *xfeature
+    steps:
+      - { call: call, args: [ 0, { params: { id: ".." } } ], expect: { error: { status: 400, message: Invalid route parameter } } }
+      - { call: call, args: [ 0, { params: { id: "." } } ], expect: { error: { status: 400, message: Invalid route parameter } } }
+      - { call: requests, expect: { value: [] } }
+
+  - name: bodies are sent as JSON except for GET and HEAD
+    subject: remote-feature
+    init:
+      baseUrl: https://example.test
+      responses: [ { status: 204 }, { status: 201, json: { id: "7" } }, { status: 200, json: [] }, { status: 200, json: null }, { status: 200, json: "text" } ]
+      feature:
+        id: w
+        seeds: [ { id: "w:demo" } ]
+        endpoints:
+          - { method: POST, path: /w, resource: w.create, access: authenticated }
+          - { method: PUT, path: "/w/:id", resource: w.edit, access: permission, explicitGrant: true, tool: { name: w_edit, description: Edit a w } }
+          - { method: DELETE, path: "/w/:id", resource: w.delete, access: owner }
+          - { method: HEAD, path: /w, resource: w.head, access: guest }
+          - { method: PATCH, path: /w, resource: w.patch, access: guest }
+    steps:
+      - { call: call, args: [ 0, { request: { body: { b: "x</y>& ", a: [ 1, 1.5, 1e+21, true, null ] } } } ], expect: { value: null }, note: 204 answers null }
+      - { call: call, args: [ 1, { params: { id: "7" }, request: { headers: { authorization: Bearer t }, body: {} } } ], expect: { value: { id: "7" } } }
+      - { call: call, args: [ 2, { params: { id: "7" } } ], expect: { value: [] } }
+      - { call: call, args: [ 3, {} ], expect: { value: null } }
+      - { call: call, args: [ 4, { request: { body: { z: 1 } } } ], expect: { value: text } }
+      - call: requests
+        expect:
+          value:
+            - { url: "https://example.test/w", method: POST, headers: { content-type: application/json }, body: "{\"b\":\"x</y>& \",\"a\":[1,1.5,1e+21,true,null]}", redirect: error, timeout: true }
+            - { url: "https://example.test/w/7", method: PUT, headers: { content-type: application/json, authorization: Bearer t }, body: "{}", redirect: error, timeout: true }
+            - { url: "https://example.test/w/7", method: DELETE, headers: { content-type: application/json }, body: "{}", redirect: error, timeout: true }
+            - { url: "https://example.test/w", method: HEAD, headers: { content-type: application/json }, body: null, redirect: error, timeout: true }
+            - { url: "https://example.test/w", method: PATCH, headers: { content-type: application/json }, body: "{\"z\":1}", redirect: error, timeout: true }
+      - call: feature
+        expect:
+          value:
+            id: w
+            seeds: [ { id: "w:demo" } ]
+            migrations: []
+            endpoints:
+              - { method: POST, path: /w, resource: w.create, access: authenticated }
+              - { method: PUT, path: "/w/:id", resource: w.edit, access: permission, explicitGrant: true, tool: { name: w_edit, description: Edit a w } }
+              - { method: DELETE, path: "/w/:id", resource: w.delete, access: owner }
+              - { method: HEAD, path: /w, resource: w.head, access: guest }
+              - { method: PATCH, path: /w, resource: w.patch, access: guest }
+
+  - name: remote failures become HTTP errors without their body
+    subject: remote-feature
+    init:
+      baseUrl: https://example.test
+      timeoutMs: 1
+      responses: [ { status: 503, text: secret stack trace }, { status: 404, json: { error: Task not found } }, { status: 302, text: "" }, { status: 300, text: "" }, { status: 200, text: "not json" }, { network: connection reset } ]
+      feature: *xfeature
+    steps:
+      - { call: call, args: [ 0, { params: { id: "1" } } ], expect: { error: { status: 503, message: Remote service request failed } } }
+      - { call: call, args: [ 0, { params: { id: "1" } } ], expect: { error: { status: 404, message: Remote service request failed } } }
+      - { call: call, args: [ 0, { params: { id: "1" } } ], expect: { error: { status: 302, message: Remote service request failed } } }
+      - { call: call, args: [ 0, { params: { id: "1" } } ], expect: { error: { status: 300, message: Remote service request failed } } }
+      - { call: call, args: [ 0, { params: { id: "1" } } ], expect: { error: { message: { $type: string } } }, note: an invalid JSON body fails }
+      - { call: call, args: [ 0, { params: { id: "1" } } ], expect: { error: { message: connection reset } }, note: transport errors propagate }
+
+  - name: remote configuration is validated when the feature is built
+    subject: remote-feature
+    init: { baseUrl: "http://example.test", feature: *xfeature }
+    create: { error: { message: Invalid remote service configuration } }
+
+  - name: remote base URLs cannot carry credentials
+    subject: remote-feature
+    init: { baseUrl: "https://user:pw@example.test", feature: *xfeature }
+    create: { error: { message: Invalid remote service configuration } }
+
+  - name: remote base URLs cannot carry a username
+    subject: remote-feature
+    init: { baseUrl: "https://user@example.test", feature: *xfeature }
+    create: { error: { message: Invalid remote service configuration } }
+
+  - name: remote base URLs cannot carry a query
+    subject: remote-feature
+    init: { baseUrl: "https://example.test/api?key=1", feature: *xfeature }
+    create: { error: { message: Invalid remote service configuration } }
+
+  - name: remote base URLs cannot carry a fragment
+    subject: remote-feature
+    init: { baseUrl: "https://example.test/api#part", feature: *xfeature }
+    create: { error: { message: Invalid remote service configuration } }
+
+  - name: remote base URLs must parse
+    subject: remote-feature
+    init: { baseUrl: "example.test", feature: *xfeature }
+    create: { error: { message: Invalid URL } }
+
+  - name: remote timeouts must be at least one millisecond
+    subject: remote-feature
+    init: { baseUrl: "https://example.test", timeoutMs: 0, feature: *xfeature }
+    create: { error: { message: Invalid remote service configuration } }
+
+  - name: remote timeouts must be whole milliseconds
+    subject: remote-feature
+    init: { baseUrl: "https://example.test", timeoutMs: 1.5, feature: *xfeature }
+    create: { error: { message: Invalid remote service configuration } }
+
+  - name: remote timeouts must fit a 32-bit signed timer
+    subject: remote-feature
+    init: { baseUrl: "https://example.test", timeoutMs: 2147483648, feature: *xfeature }
+    create: { error: { message: Invalid remote service configuration } }
+
+  - name: the longest remote timeout and an upper-case base URL are accepted
+    subject: remote-feature
+    init: { baseUrl: "HTTPS://EXAMPLE.test:8443", timeoutMs: 2147483647, responses: [ { status: 200, json: true } ], feature: *xfeature }
+    steps:
+      - { call: call, args: [ 0, { params: { id: "1" } } ], expect: { value: true } }
+      - { call: requests, expect: { value: [ { $partial: { url: "https://example.test:8443/x/1" } } ] } }

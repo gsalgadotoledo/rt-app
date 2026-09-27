@@ -231,8 +231,10 @@ export function remoteFeature(
     base.password ||
     base.search ||
     base.hash ||
-    !Number.isFinite(timeoutMs) ||
-    timeoutMs < 1
+    // AbortSignal.timeout needs an integer; above 2^31 - 1 ms Node silently uses 1 ms.
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > 2_147_483_647
   )
     throw new TypeError("Invalid remote service configuration");
   return {
@@ -241,9 +243,13 @@ export function remoteFeature(
     endpoints: feature.endpoints.map((endpoint) => ({
       ...endpoint,
       async handle(context) {
-        const path = endpoint.path.replace(/:([A-Za-z0-9_]+)/g, (_, name) =>
-          encodeURIComponent(context.params[name]),
-        );
+        const path = endpoint.path.replace(/:([A-Za-z0-9_]+)/g, (_, name) => {
+          const value = context.params[name];
+          // URL removes "." and ".." path segments, which would forward to another remote route.
+          if (value === "." || value === "..")
+            throw new HttpError(400, "Invalid route parameter");
+          return encodeURIComponent(value);
+        });
         const url = new URL(base.toString());
         url.pathname = base.pathname.replace(/\/$/, "") + path;
         url.search = new URLSearchParams(context.request.query).toString();

@@ -1,0 +1,1099 @@
+contract: 1
+module: migrations
+title: Module migrations and seeds (MigrationRunner, SeedRunner, rta migrate / rta seed)
+description: |
+  MigrationRunner and SeedRunner of @gsalgadotoledo/rt-app-migrations over a NoSQL store, plus the
+  migrateCommand / seedCommand CLI helpers. Reference: packages/migrations/src/{index,cli}.ts.
+
+  Declarations. A module is {id, migrations, seeds}. A migration is {id, checksum, description?,
+  up?, down?, run? (legacy run(store)), providers?: {<provider>: {checksum?, up?, down?, run?}}}.
+  A seed is {id, description?, version? ("1"), environments? (local, develop, stage), run}.
+  schemaMigration(m) is {id: m + ":001", checksum: m + "-document-v1", description: "Register the "
+  + m + " document schema"} and writes SCHEMA/<m> {schemaVersion: 1} unless it exists.
+
+  Plan (built when a runner is created, before any read or write). Environment must be one of
+  local | develop | stage | prod ("Unknown environment: <env>"). For each module in order, each
+  migration in order: id must match /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/i (ASCII, the
+  whole string, no trailing newline) and be at most 200 characters ("Invalid migration id: <String(id)>
+  (expected module:name)"); then "Duplicate migration id: <id>"; then the step is chosen: the
+  provider override when providers[<provider>] exists (it never falls back to the generic step),
+  else the migration itself when it has up or run; the step function is up, else run(store); no
+  function → "Unsupported migration <id> for <provider>". The checksum is the override's, else the
+  migration's; empty or missing → "Migration without checksum: <id>". down comes from the chosen
+  source only. Seeds: id rule with "Invalid seed id", "Duplicate seed id: <id>", environments
+  default [local, develop, stage] and must be non-empty and known ("Invalid environments for seed
+  <id>").
+
+  Checksums are opaque declared strings compared with === (no hashing). History rows written by any
+  language are therefore interchangeable: MIGRATIONS/<id> {version: 1, data: {checksum, provider,
+  appliedAt}} (rows written before Umzug, with other fields or versions, are read as they are).
+  Up/down re-read MIGRATIONS and fail with "Migration changed: <id>" (first in plan order) when a
+  recorded checksum differs, or when a provider-specific migration was recorded by another provider
+  (a record without provider passes). status() does not verify.
+
+  Lock: MIGRATION_LOCKS/"migrations" (seeds use MIGRATION_LOCKS/"seeds"), data {owner, acquiredAt,
+  expiresAt} (toISOString of the clock; expiresAt = now + lockTtlMs, default 900000). Acquire: read;
+  a row whose expiresAt parses to a time after now → "Migrations are already running (<owner>, lock
+  expires <expiresAt>)" (String(undefined) is "undefined"); otherwise write version (old + 1, or 1)
+  expecting the old version (or absence); if that write fails for any reason, read again and throw
+  the same message with the winner's owner/expiresAt or "unknown". Renewal before every step and
+  every history write is a rewrite of the lock row (version + 1, acquiredAt = now, new expiresAt)
+  expecting the version this runner wrote last; history rows are written in that same transaction,
+  so a runner that lost its lease records nothing. Expiry is only checked on acquire. Release (also
+  after failures) deletes the row only if its version and owner are still ours. The default owner
+  is "rt-app-" + a random UUID.
+
+  up({to?, step?}): lock, verify, then pending = plan minus history; `to` (when truthy) runs up to
+  and including it and must be pending (else 'Couldn''t find migration to apply with name
+  <JSON.stringify(to)>'); otherwise the first `step` (JavaScript slice: negative counts from the
+  end) or all. Each: log "migrating <id>", renew, run, then write the history row with the renewal.
+  A failing step → "Migration <id> (up) failed: Original error: <message>" (also when the renewal
+  fails); a failing history write propagates unchanged (e.g. 409 "Conflict: refresh and try
+  again"). Earlier migrations stay applied. Returns the applied ids.
+  down({to?, step?}): lock, verify, applied = plan order reversed; targets = first `step` (default
+  1) or, with `to`, up to and including it ("Migration is not applied: <id>"); any target without
+  down → "Irreversible migrations: <ids joined by ', '>" before anything runs; then each: log
+  "reverting <id>", renew, down, delete the history row (expecting its version) with the renewal.
+  History of modules no longer declared is reported by status() as {id, module, state: unknown,
+  appliedAt, reversible: false} after the plan, in sort key order, and never reverted.
+
+  Seeds: run({modules?, rerun?}): every module listed must be a declared module id ("Unknown module:
+  <m>"); selected = seeds allowed in the environment whose id prefix is listed (all when modules is
+  absent); nothing selected → [] without locking. Pending = selected whose history version differs
+  (or is missing); rerun runs all selected. Each: log "seeding <id>", renew, run, then write
+  SEEDS/<id> {version: old + 1 (1), data: {version, environment, appliedAt}}. secret(name) needs a
+  non-empty value ("Seed <id> requires <name>"), service(id) a registered one ("Seed <id> requires
+  the <id> service"); failures are wrapped like migrations. status(): {id, module, description,
+  environments, appliedAt, state: skipped (environment not allowed) | pending | changed | applied}.
+  ensureRows(rows): per row, skip when it exists, else create {...row, version: 1} expecting absence;
+  on failure read again and swallow the error only if the row now exists. Returns "pk/sk" of the
+  rows this call created.
+
+  CLI: see the cases; argument errors throw the usage line, runner errors propagate. `--step` uses
+  JavaScript Number(): "" → 0, " 2 " → 2, "0x1" → 1, "1e0" → 1, "-0" → 0; it must be an integer
+  >= 0. Human output goes through out(line); log lines are indented by two spaces and silenced by
+  --json. Status JSON is JSON.stringify(value, null, 2) with fields in the order shown.
+
+  Facade (subjects migrations, migrations-postgres, migrations-dynamodb): init {now (ISO, default
+  2026-09-24T10:00:00.000Z), environment?, owner? ("runner-a"), lockTtlMs?, provider? (the name
+  the runners see, "memory" by default whatever the backing store), secrets?, services?, rows?,
+  features: [{id, migrations, seeds}]}. A declaration {schema: m} is schemaMigration(m). Step
+  functions are lists of operations; each step first appends "<id> up|down|run|seed" (overrides:
+  "up@<provider>") to trace(), then runs: {ensure: rows} (trace {ensured}), {delete: {pk, sk}},
+  {fail: message}, {advance: ms} (moves the clock), {steal: {lock, owner, ttlMs?}} (another runner
+  rewrites the lock row), {release: lock} (deletes it), {faults: [kind…]} (next transactions: ok |
+  conflict | error | lostAck), {peek: [pk, sk]} (trace {peek: row}), {log: text}, {context: true}
+  (trace {context: {provider, environment}}), {secret: name}, {service: id}, {nested: {runner:
+  migrations|seeds, owner, call, options?, features? ([])}} (trace {nested: {value} | {error}}).
+  Methods: status(), up(target), down(target), seedStatus(), seed(options), ensureRows(rows),
+  migrateCommand(argv) and seedCommand(argv, secrets) → printed lines, output() (lines of the last
+  command, also when it failed), trace(), logs(), row(pk, sk), rows(pk), setNow(iso),
+  setFeatures(features), setEnvironment(env), setOwner(owner) (null: the default owner),
+  injectFaults(kind, count). Every call builds new runners, as the application does.
+subject: migrations
+subjects: [ migrations, migrations-postgres, migrations-dynamodb ]
+optionalSubjects: [ migrations-postgres, migrations-dynamodb ]
+init:
+  features: &catalog
+    - id: catalog
+      migrations:
+        - { schema: catalog }
+        - id: "catalog:002"
+          checksum: catalog-currencies-v1
+          description: Add supported currencies
+          up: [ { ensure: [ { pk: CURRENCY, sk: USD, data: { code: USD } }, { pk: CURRENCY, sk: EUR, data: { code: EUR } } ] } ]
+          down: [ { delete: { pk: CURRENCY, sk: USD } }, { delete: { pk: CURRENCY, sk: EUR } } ]
+cases:
+  # --- applying ---------------------------------------------------------------------------------
+  - name: applies pending migrations once, in declaration order, and records history
+    tags: [ interop ]
+    steps:
+      - call: status
+        expect:
+          value:
+            - { id: "catalog:001", module: catalog, description: Register the catalog document schema, state: pending, reversible: false }
+            - { id: "catalog:002", module: catalog, description: Add supported currencies, state: pending, reversible: true }
+      - { call: up, args: [ null ], expect: { value: [ "catalog:001", "catalog:002" ] } }
+      - { call: up, args: [ {} ], expect: { value: [] } }
+      - call: trace
+        expect: { value: [ "catalog:002 up", { ensured: [ CURRENCY/USD, CURRENCY/EUR ] } ] }
+      - call: rows
+        args: [ MIGRATIONS ]
+        expect:
+          value:
+            - { pk: MIGRATIONS, sk: "catalog:001", version: 1, data: { checksum: catalog-document-v1, provider: memory, appliedAt: "2026-09-24T10:00:00.000Z" } }
+            - { pk: MIGRATIONS, sk: "catalog:002", version: 1, data: { checksum: catalog-currencies-v1, provider: memory, appliedAt: "2026-09-24T10:00:00.000Z" } }
+      - { call: row, args: [ SCHEMA, catalog ], expect: { value: { pk: SCHEMA, sk: catalog, version: 1, data: { schemaVersion: 1 } } } }
+      - { call: rows, args: [ CURRENCY ], expect: { value: [ { pk: CURRENCY, sk: EUR, version: 1, data: { code: EUR } }, { pk: CURRENCY, sk: USD, version: 1, data: { code: USD } } ] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] }, note: the lock is released }
+      - call: status
+        expect:
+          value:
+            - { id: "catalog:001", module: catalog, description: Register the catalog document schema, state: applied, appliedAt: "2026-09-24T10:00:00.000Z", reversible: false }
+            - { id: "catalog:002", module: catalog, description: Add supported currencies, state: applied, appliedAt: "2026-09-24T10:00:00.000Z", reversible: true }
+      - { call: logs, expect: { value: [ "migrating catalog:001", "migrating catalog:002" ] } }
+
+  - name: modules run in declaration order, not in id order
+    init:
+      features:
+        - { id: zeta, migrations: [ { id: "zeta:b", checksum: "1", up: [] }, { id: "zeta:a", checksum: "1", up: [] } ] }
+        - { id: alpha, migrations: [ { id: "alpha:001", checksum: "1", up: [] } ] }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "zeta:b", "zeta:a", "alpha:001" ] } }
+      - { call: trace, expect: { value: [ "zeta:b up", "zeta:a up", "alpha:001 up" ] } }
+      - { call: status, expect: { value: [ { id: "zeta:b", module: zeta, state: applied, appliedAt: "2026-09-24T10:00:00.000Z", reversible: false }, { id: "zeta:a", module: zeta, state: applied, appliedAt: "2026-09-24T10:00:00.000Z", reversible: false }, { id: "alpha:001", module: alpha, state: applied, appliedAt: "2026-09-24T10:00:00.000Z", reversible: false } ] } }
+
+  - name: the module of an id is its prefix, whatever module declares it
+    init:
+      features: [ { id: shop, migrations: [ { id: "billing.v2:init", checksum: "1", up: [] } ] } ]
+    steps:
+      - { call: status, expect: { value: [ { id: "billing.v2:init", module: billing.v2, state: pending, reversible: false } ] } }
+
+  - name: step and to limit up
+    init:
+      features: &three
+        - id: m
+          migrations:
+            - { id: "m:1", checksum: "1", up: [], down: [] }
+            - { id: "m:2", checksum: "2", up: [], down: [] }
+            - { id: "m:3", checksum: "3", up: [], down: [] }
+    steps:
+      - { call: up, args: [ { step: 1 } ], expect: { value: [ "m:1" ] } }
+      - { call: up, args: [ { step: 0 } ], expect: { value: [] } }
+      - { call: up, args: [ { to: "m:2", step: 0 } ], expect: { value: [ "m:2" ] }, note: to wins over step }
+      - { call: up, args: [ { to: "m:2" } ], expect: { error: { message: "Couldn't find migration to apply with name \"m:2\"" } }, note: to must be pending }
+      - { call: up, args: [ { to: "m:9" } ], expect: { error: { message: "Couldn't find migration to apply with name \"m:9\"" } } }
+      - { call: up, args: [ { to: "say \"hi\"" } ], expect: { error: { message: "Couldn't find migration to apply with name \"say \\\"hi\\\"\"" } }, note: the name is JSON.stringify'd }
+      - { call: up, args: [ { to: "", step: 5 } ], expect: { value: [ "m:3" ] }, note: an empty to is ignored }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  - name: a negative step counts from the end (JavaScript slice)
+    init: { features: *three }
+    steps:
+      - { call: up, args: [ { step: -1 } ], expect: { value: [ "m:1", "m:2" ] } }
+      - { call: up, args: [ { step: -5 } ], expect: { value: [] } }
+      - { call: down, args: [ { step: -1 } ], expect: { value: [ "m:2" ] } }
+
+  # --- reverting --------------------------------------------------------------------------------
+  - name: down reverts the latest applied migrations
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "catalog:001", "catalog:002" ] } }
+      - { call: down, args: [ null ], expect: { value: [ "catalog:002" ] } }
+      - { call: trace, expect: { value: [ "catalog:002 up", { ensured: [ CURRENCY/USD, CURRENCY/EUR ] }, "catalog:002 down" ] } }
+      - { call: rows, args: [ CURRENCY ], expect: { value: [] } }
+      - { call: row, args: [ MIGRATIONS, "catalog:002" ], expect: { value: null } }
+      - { call: down, args: [ { step: 0 } ], expect: { value: [] } }
+      - { call: down, args: [ { to: "catalog:002" } ], expect: { error: { message: "Migration is not applied: catalog:002" } } }
+      - { call: logs, expect: { value: [ "migrating catalog:001", "migrating catalog:002", "reverting catalog:002" ] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  - name: down with step and to, in reverse application order
+    init: { features: *three }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "m:1", "m:2", "m:3" ] } }
+      - { call: down, args: [ { step: 2 } ], expect: { value: [ "m:3", "m:2" ] } }
+      - { call: up, args: [ {} ], expect: { value: [ "m:2", "m:3" ] } }
+      - { call: down, args: [ { to: "m:2", step: 1 } ], expect: { value: [ "m:3", "m:2" ] }, note: to wins over step and is included }
+      - { call: down, args: [ { step: 10 } ], expect: { value: [ "m:1" ] } }
+      - { call: down, args: [ {} ], expect: { value: [] } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [] } }
+
+  - name: down refuses irreversible migrations before reverting anything
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "catalog:001", "catalog:002" ] } }
+      - { call: down, args: [ { to: "catalog:001" } ], expect: { error: { message: "Irreversible migrations: catalog:001" } } }
+      - { call: down, args: [ { step: 2 } ], expect: { error: { message: "Irreversible migrations: catalog:001" } } }
+      - { call: trace, expect: { value: [ "catalog:002 up", { ensured: [ CURRENCY/USD, CURRENCY/EUR ] } ] } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [ { $partial: { sk: "catalog:001" } }, { $partial: { sk: "catalog:002" } } ] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  - name: every irreversible target is listed, latest first
+    init:
+      features:
+        - id: m
+          migrations:
+            - { id: "m:1", checksum: "1", up: [] }
+            - { id: "m:2", checksum: "2", up: [], down: [] }
+            - { id: "m:3", checksum: "3", up: [] }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "m:1", "m:2", "m:3" ] } }
+      - { call: down, args: [ { step: 3 } ], expect: { error: { message: "Irreversible migrations: m:3, m:1" } } }
+      - { call: trace, expect: { value: [ "m:1 up", "m:2 up", "m:3 up" ] } }
+
+  - name: a failing down stops the rollback; reverted migrations stay reverted
+    init: { features: *three }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "m:1", "m:2", "m:3" ] } }
+      - call: setFeatures
+        args:
+          - - id: m
+              migrations:
+                - { id: "m:1", checksum: "1", up: [], down: [] }
+                - { id: "m:2", checksum: "2", up: [], down: [ { fail: rollback refused } ] }
+                - { id: "m:3", checksum: "3", up: [], down: [] }
+        expect: { value: null }
+      - { call: down, args: [ { step: 3 } ], expect: { error: { message: "Migration m:2 (down) failed: Original error: rollback refused" } } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [ { $partial: { sk: "m:1" } }, { $partial: { sk: "m:2" } } ] } }
+      - { call: trace, expect: { value: [ "m:1 up", "m:2 up", "m:3 up", "m:3 down", "m:2 down" ] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  # --- failures ---------------------------------------------------------------------------------
+  - name: a failing migration is not recorded, stops the plan and can be retried
+    init:
+      features: &flaky
+        - id: flaky
+          migrations:
+            - { schema: flaky }
+            - { id: "flaky:002", checksum: "2", up: [ { fail: provider unavailable } ] }
+            - { id: "flaky:003", checksum: "3", up: [] }
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: "Migration flaky:002 (up) failed: Original error: provider unavailable" } } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [ { $partial: { sk: "flaky:001" } } ] } }
+      - { call: trace, expect: { value: [ "flaky:002 up" ] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+      - call: status
+        expect: { value: [ { $partial: { id: "flaky:001", state: applied } }, { $partial: { id: "flaky:002", state: pending } }, { $partial: { id: "flaky:003", state: pending } } ] }
+      - call: setFeatures
+        args: [ [ { id: flaky, migrations: [ { schema: flaky }, { id: "flaky:002", checksum: "2", up: [] }, { id: "flaky:003", checksum: "3", up: [] } ] } ] ]
+        expect: { value: null }
+      - { call: up, args: [ {} ], expect: { value: [ "flaky:002", "flaky:003" ] } }
+      - { call: logs, expect: { value: [ "migrating flaky:001", "migrating flaky:002", "migrating flaky:002", "migrating flaky:003" ] } }
+
+  - name: a failed history write re-runs the step on the next run
+    tags: [ idempotency ]
+    init:
+      features: [ { id: m, migrations: [ { id: "m:1", checksum: "1", up: [ { faults: [ error ] } ] } ] } ]
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: Store unavailable } }, note: history writes are not wrapped }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+      - call: setFeatures
+        args: [ [ { id: m, migrations: [ { id: "m:1", checksum: "1", up: [] } ] } ] ]
+        expect: { value: null }
+      - { call: up, args: [ {} ], expect: { value: [ "m:1" ] } }
+      - { call: trace, expect: { value: [ "m:1 up", "m:1 up" ] } }
+
+  - name: a lost acknowledgement records history but keeps the lease until it expires
+    init:
+      features: [ { id: m, migrations: [ { id: "m:1", checksum: "1", up: [ { faults: [ lostAck ] } ] }, { id: "m:2", checksum: "2", up: [] } ] } ]
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: Acknowledgement lost } } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [ { $partial: { sk: "m:1" } } ] } }
+      - call: rows
+        args: [ MIGRATION_LOCKS ]
+        expect: { value: [ { pk: MIGRATION_LOCKS, sk: migrations, version: 3, data: { owner: runner-a, acquiredAt: "2026-09-24T10:00:00.000Z", expiresAt: "2026-09-24T10:15:00.000Z" } } ] }
+        note: the runner did not see its own write, so release left the row
+      - { call: up, args: [ {} ], expect: { error: { message: "Migrations are already running (runner-a, lock expires 2026-09-24T10:15:00.000Z)" } } }
+      - { call: setNow, args: [ "2026-09-24T10:15:00.000Z" ], expect: { value: null } }
+      - { call: up, args: [ {} ], expect: { value: [ "m:2" ] } }
+
+  # --- plan validation --------------------------------------------------------------------------
+  - name: ids are module:name with ASCII letters, digits, dots, dashes and underscores
+    init:
+      features:
+        - { id: x, migrations: [ { id: "Mod-1.x_y:Name.2-b_c", checksum: "1", up: [] }, { id: "0:0", checksum: "1", up: [] } ] }
+    steps:
+      - { call: status, expect: { value: [ { id: "Mod-1.x_y:Name.2-b_c", module: Mod-1.x_y, state: pending, reversible: false }, { id: "0:0", module: "0", state: pending, reversible: false } ] } }
+
+  - name: an id without a module is invalid
+    init: { features: [ { id: x, migrations: [ { id: no-module, checksum: "1", up: [] } ] } ] }
+    steps:
+      - { call: status, expect: { error: { message: "Invalid migration id: no-module (expected module:name)" } } }
+      - { call: up, args: [ {} ], expect: { error: { message: "Invalid migration id: no-module (expected module:name)" } } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  - name: invalid ids
+    steps:
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "-x:1", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: -x:1 (expected module:name)" } } }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "x:.1", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: x:.1 (expected module:name)" } } }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "x:a:b", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: x:a:b (expected module:name)" } } }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "x:a b", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: x:a b (expected module:name)" } } }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "x:1\n", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: x:1\n (expected module:name)" } }, note: $ does not accept a trailing newline }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "x:é", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: x:é (expected module:name)" } } }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "x:\u212A", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: x:\u212A (expected module:name)" } }, note: the Kelvin sign is not ASCII k (no Unicode case folding) }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "\u017Fx:1", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: \u017Fx:1 (expected module:name)" } }, note: the long s is not ASCII s }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id:  (expected module:name)" } } }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: undefined (expected module:name)" } } }
+
+  - name: ids are at most 200 characters
+    steps:
+      - { call: setFeatures, args: [ [ { id: m, migrations: [ { id: "m:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { value: [ { $partial: { id: "m:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", state: pending } } ] } }
+      - { call: setFeatures, args: [ [ { id: m, migrations: [ { id: "m:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", checksum: "1", up: [] } ] } ] ], expect: { value: null } }
+      - { call: status, expect: { error: { message: "Invalid migration id: m:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (expected module:name)" } } }
+
+  - name: duplicate ids fail across modules
+    init:
+      features:
+        - { id: a, migrations: [ { id: "shared:1", checksum: "1", up: [] } ] }
+        - { id: b, migrations: [ { id: "shared:1", checksum: "2", up: [] } ] }
+    steps:
+      - { call: status, expect: { error: { message: "Duplicate migration id: shared:1" } } }
+
+  - name: checks run per migration in order (id, duplicate, step, checksum)
+    steps:
+      - call: setFeatures
+        args: [ [ { id: a, migrations: [ { id: "a:1", checksum: "", up: [] }, { id: bad, checksum: "1", up: [] } ] } ] ]
+        expect: { value: null }
+      - { call: status, expect: { error: { message: "Migration without checksum: a:1" } } }
+      - call: setFeatures
+        args: [ [ { id: a, migrations: [ { id: "a:1", checksum: "1" }, { id: "a:1", checksum: "" } ] } ] ]
+        expect: { value: null }
+      - { call: status, expect: { error: { message: "Unsupported migration a:1 for memory" } } }
+      - call: setFeatures
+        args: [ [ { id: a, migrations: [ { id: "a:1", up: [] } ] } ] ]
+        expect: { value: null }
+      - { call: status, expect: { error: { message: "Migration without checksum: a:1" } } }
+      - call: setFeatures
+        args: [ [ { id: a, migrations: [ { id: "a:1", checksum: "1", up: [] }, { id: "a:1" } ] } ] ]
+        expect: { value: null }
+      - { call: status, expect: { error: { message: "Duplicate migration id: a:1" } } }
+
+  - name: unknown environments are refused
+    init: { features: *catalog, environment: qa }
+    steps:
+      - { call: status, expect: { error: { message: "Unknown environment: qa" } } }
+      - { call: seedStatus, expect: { error: { message: "Unknown environment: qa" } } }
+      - { call: setEnvironment, args: [ Local ], expect: { value: null } }
+      - { call: up, args: [ {} ], expect: { error: { message: "Unknown environment: Local" } } }
+      - { call: setEnvironment, args: [ prod ], expect: { value: null } }
+      - { call: up, args: [ {} ], expect: { value: [ "catalog:001", "catalog:002" ] } }
+
+  # --- providers --------------------------------------------------------------------------------
+  - name: a provider override replaces the generic step on that provider only
+    init:
+      features:
+        - id: legacy
+          migrations:
+            - id: "legacy:001"
+              checksum: generic
+              up: [ { context: true } ]
+              down: [ ]
+              providers: { memory: { checksum: memory-v1, up: [ { context: true } ] } }
+            - { id: "legacy:002", checksum: old, run: [ ] }
+            - { id: "legacy:003", checksum: dyn, up: [], providers: { dynamodb: { checksum: dynamo-v1, up: [] } } }
+    steps:
+      - { call: status, expect: { value: [ { id: "legacy:001", module: legacy, state: pending, reversible: false }, { id: "legacy:002", module: legacy, state: pending, reversible: false }, { id: "legacy:003", module: legacy, state: pending, reversible: false } ] }, note: down comes from the chosen source }
+      - { call: up, args: [ {} ], expect: { value: [ "legacy:001", "legacy:002", "legacy:003" ] } }
+      - { call: trace, expect: { value: [ "legacy:001 up@memory", { context: { provider: memory, environment: local } }, "legacy:002 run", "legacy:003 up" ] } }
+      - { call: row, args: [ MIGRATIONS, "legacy:001" ], expect: { value: { $partial: { data: { checksum: memory-v1, provider: memory, appliedAt: "2026-09-24T10:00:00.000Z" } } } } }
+      - { call: row, args: [ MIGRATIONS, "legacy:002" ], expect: { value: { $partial: { data: { checksum: old, provider: memory, appliedAt: "2026-09-24T10:00:00.000Z" } } } } }
+      - { call: row, args: [ MIGRATIONS, "legacy:003" ], expect: { value: { $partial: { data: { checksum: dyn, provider: memory, appliedAt: "2026-09-24T10:00:00.000Z" } } } } }
+
+  - name: the runner provider selects overrides and is recorded in history
+    init:
+      provider: dynamodb
+      environment: stage
+      features:
+        - id: idx
+          migrations:
+            - id: "idx:001"
+              checksum: generic
+              up: [ { context: true } ]
+              down: [ ]
+              providers:
+                dynamodb: { up: [ { context: true } ], down: [ { log: dynamo down } ] }
+            - { id: "idx:002", checksum: legacy, run: [], providers: { dynamodb: { checksum: legacy-dynamo, run: [] } } }
+    steps:
+      - { call: status, expect: { value: [ { $partial: { id: "idx:001", reversible: true } }, { $partial: { id: "idx:002", reversible: false } } ] } }
+      - { call: up, args: [ {} ], expect: { value: [ "idx:001", "idx:002" ] } }
+      - { call: trace, expect: { value: [ "idx:001 up@dynamodb", { context: { provider: dynamodb, environment: stage } }, "idx:002 run@dynamodb" ] } }
+      - { call: row, args: [ MIGRATIONS, "idx:001" ], expect: { value: { $partial: { data: { checksum: generic, provider: dynamodb, appliedAt: "2026-09-24T10:00:00.000Z" } } } }, note: an override without checksum keeps the migration checksum }
+      - { call: row, args: [ MIGRATIONS, "idx:002" ], expect: { value: { $partial: { data: { checksum: legacy-dynamo, provider: dynamodb, appliedAt: "2026-09-24T10:00:00.000Z" } } } } }
+      - { call: down, args: [ { step: 2 } ], expect: { error: { message: "Irreversible migrations: idx:002" } } }
+      - { call: down, args: [ { to: "idx:001" } ], expect: { error: { message: "Irreversible migrations: idx:002" } } }
+      - { call: setFeatures, args: [ [ { id: idx, migrations: [ { id: "idx:001", checksum: generic, up: [], providers: { dynamodb: { up: [], down: [ { log: dynamo down } ] } } } ] } ] ], expect: { value: null } }
+      - { call: down, args: [ {} ], expect: { value: [ "idx:001" ] } }
+      - { call: logs, expect: { value: [ "migrating idx:001", "migrating idx:002", "reverting idx:001", dynamo down ] } }
+
+  - name: an override without a step function does not fall back to the generic step
+    init:
+      features: [ { id: x, migrations: [ { id: "x:1", checksum: "1", up: [], providers: { memory: { checksum: "2" } } } ] } ]
+    steps:
+      - { call: status, expect: { error: { message: "Unsupported migration x:1 for memory" } } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [] } }
+
+  - name: provider-specific migrations cannot move to another engine; generic ones can
+    tags: [ interop ]
+    init:
+      rows:
+        - { pk: MIGRATIONS, sk: "catalog:001", version: 1, data: { checksum: catalog-document-v1, provider: dynamodb, appliedAt: "2026-01-01T00:00:00.000Z" } }
+      features: *catalog
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "catalog:002" ] }, note: generic history from another engine is accepted }
+      - { call: row, args: [ MIGRATIONS, "catalog:001" ], expect: { value: { pk: MIGRATIONS, sk: "catalog:001", version: 1, data: { checksum: catalog-document-v1, provider: dynamodb, appliedAt: "2026-01-01T00:00:00.000Z" } } } }
+      - call: setFeatures
+        args: [ [ { id: idx, migrations: [ { id: "idx:001", checksum: c, providers: { memory: { checksum: c, up: [] } } } ] } ] ]
+        expect: { value: null }
+      - { call: up, args: [ {} ], expect: { value: [ "idx:001" ] } }
+      - { call: row, args: [ MIGRATIONS, "idx:001" ], expect: { value: { $partial: { data: { checksum: c, provider: memory, appliedAt: "2026-09-24T10:00:00.000Z" } } } } }
+
+  - name: history of a provider-specific migration from another engine is a change
+    init:
+      rows:
+        - { pk: MIGRATIONS, sk: "idx:001", version: 1, data: { checksum: c, provider: dynamodb } }
+      features:
+        - { id: idx, migrations: [ { id: "idx:001", checksum: c, providers: { memory: { checksum: c, up: [] } } }, { id: "idx:002", checksum: d, up: [] } ] }
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: "Migration changed: idx:001" } } }
+      - { call: down, args: [ {} ], expect: { error: { message: "Migration changed: idx:001" } } }
+      - { call: status, expect: { value: [ { id: "idx:001", module: idx, state: applied, reversible: false }, { id: "idx:002", module: idx, state: pending, reversible: false } ] }, note: status does not verify }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] }, note: a failed verification releases the lock }
+      - { call: trace, expect: { value: [] } }
+
+  - name: provider-specific history without a provider passes
+    init:
+      rows:
+        - { pk: MIGRATIONS, sk: "idx:001", version: 2, data: { checksum: c } }
+      features:
+        - { id: idx, migrations: [ { id: "idx:001", checksum: c, providers: { memory: { checksum: c, up: [] } } }, { id: "idx:002", checksum: d, up: [] } ] }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "idx:002" ] } }
+      - { call: status, expect: { value: [ { id: "idx:001", module: idx, state: applied, reversible: false }, { id: "idx:002", module: idx, state: applied, appliedAt: "2026-09-24T10:00:00.000Z", reversible: false } ] } }
+
+  # --- checksums --------------------------------------------------------------------------------
+  - name: checksums are compared exactly and verified before every run
+    tags: [ interop ]
+    init:
+      rows:
+        - { pk: MIGRATIONS, sk: "catalog:001", version: 1, data: { checksum: catalog-document-v1, provider: memory, appliedAt: "2026-01-01T00:00:00.000Z" } }
+        - { pk: MIGRATIONS, sk: "catalog:002", version: 1, data: { checksum: "catalog-currencies-v1 ", provider: memory, appliedAt: "2026-01-01T00:00:00.000Z" } }
+      features: *catalog
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: "Migration changed: catalog:002" } } }
+      - { call: down, args: [ {} ], expect: { error: { message: "Migration changed: catalog:002" } } }
+      - { call: status, expect: { value: [ { $partial: { id: "catalog:001", state: applied } }, { $partial: { id: "catalog:002", state: applied } } ] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+      - { call: trace, expect: { value: [] } }
+
+  - name: the first changed migration in plan order is reported
+    init:
+      rows:
+        - { pk: MIGRATIONS, sk: "m:2", version: 1, data: { checksum: "x" } }
+        - { pk: MIGRATIONS, sk: "m:3", version: 1, data: { checksum: 3 } }
+      features: *three
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: "Migration changed: m:2" } } }
+      - call: setFeatures
+        args: [ [ { id: m, migrations: [ { id: "m:1", checksum: "1", up: [] }, { id: "m:2", checksum: "x", up: [] }, { id: "m:3", checksum: "3", up: [] } ] } ] ]
+        expect: { value: null }
+      - { call: up, args: [ {} ], expect: { error: { message: "Migration changed: m:3" } }, note: the number 3 is not the string "3" }
+
+  - name: history written before Umzug is reused as it is
+    tags: [ interop ]
+    init:
+      rows:
+        - { pk: MIGRATIONS, sk: "catalog:001", version: 3, data: { checksum: catalog-document-v1, provider: json, appliedAt: "2025-05-05T05:05:05.005Z", by: contracts.migrate } }
+      features: *catalog
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "catalog:002" ] } }
+      - { call: trace, expect: { value: [ "catalog:002 up", { ensured: [ CURRENCY/USD, CURRENCY/EUR ] } ] } }
+      - { call: status, expect: { value: [ { $partial: { id: "catalog:001", state: applied, appliedAt: "2025-05-05T05:05:05.005Z" } }, { $partial: { id: "catalog:002", state: applied } } ] } }
+
+  - name: history of modules that are no longer declared is reported as unknown and never reverted
+    init:
+      rows:
+        - { pk: MIGRATIONS, sk: "zz:001", version: 1, data: { checksum: "z" } }
+        - { pk: MIGRATIONS, sk: "old:001", version: 1, data: { checksum: old-document-v1, provider: memory, appliedAt: "2026-01-01T00:00:00.000Z" } }
+      features: *catalog
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "catalog:001", "catalog:002" ] } }
+      - call: status
+        expect:
+          value:
+            - { id: "catalog:001", module: catalog, description: Register the catalog document schema, state: applied, appliedAt: "2026-09-24T10:00:00.000Z", reversible: false }
+            - { id: "catalog:002", module: catalog, description: Add supported currencies, state: applied, appliedAt: "2026-09-24T10:00:00.000Z", reversible: true }
+            - { id: "old:001", module: old, state: unknown, appliedAt: "2026-01-01T00:00:00.000Z", reversible: false }
+            - { id: "zz:001", module: zz, state: unknown, reversible: false }
+      - { call: down, args: [ { to: "old:001" } ], expect: { error: { message: "Migration is not applied: old:001" } } }
+      - { call: down, args: [ {} ], expect: { value: [ "catalog:002" ] } }
+      - { call: row, args: [ MIGRATIONS, "old:001" ], expect: { value: { $partial: { sk: "old:001" } } } }
+
+  # --- lock -------------------------------------------------------------------------------------
+  - name: a live lock refuses the run without writing
+    init:
+      rows:
+        - { pk: MIGRATION_LOCKS, sk: migrations, version: 3, data: { owner: crashed, acquiredAt: "2026-09-24T09:50:00.000Z", expiresAt: "2026-09-24T10:05:00.000Z" } }
+      features: *catalog
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: "Migrations are already running (crashed, lock expires 2026-09-24T10:05:00.000Z)" } } }
+      - { call: down, args: [ {} ], expect: { error: { message: "Migrations are already running (crashed, lock expires 2026-09-24T10:05:00.000Z)" } } }
+      - { call: status, expect: { value: [ { $partial: { state: pending } }, { $partial: { state: pending } } ] }, note: status does not lock }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [] } }
+      - { call: row, args: [ MIGRATION_LOCKS, migrations ], expect: { value: { pk: MIGRATION_LOCKS, sk: migrations, version: 3, data: { owner: crashed, acquiredAt: "2026-09-24T09:50:00.000Z", expiresAt: "2026-09-24T10:05:00.000Z" } } } }
+      - { call: setNow, args: [ "2026-09-24T10:04:59.999Z" ], expect: { value: null } }
+      - { call: up, args: [ {} ], expect: { error: { message: "Migrations are already running (crashed, lock expires 2026-09-24T10:05:00.000Z)" } } }
+
+  - name: an expired lock is taken over, renewed before each step and released
+    init:
+      lockTtlMs: 1000
+      rows:
+        - { pk: MIGRATION_LOCKS, sk: migrations, version: 3, data: { owner: crashed, expiresAt: "2026-09-24T10:00:00.000Z" } }
+      features:
+        - id: m
+          migrations:
+            - { id: "m:1", checksum: "1", up: [ { peek: [ MIGRATION_LOCKS, migrations ] }, { advance: 250 } ] }
+            - { id: "m:2", checksum: "2", up: [ { peek: [ MIGRATION_LOCKS, migrations ] }, { peek: [ MIGRATIONS, "m:1" ] } ] }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "m:1", "m:2" ] }, note: expiresAt equal to now is expired }
+      - call: trace
+        expect:
+          value:
+            - "m:1 up"
+            - { peek: { pk: MIGRATION_LOCKS, sk: migrations, version: 5, data: { owner: runner-a, acquiredAt: "2026-09-24T10:00:00.000Z", expiresAt: "2026-09-24T10:00:01.000Z" } } }
+            - "m:2 up"
+            - { peek: { pk: MIGRATION_LOCKS, sk: migrations, version: 7, data: { owner: runner-a, acquiredAt: "2026-09-24T10:00:00.250Z", expiresAt: "2026-09-24T10:00:01.250Z" } } }
+            - { peek: { pk: MIGRATIONS, sk: "m:1", version: 1, data: { checksum: "1", provider: memory, appliedAt: "2026-09-24T10:00:00.250Z" } } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+      - { call: row, args: [ MIGRATIONS, "m:2" ], expect: { value: { $partial: { data: { checksum: "2", provider: memory, appliedAt: "2026-09-24T10:00:00.250Z" } } } } }
+
+  - name: a lock without a valid expiry is taken over
+    init:
+      rows:
+        - { pk: MIGRATION_LOCKS, sk: migrations, version: 1, data: { owner: someone, expiresAt: soon } }
+        - { pk: MIGRATION_LOCKS, sk: seeds, version: 9, data: { owner: someone } }
+      features:
+        - { id: m, migrations: [ { id: "m:1", checksum: "1", up: [ { peek: [ MIGRATION_LOCKS, migrations ] } ] } ], seeds: [ { id: "m:s", run: [ { peek: [ MIGRATION_LOCKS, seeds ] } ] } ] }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "m:1" ] } }
+      - { call: seed, args: [ {} ], expect: { value: [ "m:s" ] } }
+      - call: trace
+        expect:
+          value:
+            - "m:1 up"
+            - { peek: { pk: MIGRATION_LOCKS, sk: migrations, version: 3, data: { owner: runner-a, acquiredAt: "2026-09-24T10:00:00.000Z", expiresAt: "2026-09-24T10:15:00.000Z" } } }
+            - "m:s seed"
+            - { peek: { pk: MIGRATION_LOCKS, sk: seeds, version: 11, data: { owner: runner-a, acquiredAt: "2026-09-24T10:00:00.000Z", expiresAt: "2026-09-24T10:15:00.000Z" } } }
+
+  - name: a live lock without an owner names undefined
+    init:
+      rows:
+        - { pk: MIGRATION_LOCKS, sk: migrations, version: 1, data: { expiresAt: "2026-09-24T11:00:00.000Z" } }
+      features: *catalog
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: "Migrations are already running (undefined, lock expires 2026-09-24T11:00:00.000Z)" } } }
+
+  - name: a failed acquisition reports the current holder or unknown
+    steps:
+      - { call: injectFaults, args: [ conflict ], expect: { value: null } }
+      - { call: up, args: [ {} ], expect: { error: { message: "Migrations are already running (unknown, lock expires unknown)" } } }
+      - { call: injectFaults, args: [ error ], expect: { value: null } }
+      - { call: down, args: [ {} ], expect: { error: { message: "Migrations are already running (unknown, lock expires unknown)" } }, note: any failed write counts }
+      - { call: up, args: [ {} ], expect: { value: [ "catalog:001", "catalog:002" ] } }
+      - { call: injectFaults, args: [ error ], expect: { value: null } }
+      - { call: up, args: [ {} ], expect: { error: { message: "Migrations are already running (unknown, lock expires unknown)" } }, note: the lock is taken even when nothing is pending }
+
+  - name: another runner is locked out while one runs
+    init:
+      features:
+        - id: slow
+          migrations:
+            - id: "slow:001"
+              checksum: "1"
+              up:
+                - { nested: { runner: migrations, owner: runner-b, call: up } }
+                - { nested: { runner: migrations, owner: runner-a, call: status, features: *catalog } }
+                - { nested: { runner: seeds, owner: runner-c, call: run, features: [ { id: s, seeds: [ { id: "s:1", run: [] } ] } ] } }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "slow:001" ] } }
+      - call: trace
+        expect:
+          value:
+            - "slow:001 up"
+            - { nested: { error: "Migrations are already running (runner-a, lock expires 2026-09-24T10:15:00.000Z)" } }
+            - { nested: { value: [ { id: "catalog:001", module: catalog, description: Register the catalog document schema, state: pending, reversible: false }, { id: "catalog:002", module: catalog, description: Add supported currencies, state: pending, reversible: true } ] } }
+            - "s:1 seed"
+            - { nested: { value: [ "s:1" ] } }
+        note: status reads without locking; seeds use their own lock
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  - name: a lease stolen during a step stops the runner before it records anything
+    init:
+      features:
+        - id: lease
+          migrations:
+            - { id: "lease:intrude", checksum: "1", up: [ { steal: { lock: migrations, owner: intruder } } ] }
+            - { id: "lease:after", checksum: "2", up: [] }
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [] } }
+      - { call: trace, expect: { value: [ "lease:intrude up" ] } }
+      - { call: row, args: [ MIGRATION_LOCKS, migrations ], expect: { value: { pk: MIGRATION_LOCKS, sk: migrations, version: 3, data: { owner: intruder, acquiredAt: "2026-09-24T10:00:00.000Z", expiresAt: "2026-09-24T10:15:00.000Z" } } }, note: the intruder's lease is left intact }
+
+  - name: a lease lost before a step fails that step through its renewal
+    init:
+      features:
+        - id: lease
+          migrations:
+            - { id: "lease:1", checksum: "1", up: [ { faults: [ ok, conflict ] } ] }
+            - { id: "lease:2", checksum: "2", up: [] }
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { message: "Migration lease:2 (up) failed: Original error: Conflict: refresh and try again" } } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [ { $partial: { sk: "lease:1" } } ] } }
+      - { call: trace, expect: { value: [ "lease:1 up" ] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  - name: a runner that outlives its lease still records while nobody took it over
+    init:
+      lockTtlMs: 60000
+      features:
+        - id: m
+          migrations:
+            - { id: "m:1", checksum: "1", up: [ { advance: 3600000 } ] }
+            - { id: "m:2", checksum: "2", up: [ { peek: [ MIGRATION_LOCKS, migrations ] } ] }
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "m:1", "m:2" ] } }
+      - { call: trace, expect: { value: [ "m:1 up", "m:2 up", { peek: { pk: MIGRATION_LOCKS, sk: migrations, version: 4, data: { owner: runner-a, acquiredAt: "2026-09-24T11:00:00.000Z", expiresAt: "2026-09-24T11:01:00.000Z" } } } ] } }
+
+  - name: an expired lease taken over by another runner loses the history write
+    init:
+      lockTtlMs: 60000
+      features:
+        - id: m
+          migrations:
+            - id: "m:1"
+              checksum: "1"
+              up:
+                - { advance: 60000 }
+                - { nested: { runner: migrations, owner: runner-b, call: up } }
+            - { id: "m:2", checksum: "2", up: [] }
+    steps:
+      - { call: up, args: [ {} ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: trace, expect: { value: [ "m:1 up", { nested: { value: [] } } ] } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] }, note: runner-b released its own lease }
+
+  - name: the default owner is rt-app- and a random UUID
+    init:
+      features: [ { id: m, migrations: [ { id: "m:1", checksum: "1", up: [ { peek: [ MIGRATION_LOCKS, migrations ] } ] } ] } ]
+    steps:
+      - { call: setOwner, args: [ null ], expect: { value: null } }
+      - { call: up, args: [ {} ], expect: { value: [ "m:1" ] } }
+      - call: trace
+        expect: { value: [ "m:1 up", { peek: { pk: MIGRATION_LOCKS, sk: migrations, version: 2, data: { owner: { $regex: "^rt-app-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }, acquiredAt: "2026-09-24T10:00:00.000Z", expiresAt: "2026-09-24T10:15:00.000Z" } } } ] }
+
+  # --- context ----------------------------------------------------------------------------------
+  - name: steps see the store provider, the environment and the log
+    init:
+      environment: develop
+      features: [ { id: m, migrations: [ { id: "m:1", checksum: "1", up: [ { context: true }, { log: hello } ], down: [ { log: bye } ] } ] } ]
+    steps:
+      - { call: up, args: [ {} ], expect: { value: [ "m:1" ] } }
+      - { call: down, args: [ {} ], expect: { value: [ "m:1" ] } }
+      - { call: trace, expect: { value: [ "m:1 up", { context: { provider: memory, environment: develop } }, "m:1 down" ] } }
+      - { call: logs, expect: { value: [ "migrating m:1", hello, "reverting m:1", bye ] } }
+
+  - name: ensureRows inserts missing rows only and never overwrites
+    tags: [ idempotency ]
+    init:
+      rows: [ { pk: P, sk: a, version: 4, data: { n: 99 } } ]
+    steps:
+      - call: ensureRows
+        args: [ [ { pk: P, sk: a, data: { n: 1 } }, { pk: P, sk: b, data: { n: 2 }, ttl: 4102444800 }, { pk: P, sk: b, data: { n: 3 } }, { pk: Q, sk: a, version: 7, data: {} } ] ]
+        expect: { value: [ P/b, Q/a ] }
+      - { call: rows, args: [ P ], expect: { value: [ { pk: P, sk: a, version: 4, data: { n: 99 } }, { pk: P, sk: b, version: 1, data: { n: 2 }, ttl: 4102444800 } ] } }
+      - { call: row, args: [ Q, a ], expect: { value: { pk: Q, sk: a, version: 1, data: {} } }, note: rows are always created with version 1 }
+      - { call: ensureRows, args: [ [ { pk: P, sk: a, data: {} }, { pk: P, sk: b, data: {} } ] ], expect: { value: [] } }
+
+  - name: ensureRows keeps rows another writer created and rethrows other failures
+    tags: [ idempotency ]
+    steps:
+      - { call: injectFaults, args: [ lostAck ], expect: { value: null } }
+      - { call: ensureRows, args: [ [ { pk: P, sk: a, data: { n: 1 } }, { pk: P, sk: b, data: { n: 2 } } ] ], expect: { value: [ P/b ] }, note: the row exists after the failure, so the error is swallowed }
+      - { call: row, args: [ P, a ], expect: { value: { pk: P, sk: a, version: 1, data: { n: 1 } } } }
+      - { call: injectFaults, args: [ error ], expect: { value: null } }
+      - { call: ensureRows, args: [ [ { pk: P, sk: c, data: {} } ] ], expect: { error: { message: Store unavailable } } }
+      - { call: injectFaults, args: [ conflict ], expect: { value: null } }
+      - { call: ensureRows, args: [ [ { pk: P, sk: c, data: {} } ] ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: row, args: [ P, c ], expect: { value: null } }
+
+  # --- seeds ------------------------------------------------------------------------------------
+  - name: seeds run once per environment in module order and record their version
+    tags: [ interop ]
+    init:
+      environment: stage
+      secrets: { DEMO_PASSWORD: Demo-password-2026! }
+      services: { users: { owner: ana } }
+      features: &seeded
+        - id: users
+          seeds:
+            - id: "users:demo"
+              description: Demo identities
+              run: [ { secret: DEMO_PASSWORD }, { ensure: [ { pk: USERS, sk: ana, data: { name: Ana } } ] } ]
+        - id: catalog
+          seeds:
+            - { id: "catalog:currencies", environments: [ local, develop, stage, prod ], run: [ { ensure: [ { pk: CURRENCY, sk: USD, data: {} } ] } ] }
+            - { id: "catalog:products", run: [ { service: users } ] }
+    steps:
+      - call: seedStatus
+        expect:
+          value:
+            - { id: "users:demo", module: users, description: Demo identities, environments: [ local, develop, stage ], state: pending }
+            - { id: "catalog:currencies", module: catalog, environments: [ local, develop, stage, prod ], state: pending }
+            - { id: "catalog:products", module: catalog, environments: [ local, develop, stage ], state: pending }
+      - { call: seed, args: [ null ], expect: { value: [ "users:demo", "catalog:currencies", "catalog:products" ] } }
+      - { call: seed, args: [ {} ], expect: { value: [] } }
+      - call: trace
+        expect:
+          value:
+            - "users:demo seed"
+            - { secret: Demo-password-2026! }
+            - { ensured: [ USERS/ana ] }
+            - "catalog:currencies seed"
+            - { ensured: [ CURRENCY/USD ] }
+            - "catalog:products seed"
+            - { service: { owner: ana } }
+      - call: rows
+        args: [ SEEDS ]
+        expect:
+          value:
+            - { pk: SEEDS, sk: "catalog:currencies", version: 1, data: { version: "1", environment: stage, appliedAt: "2026-09-24T10:00:00.000Z" } }
+            - { pk: SEEDS, sk: "catalog:products", version: 1, data: { version: "1", environment: stage, appliedAt: "2026-09-24T10:00:00.000Z" } }
+            - { pk: SEEDS, sk: "users:demo", version: 1, data: { version: "1", environment: stage, appliedAt: "2026-09-24T10:00:00.000Z" } }
+      - { call: seedStatus, expect: { value: [ { $partial: { state: applied, appliedAt: "2026-09-24T10:00:00.000Z" } }, { $partial: { state: applied } }, { $partial: { state: applied } } ] } }
+      - { call: logs, expect: { value: [ "seeding users:demo", "seeding catalog:currencies", "seeding catalog:products" ] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  - name: production only runs seeds that list prod
+    init:
+      environment: prod
+      secrets: { DEMO_PASSWORD: x }
+      services: { users: { owner: ana } }
+      features: *seeded
+    steps:
+      - { call: seed, args: [ {} ], expect: { value: [ "catalog:currencies" ] } }
+      - { call: row, args: [ USERS, ana ], expect: { value: null } }
+      - { call: seedStatus, expect: { value: [ { $partial: { id: "users:demo", state: skipped } }, { $partial: { id: "catalog:currencies", state: applied, appliedAt: "2026-09-24T10:00:00.000Z" } }, { $partial: { id: "catalog:products", state: skipped } } ] } }
+      - { call: setEnvironment, args: [ local ], expect: { value: null } }
+      - { call: seed, args: [ {} ], expect: { value: [ "users:demo", "catalog:products" ] }, note: history is per database, not per environment }
+      - { call: row, args: [ SEEDS, "catalog:currencies" ], expect: { value: { pk: SEEDS, sk: "catalog:currencies", version: 1, data: { version: "1", environment: prod, appliedAt: "2026-09-24T10:00:00.000Z" } } } }
+      - { call: setEnvironment, args: [ prod ], expect: { value: null } }
+      - { call: seedStatus, expect: { value: [ { $partial: { id: "users:demo", state: skipped, appliedAt: "2026-09-24T10:00:00.000Z" } }, { $partial: { state: applied } }, { $partial: { state: skipped } } ] }, note: skipped keeps appliedAt }
+
+  - name: rerun forces applied seeds; a new version runs only the changed seed
+    init:
+      secrets: { DEMO_PASSWORD: x }
+      services: { users: { owner: ana } }
+      features: *seeded
+    steps:
+      - { call: seed, args: [ {} ], expect: { value: [ "users:demo", "catalog:currencies", "catalog:products" ] } }
+      - { call: setNow, args: [ "2026-09-25T00:00:00.000Z" ], expect: { value: null } }
+      - { call: seed, args: [ { rerun: true, modules: [ users ] } ], expect: { value: [ "users:demo" ] } }
+      - { call: row, args: [ SEEDS, "users:demo" ], expect: { value: { pk: SEEDS, sk: "users:demo", version: 2, data: { version: "1", environment: local, appliedAt: "2026-09-25T00:00:00.000Z" } } } }
+      - call: setFeatures
+        args:
+          - - { id: users, seeds: [ { id: "users:demo", run: [] } ] }
+            - { id: catalog, seeds: [ { id: "catalog:currencies", environments: [ local ], run: [] }, { id: "catalog:products", version: "2", run: [] } ] }
+        expect: { value: null }
+      - { call: seedStatus, expect: { value: [ { $partial: { state: applied } }, { $partial: { state: applied } }, { $partial: { state: changed, appliedAt: "2026-09-24T10:00:00.000Z" } } ] } }
+      - { call: seed, args: [ {} ], expect: { value: [ "catalog:products" ] } }
+      - { call: row, args: [ SEEDS, "catalog:products" ], expect: { value: { pk: SEEDS, sk: "catalog:products", version: 2, data: { version: "2", environment: local, appliedAt: "2026-09-25T00:00:00.000Z" } } } }
+      - { call: seed, args: [ { rerun: true } ], expect: { value: [ "users:demo", "catalog:currencies", "catalog:products" ] } }
+      - { call: rows, args: [ SEEDS ], expect: { value: [ { $partial: { version: 2 } }, { $partial: { version: 3 } }, { $partial: { version: 3 } } ] } }
+
+  - name: history of an older seed version from another language is pending again
+    tags: [ interop ]
+    init:
+      rows:
+        - { pk: SEEDS, sk: "a:s", version: 4, data: { version: "1", environment: develop, appliedAt: "2026-01-01T00:00:00.000Z" } }
+        - { pk: SEEDS, sk: "a:t", version: 1, data: { version: 2 } }
+      features: [ { id: a, seeds: [ { id: "a:s", version: "2", run: [] }, { id: "a:t", version: "2", run: [] } ] } ]
+    steps:
+      - { call: seedStatus, expect: { value: [ { id: "a:s", module: a, environments: [ local, develop, stage ], appliedAt: "2026-01-01T00:00:00.000Z", state: changed }, { id: "a:t", module: a, environments: [ local, develop, stage ], state: changed } ] }, note: versions compare with === (2 is not "2") }
+      - { call: seed, args: [ {} ], expect: { value: [ "a:s", "a:t" ] } }
+      - { call: row, args: [ SEEDS, "a:s" ], expect: { value: { pk: SEEDS, sk: "a:s", version: 5, data: { version: "2", environment: local, appliedAt: "2026-09-24T10:00:00.000Z" } } } }
+
+  - name: the module filter selects seeds by id prefix and needs declared modules
+    init:
+      secrets: { DEMO_PASSWORD: x }
+      services: { users: { owner: ana } }
+      features:
+        - id: users
+          seeds: [ { id: "users:demo", run: [] } ]
+        - id: catalog
+          seeds: [ { id: "catalog:a", run: [] }, { id: "extra:b", run: [] } ]
+        - id: empty
+    steps:
+      - { call: seed, args: [ { modules: [ billing ] } ], expect: { error: { message: "Unknown module: billing" } } }
+      - { call: seed, args: [ { modules: [ catalog, extra ] } ], expect: { error: { message: "Unknown module: extra" } }, note: module names are module ids, checked first }
+      - { call: seed, args: [ { modules: [ empty ] } ], expect: { value: [] } }
+      - { call: seed, args: [ { modules: [] } ], expect: { value: [] } }
+      - { call: seed, args: [ { modules: [ catalog ] } ], expect: { value: [ "catalog:a" ] } }
+      - { call: seed, args: [ { modules: [ catalog, users ] } ], expect: { value: [ "users:demo" ] } }
+      - { call: injectFaults, args: [ error ], expect: { value: null } }
+      - { call: seed, args: [ { modules: [ empty ] } ], expect: { value: [] }, note: nothing selected, nothing locked }
+      - { call: seed, args: [ {} ], expect: { error: { message: "Migrations are already running (unknown, lock expires unknown)" } }, note: extra:b is pending and needs the lock }
+
+  - name: invalid seed declarations
+    steps:
+      - { call: setFeatures, args: [ [ { id: x, seeds: [ { id: "x:a", environments: [], run: [] } ] } ] ], expect: { value: null } }
+      - { call: seedStatus, expect: { error: { message: "Invalid environments for seed x:a" } } }
+      - { call: setFeatures, args: [ [ { id: x, seeds: [ { id: "x:a", environments: [ local, qa ], run: [] } ] } ] ], expect: { value: null } }
+      - { call: seed, args: [ {} ], expect: { error: { message: "Invalid environments for seed x:a" } } }
+      - { call: setFeatures, args: [ [ { id: x, seeds: [ { id: nomodule, run: [] } ] } ] ], expect: { value: null } }
+      - { call: seedStatus, expect: { error: { message: "Invalid seed id: nomodule (expected module:name)" } } }
+      - { call: setFeatures, args: [ [ { id: x, seeds: [ { id: "x:a", environments: [ qa ], run: [] }, { id: "x:a", run: [] } ] } ] ], expect: { value: null } }
+      - { call: seedStatus, expect: { error: { message: "Invalid environments for seed x:a" } }, note: each seed is checked completely before the next }
+      - { call: setFeatures, args: [ [ { id: x, seeds: [ { id: "x:a", run: [] }, { id: "x:a", environments: [ qa ], run: [] } ] } ] ], expect: { value: null } }
+      - { call: seedStatus, expect: { error: { message: "Duplicate seed id: x:a" } } }
+      - { call: setFeatures, args: [ [ { id: x, migrations: [ { id: "x:a", checksum: "1", up: [] } ], seeds: [ { id: "x:a", run: [] } ] } ] ], expect: { value: null } }
+      - { call: seedStatus, expect: { value: [ { id: "x:a", module: x, environments: [ local, develop, stage ], state: pending } ] }, note: seeds and migrations have separate ids }
+      - { call: status, expect: { value: [ { id: "x:a", module: x, state: pending, reversible: false } ] } }
+
+  - name: missing secrets or services fail the seed without recording it
+    init:
+      environment: develop
+      secrets: { DEMO_PASSWORD: "" }
+      features: *seeded
+    steps:
+      - { call: seed, args: [ { modules: [ users ] } ], expect: { error: { message: "Migration users:demo (up) failed: Original error: Seed users:demo requires DEMO_PASSWORD" } }, note: an empty secret is missing }
+      - { call: row, args: [ SEEDS, "users:demo" ], expect: { value: null } }
+      - { call: seed, args: [ { modules: [ catalog ] } ], expect: { error: { message: "Migration catalog:products (up) failed: Original error: Seed catalog:products requires the users service" } } }
+      - { call: row, args: [ SEEDS, "catalog:currencies" ], expect: { value: { $partial: { version: 1 } } }, note: seeds before the failure stay recorded }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+      - { call: seedStatus, expect: { value: [ { $partial: { state: pending } }, { $partial: { state: applied } }, { $partial: { state: pending } } ] } }
+
+  - name: seeding has its own lock and refuses concurrent seed runs
+    init:
+      rows:
+        - { pk: MIGRATION_LOCKS, sk: migrations, version: 1, data: { owner: migrator, expiresAt: "2026-09-24T11:00:00.000Z" } }
+      features:
+        - id: slow
+          seeds:
+            - id: "slow:data"
+              run:
+                - { nested: { runner: seeds, owner: runner-b, call: run } }
+                - { nested: { runner: seeds, owner: runner-b, call: run, features: [ { id: other, seeds: [ { id: "other:1", run: [] } ] } ] } }
+    steps:
+      - { call: seed, args: [ {} ], expect: { value: [ "slow:data" ] }, note: a live migrations lock does not block seeds }
+      - call: trace
+        expect:
+          value:
+            - "slow:data seed"
+            - { nested: { value: [] } }
+            - { nested: { error: "Migrations are already running (runner-a, lock expires 2026-09-24T10:15:00.000Z)" } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [ { $partial: { sk: migrations, data: { owner: migrator, expiresAt: "2026-09-24T11:00:00.000Z" } } } ] } }
+
+  - name: a lost seed lease fails the seed history write
+    init:
+      features:
+        - { id: s, seeds: [ { id: "s:1", run: [ { steal: { lock: seeds, owner: intruder, ttlMs: 5000 } } ] }, { id: "s:2", run: [] } ] }
+    steps:
+      - { call: seed, args: [ {} ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: rows, args: [ SEEDS ], expect: { value: [] } }
+      - { call: row, args: [ MIGRATION_LOCKS, seeds ], expect: { value: { pk: MIGRATION_LOCKS, sk: seeds, version: 3, data: { owner: intruder, acquiredAt: "2026-09-24T10:00:00.000Z", expiresAt: "2026-09-24T10:00:05.000Z" } } } }
+
+  # --- rta migrate ------------------------------------------------------------------------------
+  - name: migrate status, up and down print what they do
+    tags: [ cli ]
+    steps:
+      - call: migrateCommand
+        args: [ [] ]
+        expect:
+          value:
+            - "Migrations (local):"
+            - "  pending  catalog:001 — Register the catalog document schema"
+            - "  pending  catalog:002 — Add supported currencies"
+            - "2 pending. Run: rta migrate up"
+      - { call: migrateCommand, args: [ [ up, --step, "1" ] ], expect: { value: [ "  migrating catalog:001", "Applied: catalog:001" ] } }
+      - { call: migrateCommand, args: [ [ up, --json ] ], expect: { value: [ "{\"environment\":\"local\",\"applied\":[\"catalog:002\"]}" ] } }
+      - { call: migrateCommand, args: [ [ up ] ], expect: { value: [ Nothing to apply. ] } }
+      - call: migrateCommand
+        args: [ [ status ] ]
+        expect:
+          value:
+            - "Migrations (local):"
+            - "  applied  catalog:001 — Register the catalog document schema (2026-09-24T10:00:00.000Z)"
+            - "  applied  catalog:002 — Add supported currencies (2026-09-24T10:00:00.000Z)"
+            - Up to date.
+      - { call: migrateCommand, args: [ [ down, --to, "catalog:002" ] ], expect: { value: [ "  reverting catalog:002", "Reverted: catalog:002" ] } }
+      - { call: migrateCommand, args: [ [ down, --step, "0" ] ], expect: { value: [ Nothing to revert. ] } }
+      - { call: migrateCommand, args: [ [ down, --json, --step, "0" ] ], expect: { value: [ "{\"environment\":\"local\",\"reverted\":[]}" ] } }
+      - { call: migrateCommand, args: [ [ up, --step, "5", --json, --step, "1" ] ], expect: { value: [ "{\"environment\":\"local\",\"applied\":[\"catalog:002\"]}" ] }, note: a repeated flag keeps its last value }
+
+  - name: migrate status --json is indented JSON with fields in order
+    tags: [ cli, interop ]
+    init:
+      environment: stage
+      rows:
+        - { pk: MIGRATIONS, sk: "gone:1", version: 1, data: { checksum: g, appliedAt: "2026-01-01T00:00:00.000Z" } }
+      features:
+        - id: m
+          migrations:
+            - { id: "m:1", checksum: "1", description: "Añadir — «monedas» \"€\" </script>", up: [], down: [] }
+            - { id: "m:2", checksum: "2", description: "", up: [] }
+    steps:
+      - { call: migrateCommand, args: [ [ up, --step, "1" ] ], expect: { value: [ "  migrating m:1", "Applied: m:1" ] } }
+      - call: migrateCommand
+        args: [ [ status, --json ] ]
+        expect:
+          value:
+            - "{\n  \"environment\": \"stage\",\n  \"migrations\": [\n    {\n      \"id\": \"m:1\",\n      \"module\": \"m\",\n      \"description\": \"Añadir — «monedas» \\\"€\\\" </script>\",\n      \"state\": \"applied\",\n      \"appliedAt\": \"2026-09-24T10:00:00.000Z\",\n      \"reversible\": true\n    },\n    {\n      \"id\": \"m:2\",\n      \"module\": \"m\",\n      \"description\": \"\",\n      \"state\": \"pending\",\n      \"reversible\": false\n    },\n    {\n      \"id\": \"gone:1\",\n      \"module\": \"gone\",\n      \"state\": \"unknown\",\n      \"appliedAt\": \"2026-01-01T00:00:00.000Z\",\n      \"reversible\": false\n    }\n  ]\n}"
+      - call: migrateCommand
+        args: [ [ status ] ]
+        expect:
+          value:
+            - "Migrations (stage):"
+            - "  applied  m:1 — Añadir — «monedas» \"€\" </script> (2026-09-24T10:00:00.000Z)"
+            - "  pending  m:2"
+            - "  unknown  gone:1 (2026-01-01T00:00:00.000Z)"
+            - "1 pending. Run: rta migrate up"
+
+  - name: migrate prints step logs and propagates runner errors
+    tags: [ cli ]
+    init: { features: *flaky }
+    steps:
+      - { call: migrateCommand, args: [ [ up ] ], expect: { error: { message: "Migration flaky:002 (up) failed: Original error: provider unavailable" } } }
+      - { call: output, expect: { value: [ "  migrating flaky:001", "  migrating flaky:002" ] } }
+      - { call: migrateCommand, args: [ [ up, --json ] ], expect: { error: { message: "Migration flaky:002 (up) failed: Original error: provider unavailable" } } }
+      - { call: output, expect: { value: [] }, note: --json silences log lines }
+      - call: setFeatures
+        args: [ [ { id: m, migrations: [ { id: "m:1", checksum: "1", up: [ { log: copying rows }, { context: true } ] } ] } ] ]
+        expect: { value: null }
+      - { call: migrateCommand, args: [ [ up ] ], expect: { value: [ "  migrating m:1", "  copying rows", "Applied: m:1" ] } }
+      - { call: setOwner, args: [ other ], expect: { value: null } }
+      - { call: migrateCommand, args: [ [ down ] ], expect: { error: { message: "Irreversible migrations: m:1" } } }
+
+  - name: migrate rejects malformed arguments before touching the store
+    tags: [ cli ]
+    steps:
+      - { call: migrateCommand, args: [ [ sideways ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --step, "-1" ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --step, x ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --step, "1.5" ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --step, Infinity ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --step ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --to ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --to, --json ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --force ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --json=true ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, stray ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ --json, up ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } }, note: the action comes first }
+      - { call: migrateCommand, args: [ [ status, --step, "1" ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ status, --to, "catalog:001" ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ Up ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, "-step", "1" ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: rows, args: [ MIGRATIONS ], expect: { value: [] } }
+      - { call: rows, args: [ MIGRATION_LOCKS ], expect: { value: [] } }
+
+  - name: migrate --step follows JavaScript Number()
+    tags: [ cli ]
+    init: { features: *three }
+    steps:
+      - { call: migrateCommand, args: [ [ up, --step, "" ] ], expect: { value: [ Nothing to apply. ] }, note: Number("") is 0 }
+      - { call: migrateCommand, args: [ [ up, --step, "-0" ] ], expect: { value: [ Nothing to apply. ] } }
+      - { call: migrateCommand, args: [ [ up, --step, " 1\n" ] ], expect: { value: [ "  migrating m:1", "Applied: m:1" ] } }
+      - { call: migrateCommand, args: [ [ up, --step, "0x1" ] ], expect: { value: [ "  migrating m:2", "Applied: m:2" ] } }
+      - { call: migrateCommand, args: [ [ down, --step, "1e0" ] ], expect: { value: [ "  reverting m:2", "Reverted: m:2" ] } }
+      - { call: migrateCommand, args: [ [ up, --step, "+1.0" ] ], expect: { value: [ "  migrating m:2", "Applied: m:2" ] } }
+      - { call: migrateCommand, args: [ [ up, --step, "1e21" ] ], expect: { value: [ "  migrating m:3", "Applied: m:3" ] } }
+      - { call: migrateCommand, args: [ [ down, --step, "0b10" ] ], expect: { value: [ "  reverting m:3", "  reverting m:2", "Reverted: m:3, m:2" ] } }
+      - { call: migrateCommand, args: [ [ up, --step, "0o0" ] ], expect: { value: [ Nothing to apply. ] } }
+      - { call: migrateCommand, args: [ [ up, --step, "-0x1" ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } }, note: signed hex is NaN }
+      - { call: migrateCommand, args: [ [ up, --step, "1_0" ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } } }
+      - { call: migrateCommand, args: [ [ up, --step, ".5e1" ] ], expect: { value: [ "  migrating m:2", "  migrating m:3", "Applied: m:2, m:3" ] } }
+
+  - name: runner errors come before argument errors checked later
+    tags: [ cli ]
+    init:
+      features:
+        - { id: a, migrations: [ { id: "a:1", checksum: "1", up: [] } ] }
+        - { id: b, migrations: [ { id: "a:1", checksum: "1", up: [] } ] }
+    steps:
+      - { call: migrateCommand, args: [ [ sideways ] ], expect: { error: { message: "Duplicate migration id: a:1" } }, note: the action is checked after the runner is built }
+      - { call: migrateCommand, args: [ [ up, --step, x ] ], expect: { error: { message: "Duplicate migration id: a:1" } } }
+      - { call: migrateCommand, args: [ [ up, --bogus ] ], expect: { error: { message: "Usage: rta migrate [status|up|down] [--to <id>] [--step <n>] [--json]" } }, note: unknown flags are checked first }
+      - { call: seedCommand, args: [ [ plant ], {} ], expect: { error: { message: "Usage: rta seed [status|run] [--module <id>[,<id>]] [--rerun] [--json]" } } }
+
+  - name: migrate reports a locked database
+    tags: [ cli ]
+    init:
+      rows:
+        - { pk: MIGRATION_LOCKS, sk: migrations, version: 1, data: { owner: deploy-42, expiresAt: "2026-09-24T10:10:00.000Z" } }
+      features: *catalog
+    steps:
+      - { call: migrateCommand, args: [ [ up ] ], expect: { error: { message: "Migrations are already running (deploy-42, lock expires 2026-09-24T10:10:00.000Z)" } } }
+      - { call: migrateCommand, args: [ [ status ] ], expect: { value: [ "Migrations (local):", "  pending  catalog:001 — Register the catalog document schema", "  pending  catalog:002 — Add supported currencies", "2 pending. Run: rta migrate up" ] } }
+
+  # --- rta seed ---------------------------------------------------------------------------------
+  - name: seed run and status with module filter, rerun and secrets
+    tags: [ cli ]
+    init:
+      environment: stage
+      features: &demo
+        - id: catalog
+          seeds: [ { id: "catalog:demo", description: Demo products, run: [ { secret: DEMO_PASSWORD } ] } ]
+    steps:
+      - { call: seedCommand, args: [ [], {} ], expect: { error: { message: "Migration catalog:demo (up) failed: Original error: Seed catalog:demo requires DEMO_PASSWORD" } } }
+      - { call: output, expect: { value: [ "  seeding catalog:demo" ] } }
+      - { call: seedCommand, args: [ [ --module, catalog ], { DEMO_PASSWORD: x } ], expect: { value: [ "  seeding catalog:demo", "Seeded: catalog:demo" ] } }
+      - { call: seedCommand, args: [ [ run ], { DEMO_PASSWORD: x } ], expect: { value: [ No pending seeds for stage. ] } }
+      - { call: seedCommand, args: [ [ run, --rerun, --json ], { DEMO_PASSWORD: x } ], expect: { value: [ "{\"environment\":\"stage\",\"seeded\":[\"catalog:demo\"]}" ] } }
+      - { call: seedCommand, args: [ [ status ], {} ], expect: { value: [ "Seeds (stage):", "  applied  catalog:demo — Demo products" ] } }
+      - call: seedCommand
+        args: [ [ status, --json ], {} ]
+        expect:
+          value:
+            - "{\n  \"environment\": \"stage\",\n  \"seeds\": [\n    {\n      \"id\": \"catalog:demo\",\n      \"module\": \"catalog\",\n      \"description\": \"Demo products\",\n      \"environments\": [\n        \"local\",\n        \"develop\",\n        \"stage\"\n      ],\n      \"appliedAt\": \"2026-09-24T10:00:00.000Z\",\n      \"state\": \"applied\"\n    }\n  ]\n}"
+      - { call: trace, expect: { value: [ "catalog:demo seed", "catalog:demo seed", { secret: x }, "catalog:demo seed", { secret: x } ] } }
+
+  - name: seed status lists every state
+    tags: [ cli ]
+    init:
+      environment: develop
+      rows:
+        - { pk: SEEDS, sk: "a:changed", version: 1, data: { version: "1" } }
+        - { pk: SEEDS, sk: "a:done", version: 1, data: { version: "1" } }
+      features:
+        - id: a
+          seeds:
+            - { id: "a:done", run: [] }
+            - { id: "a:changed", version: "2", run: [] }
+            - { id: "a:new", description: New, run: [] }
+            - { id: "a:prod", environments: [ prod ], run: [] }
+    steps:
+      - call: seedCommand
+        args: [ [ status ], {} ]
+        expect: { value: [ "Seeds (develop):", "  applied  a:done", "  changed  a:changed", "  pending  a:new — New", "  skipped  a:prod" ] }
+      - { call: seedCommand, args: [ [ --json ], {} ], expect: { value: [ "{\"environment\":\"develop\",\"seeded\":[\"a:changed\",\"a:new\"]}" ] } }
+
+  - name: seed modules are split on commas and trimmed
+    tags: [ cli ]
+    init:
+      features:
+        - { id: users, seeds: [ { id: "users:demo", run: [] } ] }
+        - { id: catalog, seeds: [ { id: "catalog:demo", run: [] } ] }
+    steps:
+      - { call: seedCommand, args: [ [ --module, " , " ], {} ], expect: { value: [ No pending seeds for local. ] }, note: an empty list selects nothing }
+      - { call: seedCommand, args: [ [ --module, "billing" ], {} ], expect: { error: { message: "Unknown module: billing" } } }
+      - { call: seedCommand, args: [ [ run, --module, " catalog ,\tusers,", --json ], {} ], expect: { value: [ "{\"environment\":\"local\",\"seeded\":[\"users:demo\",\"catalog:demo\"]}" ] } }
+
+  - name: seed rejects malformed arguments
+    tags: [ cli ]
+    init: { features: *demo }
+    steps:
+      - { call: seedCommand, args: [ [ plant ], {} ], expect: { error: { message: "Usage: rta seed [status|run] [--module <id>[,<id>]] [--rerun] [--json]" } } }
+      - { call: seedCommand, args: [ [ status, --rerun ], {} ], expect: { error: { message: "Usage: rta seed [status|run] [--module <id>[,<id>]] [--rerun] [--json]" } } }
+      - { call: seedCommand, args: [ [ status, --module, catalog ], {} ], expect: { error: { message: "Usage: rta seed [status|run] [--module <id>[,<id>]] [--rerun] [--json]" } } }
+      - { call: seedCommand, args: [ [ --module ], {} ], expect: { error: { message: "Usage: rta seed [status|run] [--module <id>[,<id>]] [--rerun] [--json]" } } }
+      - { call: seedCommand, args: [ [ --everything ], {} ], expect: { error: { message: "Usage: rta seed [status|run] [--module <id>[,<id>]] [--rerun] [--json]" } } }
+      - { call: seedCommand, args: [ [ run, --step, "1" ], {} ], expect: { error: { message: "Usage: rta seed [status|run] [--module <id>[,<id>]] [--rerun] [--json]" } } }
+      - { call: rows, args: [ SEEDS ], expect: { value: [] } }
+
+  - name: production reports skipped demo seeds and runs none
+    tags: [ cli ]
+    init: { environment: prod, features: *demo }
+    steps:
+      - { call: seedCommand, args: [ [], { DEMO_PASSWORD: x } ], expect: { value: [ No pending seeds for prod. ] } }
+      - { call: seedCommand, args: [ [ status ], {} ], expect: { value: [ "Seeds (prod):", "  skipped  catalog:demo — Demo products" ] } }
