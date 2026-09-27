@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 
+	"rt.local/core-go/apperr"
 	"rt.local/core-go/internal/js"
 	"rt.local/core-go/nosql"
 	"rt.local/core-go/web"
@@ -156,6 +157,15 @@ func (s *Subscriptions) Feature() web.Feature {
 				}
 				return s.Overview(c.Ctx, months)
 			}},
+		web.Endpoint{Method: "GET", Path: "/subscriptions/admin/economics", Resource: manage, Access: web.Owner,
+			Tool: &web.Tool{Name: "subscriptions_economics", Description: "Unit economics: provider cost (settlements priced with the rates' costs), revenue (money paid) and margin per currency, per plan and for the users with the highest cost. query.limit (1-200, default 50). Never writes.", Example: map[string]any{"query": map[string]any{"limit": "50"}}},
+			Handle: func(c *web.Context) (any, error) {
+				limit := any(50.0)
+				if l := c.Request.Query["limit"]; l != "" {
+					limit = js.Number(l, true)
+				}
+				return s.Economics(c.Ctx, limit)
+			}},
 		web.Endpoint{Method: "GET", Path: "/subscriptions/admin/accounts/:id/ledger", Resource: manage, Access: web.Owner,
 			Tool:   &web.Tool{Name: "subscriptions_account_ledger", Description: "Chronological credit statement (allowances, usage, expiries, grants, purchases, plans), balances and totals. params.id user; query.cursor continues.", Example: map[string]any{"params": map[string]any{"id": "USER_ID"}}},
 			Handle: func(c *web.Context) (any, error) { return s.Ledger(c.Ctx, c.Params["id"], c.Request.Query["cursor"]) }},
@@ -240,7 +250,81 @@ func (s *Subscriptions) Feature() web.Feature {
 				Example: map[string]any{"params": map[string]any{"id": "USER_ID", "key": "turn-1:0"}}},
 			Handle: func(c *web.Context) (any, error) { return s.Release(c.Ctx, c.Params["id"], c.Params["key"], asAPI(c)) }},
 	)
+	// Metering for backends with a scoped service key (resource "subscriptions.meter"): the owner
+	// calls on the account in the path, source "api" and actorId "service:<key id>".
+	endpoints = append(endpoints, s.meterEndpoints(asAPI)...)
 	return web.Feature{ID: "subscriptions", Endpoints: endpoints}
+}
+
+// meterEndpoints are the web.Service endpoints of the subscriptions.meter scope.
+func (s *Subscriptions) meterEndpoints(asAPI func(*web.Context) ReservationMeta) []web.Endpoint {
+	const base = "/service/subscriptions/accounts/:id"
+	account := func(c *web.Context) (string, error) { return id(c.Params["id"]) }
+	endpoint := func(method, path string, handle func(c *web.Context, userID string) (any, error)) web.Endpoint {
+		return web.Endpoint{Method: method, Path: base + path, Resource: Meter, Access: web.Service, Handle: func(c *web.Context) (any, error) {
+			userID, err := account(c)
+			if err != nil {
+				return nil, err
+			}
+			return handle(c, userID)
+		}}
+	}
+	return []web.Endpoint{
+		endpoint("GET", "/usage", func(c *web.Context, u string) (any, error) { return s.UsageSummary(c.Ctx, u) }),
+		endpoint("POST", "/preflight", func(c *web.Context, u string) (any, error) {
+			return s.Preflight(c.Ctx, u, c.Request.Body["productId"], amountBody(c.Request.Body))
+		}),
+		endpoint("POST", "/reservations", func(c *web.Context, u string) (any, error) {
+			return s.Reserve(c.Ctx, u, c.Request.Body["productId"], reservationBody(c.Request.Body), asAPI(c))
+		}),
+		endpoint("POST", "/reservations/:key/settle", func(c *web.Context, u string) (any, error) {
+			return s.Settle(c.Ctx, u, c.Params["key"], usageBody(c.Request.Body), asAPI(c))
+		}),
+		endpoint("POST", "/reservations/:key/release", func(c *web.Context, u string) (any, error) {
+			return s.Release(c.Ctx, u, c.Params["key"], asAPI(c))
+		}),
+		// Debits only: a metering key charges usage; adding credits stays with the owner.
+		endpoint("POST", "/ledger", func(c *web.Context, u string) (any, error) {
+			body := c.Request.Body
+			if n, ok := body["credits"].(float64); ok && n > 0 {
+				return nil, apperr.New(403, "Service keys can only record debits")
+			}
+			input := map[string]any{}
+			for _, k := range []string{"requestId", "productId", "credits", "kind", "reason"} {
+				if v, ok := body[k]; ok {
+					input[k] = v
+				}
+			}
+			if details := ledgerDetails(body["details"]); details != nil {
+				input["details"] = details
+			}
+			input["source"], input["actorId"] = "api", actorID(c.Actor)
+			return s.RecordCredits(c.Ctx, u, input, RecordOrder...)
+		}),
+	}
+}
+
+// ledgerDetails sanitizes request details: 20 entries, keys cut to 40 and strings to 200
+// UTF-16 units (nil when not an object).
+func ledgerDetails(v any) map[string]any {
+	details := obj(v)
+	if details == nil {
+		return nil
+	}
+	clean := map[string]any{}
+	for i, k := range mapKeys(details, nil) {
+		if i >= 20 {
+			break
+		}
+		value := details[k]
+		switch value.(type) {
+		case float64, bool:
+		default:
+			value = cutUTF16(jsString(value), 200)
+		}
+		clean[cutUTF16(k, 40)] = value
+	}
+	return clean
 }
 
 // AccountView is GET /subscriptions/admin/accounts/:id: the account (with the USERS email),
@@ -306,22 +390,8 @@ func (s *Subscriptions) RecordFromBody(ctx context.Context, userID string, body 
 			input[k] = v
 		}
 	}
-	if details := obj(body["details"]); details != nil {
-		clean := map[string]any{}
-		keys := mapKeys(details, nil)
-		for i, k := range keys {
-			if i >= 20 {
-				break
-			}
-			v := details[k]
-			switch v.(type) {
-			case float64, bool:
-			default:
-				v = cutUTF16(jsString(v), 200)
-			}
-			clean[cutUTF16(k, 40)] = v
-		}
-		input["details"] = clean
+	if details := ledgerDetails(body["details"]); details != nil {
+		input["details"] = details
 	}
 	input["source"], input["actorId"] = "admin", actor
 	return s.RecordCredits(ctx, userID, input, RecordOrder...)

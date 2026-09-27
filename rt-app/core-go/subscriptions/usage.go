@@ -18,6 +18,11 @@ type Meta struct {
 	Source  string
 	ActorID string
 	Details map[string]any
+	// Model usage (ConsumeUsage): checked against the model caps and counted; its provider cost.
+	RateID    string
+	RateName  string
+	CostMinor float64
+	HasCost   bool
 }
 
 // Consume is the atomic pre-charge: the plan allowance first, then additional credits. A stable
@@ -61,12 +66,25 @@ func (s *Subscriptions) Consume(ctx context.Context, userID, productID string, c
 		fromBalance := amount - fromAllowance
 		if fromBalance > free.balance {
 			window := "period"
-			if num(counter["day"]) >= num(product["dailyLimit"]) {
+			if product["shortSeconds"] != nil && num(counter["short"]) >= num(product["shortLimit"]) {
+				window = "short"
+			} else if num(counter["day"]) >= num(product["dailyLimit"]) {
 				window = "day"
 			} else if num(counter["week"]) >= num(product["weeklyLimit"]) {
 				window = "week"
 			}
 			return nil, apperr.New(429, "Subscription "+window+" limit reached. Add credits or wait for the reset.")
+		}
+		settings, err := s.Settings(ctx)
+		if err != nil {
+			return nil, err
+		}
+		values := settings["values"].(map[string]any)
+		cap := s.rateCap(data, values, productID, meta.RateID)
+		if cap != nil {
+			if w := exceededWindow(s.rateWindows(data, productID, cap), amount); w != "" {
+				return nil, modelLimit(orString(meta.RateName, meta.RateID), w)
+			}
 		}
 		creditBalance := obj(data["creditBalance"])
 		if creditBalance == nil {
@@ -77,6 +95,11 @@ func (s *Subscriptions) Consume(ctx context.Context, userID, productID string, c
 		for _, f := range []string{"period", "day", "week"} {
 			counter[f] = num(counter[f]) + fromAllowance
 		}
+		if product["shortSeconds"] != nil {
+			counter["short"] = num(counter["short"]) + fromAllowance
+		}
+		s.countRate(data, productID, cap, amount)
+		s.addCost(data, meta.CostMinor, meta.HasCost, jsString(obj(obj(values["credits"])["pack"])["currency"]))
 		data["totalConsumed"] = numOr(data["totalConsumed"], 0) + amount
 		at := s.now()
 		receipt := map[string]any{"requestId": key, "productId": productID, "credits": amount, "fromAllowance": fromAllowance, "fromBalance": fromBalance, "at": at, "replayed": false}
@@ -313,14 +336,28 @@ func (s *Subscriptions) ConsumeUsage(ctx context.Context, userID, productID stri
 		return nil, err
 	}
 	rate := obj(estimate["rate"])
+	var config CreditRate
+	if err := fromJSON(rate, &config); err != nil {
+		return nil, err
+	}
+	cost, hasCost := ProviderCost(config, num(estimate["inputTokens"]), num(estimate["outputTokens"]))
+	details := map[string]any{"rateId": rate["id"], "inputTokens": estimate["inputTokens"], "outputTokens": estimate["outputTokens"]}
+	if hasCost {
+		details["costMinor"] = cost
+	}
 	receipt, err := s.Consume(ctx, userID, productID, estimate["credits"], requestID, Meta{
 		Reason:  jsString(rate["name"]) + " request",
-		Details: map[string]any{"rateId": rate["id"], "inputTokens": estimate["inputTokens"], "outputTokens": estimate["outputTokens"]},
+		Details: details,
+		RateID:  config.ID, RateName: config.Name, CostMinor: cost, HasCost: hasCost,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return spread(receipt, map[string]any{"valueMinor": estimate["valueMinor"], "currency": estimate["currency"]}), nil
+	out := spread(receipt, map[string]any{"valueMinor": estimate["valueMinor"], "currency": estimate["currency"]})
+	if hasCost {
+		out["costMinor"] = cost
+	}
+	return out, nil
 }
 
 // Ledger is the chronological statement of a user (one page), with the entries owed by

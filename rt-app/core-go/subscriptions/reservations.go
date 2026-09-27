@@ -387,8 +387,21 @@ func (s *Subscriptions) Reserve(ctx context.Context, userID string, productID an
 		if amount.credits > available {
 			return nil, apperr.New(429, "Not enough credits: "+NumberString(amount.credits-available)+" missing. Add credits or wait for the reset.")
 		}
+		settings, err := s.Settings(ctx)
+		if err != nil {
+			return nil, err
+		}
+		cap := s.rateCap(data, settings["values"].(map[string]any), product, str(amount.estimate["rateId"]))
+		if cap != nil {
+			if w := exceededWindow(s.rateWindows(data, product, cap), amount.credits); w != "" {
+				return nil, modelLimit(amount.rateName, w)
+			}
+		}
 		at := s.now()
 		hold := map[string]any{"key": key, "productId": product, "credits": amount.credits, "at": at, "expiresAt": at + ttl}
+		if cap != nil {
+			hold["rateId"] = cap["rateId"]
+		}
 		setHolds(data, append(holds, hold))
 		text := reason
 		if !hasReason {
@@ -516,6 +529,20 @@ func (s *Subscriptions) Settle(ctx context.Context, userID string, key any, usag
 			for _, f := range []string{"period", "day", "week"} {
 				counter[f] = num(counter[f]) + fromAllowance
 			}
+			if p := findProduct(obj(e["plan"]), productID); p != nil && p["shortSeconds"] != nil {
+				counter["short"] = num(counter["short"]) + fromAllowance
+			}
+		}
+		values := settings["values"].(map[string]any)
+		// Model caps count what was used (uncovered included); provider cost is the full usage.
+		s.countRate(data, productID, s.rateCap(data, values, productID, str(estimate["rateId"])), used)
+		cost, hasCost := 0.0, false
+		if priced != nil {
+			var r CreditRate
+			if err := fromJSON(priced["rate"], &r); err != nil {
+				return nil, err
+			}
+			cost, hasCost = ProviderCost(r, num(priced["inputTokens"]), num(priced["outputTokens"]))
 		}
 		balances := obj(data["creditBalance"])
 		if balances == nil {
@@ -525,12 +552,16 @@ func (s *Subscriptions) Settle(ctx context.Context, userID string, key any, usag
 		balances[productID] = free.rawBalance - fromBalance
 		data["totalConsumed"] = numOr(data["totalConsumed"], 0) + charged
 		at := s.now()
-		pack := obj(obj(settings["values"].(map[string]any)["credits"])["pack"])
+		pack := obj(obj(values["credits"])["pack"])
+		s.addCost(data, cost, hasCost, jsString(pack["currency"]))
 		details := map[string]any{"reserved": record["credits"], "used": used, "uncovered": uncovered}
 		if priced != nil {
 			details["rateId"] = obj(priced["rate"])["id"]
 			details["inputTokens"] = priced["inputTokens"]
 			details["outputTokens"] = priced["outputTokens"]
+		}
+		if hasCost {
+			details["costMinor"] = cost
 		}
 		heldChange := 0.0
 		if hold != nil {
@@ -553,6 +584,9 @@ func (s *Subscriptions) Settle(ctx context.Context, userID string, key any, usag
 			"fromBalance": fromBalance, "uncovered": uncovered, "expired": hold == nil, "status": "settled", "at": at,
 			"available":  s.available(data, productID),
 			"valueMinor": jsRound(charged * num(pack["amountMinor"]) / num(pack["credits"])), "currency": pack["currency"], "usage": reported,
+		}
+		if hasCost {
+			settlement["costMinor"] = cost
 		}
 		writes := []nosql.Write{write(old, "SUB_ACCOUNTS", userID, data), write(row, row.PK, row.SK, spread(record, map[string]any{"status": "settled", "settlement": settlement}))}
 		writes = append(append(append(writes, settled...), swept...), ledger)
@@ -649,11 +683,15 @@ func (s *Subscriptions) usageWindows(data map[string]any, productID string) []an
 	}
 	// Holds sit on the allowance first: that part counts on every window once settled.
 	reserved := math.Min(s.held(data, productID), s.allowanceLeft(data, productID))
-	return []any{
+	var out []any
+	if product["shortSeconds"] != nil {
+		out = append(out, WindowUsage("short", num(c["short"]), reserved, num(product["shortLimit"]), num(c["shortStart"])+num(product["shortSeconds"])*1000))
+	}
+	return append(out,
 		WindowUsage("day", num(c["day"]), reserved, num(product["dailyLimit"]), num(c["dayStart"])+num(product["daySeconds"])*1000),
 		WindowUsage("week", num(c["week"]), reserved, num(product["weeklyLimit"]), num(c["weekStart"])+num(product["weekSeconds"])*1000),
 		WindowUsage("period", num(c["period"]), reserved, num(product["credits"]), num(e["periodEnd"])),
-	}
+	)
 }
 
 // Preflight says whether {credits} or {estimate} fits in what the user can spend now, what is
@@ -684,10 +722,61 @@ func (s *Subscriptions) Preflight(ctx context.Context, userID string, productID 
 		available = free.allowance + free.balance
 	}
 	missing := math.Max(0, amount.credits-available)
-	fits := blocked == "" && missing == 0
+	var cap map[string]any
+	if blocked == "" {
+		cap = s.rateCap(data, values, product, str(amount.estimate["rateId"]))
+	}
+	models := s.rateWindows(data, product, cap)
+	capped := ""
+	if cap != nil {
+		capped = exceededWindow(models, amount.credits)
+	}
+	fits := blocked == "" && missing == 0 && capped == ""
 	var reason, topUp any
 	if !fits {
-		reason = orString(blocked, "credits")
+		switch {
+		case blocked != "":
+			reason = blocked
+		case missing > 0:
+			reason = "credits"
+		default:
+			reason = "model"
+		}
+	}
+	var rate *CreditRate
+	if amount.estimate != nil {
+		for _, r := range creditSettings(values).Rates {
+			if r.ID == str(amount.estimate["rateId"]) {
+				rate = &r
+				break
+			}
+		}
+	}
+	var costMinor any
+	step, hasStep := 0.0, false
+	if rate != nil {
+		if step, hasStep = ProviderCost(*rate, num(amount.estimate["inputTokens"]), num(amount.estimate["maxOutputTokens"])); hasStep {
+			costMinor = step
+		}
+	}
+	var margin map[string]any
+	if blocked == "" {
+		margin = s.margin(data, values)
+	}
+	exceeded := margin != nil && round4(num(margin["costMinor"])+step) > num(margin["capMinor"])
+	var model, marginView, degrade any
+	if cap != nil {
+		var over any
+		if capped != "" {
+			over = capped
+		}
+		model = map[string]any{"rateId": cap["rateId"], "windows": models, "exceeded": over}
+	}
+	if margin != nil {
+		marginView = spread(margin, map[string]any{"stepMinor": step, "exceeded": exceeded})
+	}
+	if rate != nil && blocked == "" && (missing > 0 || capped != "" || exceeded) {
+		degrade = s.degrade(data, values, product, *rate, num(amount.estimate["inputTokens"]), num(amount.estimate["maxOutputTokens"]), available, margin)
 	}
 	if blocked == "" && missing > 0 {
 		pack := obj(obj(values["credits"])["pack"])
@@ -701,6 +790,7 @@ func (s *Subscriptions) Preflight(ctx context.Context, userID string, productID 
 		"productId": product, "credits": amount.credits, "fits": fits, "reason": reason, "available": available, "missing": missing,
 		"allowanceLeft": free.rawAllowance, "additionalCredits": free.rawBalance, "reserved": free.held,
 		"windows": s.usageWindows(data, product), "topUp": topUp,
+		"costMinor": costMinor, "model": model, "margin": marginView, "degrade": degrade,
 	}, nil
 }
 
@@ -738,14 +828,37 @@ func (s *Subscriptions) UsageSummary(ctx context.Context, userID string) (map[st
 				alerts = append(alerts, map[string]any{"productId": pid, "window": window["kind"], "percent": window["percent"], "threshold": window["threshold"]})
 			}
 		}
+		var models []any
+		rates := creditSettings(values).Rates
+		for _, cap := range s.rateCaps(data, values, pid) {
+			var rateName any
+			for _, r := range rates {
+				if r.ID == cap["rateId"] {
+					rateName = r.Name
+					break
+				}
+			}
+			modelWindows := s.rateWindows(data, pid, cap)
+			for _, w := range modelWindows {
+				window := obj(w)
+				if num(window["threshold"]) >= 80 {
+					alerts = append(alerts, map[string]any{"productId": pid, "window": window["kind"], "percent": window["percent"], "threshold": window["threshold"], "rateId": cap["rateId"]})
+				}
+			}
+			models = append(models, map[string]any{"rateId": cap["rateId"], "name": rateName, "windows": modelWindows})
+		}
 		var name any
 		if p := findProduct(plan, pid); p != nil {
 			name = p["name"]
 		}
-		items = append(items, map[string]any{
+		item := map[string]any{
 			"productId": pid, "name": name, "allowanceLeft": free.rawAllowance, "additionalCredits": free.rawBalance,
 			"reserved": free.held, "available": free.allowance + free.balance, "threshold": threshold, "windows": windows,
-		})
+		}
+		if len(models) > 0 {
+			item["models"] = models
+		}
+		items = append(items, item)
 	}
 	reservations := []any{}
 	now := s.now()
@@ -757,6 +870,7 @@ func (s *Subscriptions) UsageSummary(ctx context.Context, userID string) (map[st
 	return map[string]any{
 		"userId": userID, "active": s.blocked(data, "", values["paymentRequired"] == true) == "", "products": items,
 		"reservations": reservations, "alerts": alerts, "pack": obj(values["credits"])["pack"],
+		"margin": orNil(s.margin(data, values)),
 	}, nil
 }
 

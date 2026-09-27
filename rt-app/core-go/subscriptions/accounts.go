@@ -52,7 +52,14 @@ func (s *Subscriptions) normalized(data map[string]any) map[string]any {
 			if now >= num(c[field])+w.seconds*1000 {
 				c[field] = num(c[field]) + math.Floor((now-num(c[field]))/(w.seconds*1000))*w.seconds*1000
 				c[w.window] = 0.0
+				resetRateWindow(c, w.window)
 			}
+		}
+		// The short window starts with the first use after the previous one ended.
+		if p["shortSeconds"] != nil && (c["shortStart"] == nil || now >= num(c["shortStart"])+num(p["shortSeconds"])*1000) {
+			c["short"] = 0.0
+			c["shortStart"] = now
+			resetRateWindow(c, "short")
 		}
 	}
 	if truthy(next["adminGrant"]) {
@@ -94,7 +101,20 @@ func (s *Subscriptions) allowanceLeft(data map[string]any, productID string) flo
 	if product == nil || c == nil {
 		return 0
 	}
-	return math.Max(0, math.Min(math.Min(num(product["dailyLimit"])-num(c["day"]), num(product["weeklyLimit"])-num(c["week"])), num(product["credits"])-num(c["period"])))
+	left := math.Min(math.Min(num(product["dailyLimit"])-num(c["day"]), num(product["weeklyLimit"])-num(c["week"])), num(product["credits"])-num(c["period"]))
+	if product["shortSeconds"] != nil {
+		left = math.Min(left, num(product["shortLimit"])-numOr(c["short"], 0))
+	}
+	return math.Max(0, left)
+}
+
+// resetRateWindow zeroes one window of every per-model counter (counters[product].rates).
+func resetRateWindow(c map[string]any, window string) {
+	for _, r := range obj(c["rates"]) {
+		if m := obj(r); m != nil && m[window] != nil {
+			m[window] = 0.0
+		}
+	}
 }
 
 // available is the allowance left plus the additional (non-expiring) credits, minus the
@@ -294,11 +314,16 @@ func (s *Subscriptions) Me(ctx context.Context, userID string) (map[string]any, 
 		p := obj(item)
 		pid := jsString(p["id"])
 		c := obj(obj(entitlement["counters"])[pid])
-		usage = append(usage, spread(p, map[string]any{
+		item := spread(p, map[string]any{
 			"used": c["period"], "remaining": s.available(data, pid), "allowanceLeft": s.allowanceLeft(data, pid),
 			"extraCredits": numOr(obj(data["creditBalance"])[pid], 0), "dayUsed": c["day"], "weekUsed": c["week"],
 			"dayResetAt": num(c["dayStart"]) + num(p["daySeconds"])*1000, "weekResetAt": num(c["weekStart"]) + num(p["weekSeconds"])*1000,
-		}))
+		})
+		if p["shortSeconds"] != nil {
+			item["shortUsed"] = c["short"]
+			item["shortResetAt"] = num(c["shortStart"]) + num(p["shortSeconds"])*1000
+		}
+		usage = append(usage, item)
 	}
 	version := 0
 	if row != nil {
@@ -890,7 +915,7 @@ func (s *Subscriptions) Reset(ctx context.Context, userID string, input any, act
 		return nil, err
 	}
 	scope := in["scope"]
-	if scope != "day" && scope != "week" && scope != "period" && scope != "all" {
+	if scope != "short" && scope != "day" && scope != "week" && scope != "period" && scope != "all" {
 		return nil, apperr.BadRequest("Invalid reset scope")
 	}
 	reason := js.Trim(strOf(in["reason"], ""))
@@ -926,9 +951,10 @@ func (s *Subscriptions) Reset(ctx context.Context, userID string, input any, act
 		for _, pid := range mapKeys(counters, productIDs(obj(e["plan"]))) {
 			c := obj(counters[pid])
 			before := s.allowanceLeft(data, pid)
-			for _, f := range []string{"day", "week", "period"} {
-				if scope == "all" || scope == f {
+			for _, f := range []string{"short", "day", "week", "period"} {
+				if (scope == "all" || scope == f) && (f != "short" || c["short"] != nil) {
 					c[f] = 0.0
+					resetRateWindow(c, f)
 				}
 			}
 			restored := s.allowanceLeft(data, pid) - before

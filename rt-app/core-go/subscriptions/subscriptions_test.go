@@ -207,7 +207,7 @@ func TestValidateCredits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := CreditSettings{Pack: Pack{500, 999, "eur"}, Rates: []CreditRate{{"x", "Fast", 0.57, 0.07, 0}, {"B", "42", 0, 1e6, 0}}}
+	want := CreditSettings{Pack: Pack{500, 999, "eur"}, Rates: []CreditRate{{ID: "x", Name: "Fast", InputPer1k: 0.57, OutputPer1k: 0.07}, {ID: "B", Name: "42", OutputPer1k: 1e6}}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v", got)
 	}
@@ -232,7 +232,7 @@ func TestValidateCredits(t *testing.T) {
 }
 
 func TestEstimate(t *testing.T) {
-	settings := CreditSettings{Pack: Pack{2, 1, "usd"}, Rates: []CreditRate{{"noisy", "Noisy", 1.1, 0, 0}, {"tiny", "Tiny", 0.0001, 0, 0}}}
+	settings := CreditSettings{Pack: Pack{2, 1, "usd"}, Rates: []CreditRate{{ID: "noisy", Name: "Noisy", InputPer1k: 1.1}, {ID: "tiny", Name: "Tiny", InputPer1k: 0.0001}}}
 	e, err := settings.Estimate("noisy", 50000, 0)
 	if err != nil || e.ExactCredits != 55 || e.Credits != 55 || e.ValueMinor != 28 {
 		t.Fatalf("noisy = %+v, %v", e, err)

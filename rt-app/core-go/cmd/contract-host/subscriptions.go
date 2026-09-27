@@ -438,6 +438,7 @@ func subscriptionsSubject(ctx context.Context, init json.RawMessage) (conformanc
 			}, nil
 		}),
 		"overview":    m(func(ctx context.Context, a []json.RawMessage) (any, error) { return s.Overview(ctx, argAny(a, 0)) }),
+		"economics":   m(func(ctx context.Context, a []json.RawMessage) (any, error) { return s.Economics(ctx, argAny(a, 0)) }),
 		"maintenance": m(func(ctx context.Context, _ []json.RawMessage) (any, error) { return s.Maintenance(ctx) }),
 		"endpoints": m(func(context.Context, []json.RawMessage) (any, error) {
 			out := make([]any, len(feature.Endpoints))

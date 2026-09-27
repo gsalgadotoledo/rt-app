@@ -132,6 +132,9 @@ func validateSettings(input any) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateLimits(plans, validated); err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"paymentRequired": in["paymentRequired"],
 		"notifications":   in["notifications"],
@@ -177,6 +180,10 @@ func validatePlan(item any) (map[string]any, error) {
 		"amount": amount, "currency": currency, "periodDays": periodDays,
 		"enabled": p["enabled"] == true && p["archived"] != true, "archived": p["archived"] == true,
 	}
+	// Validated by validateLimits once the credit rates are known.
+	if p["maxProviderCostMinor"] != nil {
+		out["maxProviderCostMinor"] = p["maxProviderCostMinor"]
+	}
 	if truthy(p["stripePriceId"]) {
 		price, err := id(p["stripePriceId"])
 		if err != nil {
@@ -219,16 +226,111 @@ func validateProduct(x map[string]any) (map[string]any, error) {
 		}
 		out[f.name] = n
 	}
+	if x["shortLimit"] != nil || x["shortSeconds"] != nil {
+		out["shortLimit"], out["shortSeconds"] = x["shortLimit"], x["shortSeconds"]
+		if x["shortLimit"] == nil {
+			out["shortLimit"] = missing{}
+		}
+		if x["shortSeconds"] == nil {
+			out["shortSeconds"] = missing{}
+		}
+	}
+	if x["rateCaps"] != nil {
+		out["rateCaps"] = x["rateCaps"]
+	}
 	return out, nil
+}
+
+// missing marks a field that was given as null next to a given one (fails validateLimits).
+type missing struct{}
+
+// CapWindows are the windows of a model cap, in check order.
+var CapWindows = []string{"short", "day", "week", "period"}
+
+func capValue(v any) bool {
+	n, ok := safeInteger(v)
+	return ok && n >= 0 && n <= 1e9
+}
+
+// validateLimits checks the finance limits after the credit rates (per plan, per product): the
+// short window, the model caps and the margin rule. It rewrites the plans in place.
+func validateLimits(plans []any, credits CreditSettings) error {
+	rates := map[string]bool{}
+	for _, r := range credits.Rates {
+		rates[r.ID] = true
+	}
+	for _, item := range plans {
+		plan := item.(map[string]any)
+		for _, x := range plan["products"].([]any) {
+			product := x.(map[string]any)
+			_, hasLimit := product["shortLimit"]
+			_, hasSeconds := product["shortSeconds"]
+			if hasLimit || hasSeconds {
+				seconds, ok := safeInteger(product["shortSeconds"])
+				if !capValue(product["shortLimit"]) || !ok || seconds < 60 || seconds > 604800 {
+					return apperr.BadRequest("Invalid short window")
+				}
+			}
+			if raw, has := product["rateCaps"]; has {
+				caps, ok := raw.([]any)
+				if !ok || len(caps) > 20 {
+					return apperr.BadRequest("Invalid model cap")
+				}
+				out := make([]any, 0, len(caps))
+				seen := map[string]bool{}
+				for _, c := range caps {
+					m, ok := c.(map[string]any)
+					rateID, isString := m["rateId"].(string)
+					if !ok || !isString || !rates[rateID] {
+						return apperr.BadRequest("Invalid model cap")
+					}
+					cap := map[string]any{"rateId": rateID}
+					for _, w := range CapWindows {
+						if m[w] == nil {
+							continue
+						}
+						if !capValue(m[w]) || (w == "short" && !hasSeconds) {
+							return apperr.BadRequest("Invalid model cap")
+						}
+						cap[w] = m[w]
+					}
+					if len(cap) < 2 {
+						return apperr.BadRequest("Invalid model cap")
+					}
+					seen[rateID] = true
+					out = append(out, cap)
+				}
+				if len(seen) != len(out) {
+					return apperr.BadRequest("Invalid model cap")
+				}
+				if len(out) > 0 {
+					product["rateCaps"] = out
+				} else {
+					delete(product, "rateCaps")
+				}
+			}
+		}
+		if max, has := plan["maxProviderCostMinor"]; has {
+			n, ok := safeInteger(max)
+			if !ok || n < 0 || n > 1e12 || plan["currency"] != credits.Pack.Currency {
+				return apperr.BadRequest("Invalid margin rule")
+			}
+		}
+	}
+	return nil
 }
 
 // planContent is what makes a new plan version when it changes.
 func planContent(p map[string]any) map[string]any {
-	return map[string]any{
+	content := map[string]any{
 		"id": p["id"], "family": orDefault(p["family"], p["id"]), "name": p["name"],
 		"description": orDefault(p["description"], ""), "amount": p["amount"], "currency": p["currency"],
 		"periodDays": p["periodDays"], "products": p["products"], "metadata": orDefault(p["metadata"], map[string]any{}),
 	}
+	if p["maxProviderCostMinor"] != nil {
+		content["maxProviderCostMinor"] = p["maxProviderCostMinor"]
+	}
+	return content
 }
 
 var lastNumber = regexp.MustCompile(`(\d+)$`)

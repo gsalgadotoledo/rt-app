@@ -38,6 +38,10 @@ type CreditRate struct {
 	InputPer1k  float64 `json:"inputPer1k"`
 	OutputPer1k float64 `json:"outputPer1k"`
 	Minimum     float64 `json:"minimum"`
+	// CostInputPer1k and CostOutputPer1k are what the provider charges, in minor units of the
+	// pack currency per 1k tokens (nil when the rate has no costs; both set when either is).
+	CostInputPer1k  *float64 `json:"costInputPer1k,omitempty"`
+	CostOutputPer1k *float64 `json:"costOutputPer1k,omitempty"`
 }
 
 type creditRateFields CreditRate
@@ -151,7 +155,19 @@ func validateRate(raw any) (CreditRate, error) {
 	if err != nil {
 		return CreditRate{}, err
 	}
-	return CreditRate{ID: id, Name: name, InputPer1k: input, OutputPer1k: output, Minimum: minimum}, nil
+	r := CreditRate{ID: id, Name: name, InputPer1k: input, OutputPer1k: output, Minimum: minimum}
+	if field(raw, "costInputPer1k") != nil || field(raw, "costOutputPer1k") != nil {
+		in, err := rate(orDefault(field(raw, "costInputPer1k"), 0.0))
+		if err != nil {
+			return CreditRate{}, err
+		}
+		out, err := rate(orDefault(field(raw, "costOutputPer1k"), 0.0))
+		if err != nil {
+			return CreditRate{}, err
+		}
+		r.CostInputPer1k, r.CostOutputPer1k = &in, &out
+	}
+	return r, nil
 }
 
 // rate accepts a number 0..1e6 with at most 4 decimals. The decimal check tolerates float64
@@ -231,9 +247,8 @@ func (c CreditSettings) Estimate(rateID string, inputTokens, outputTokens float6
 			return Estimate{}, err
 		}
 	}
-	exact := (inputTokens/1000)*selected.InputPer1k + (outputTokens/1000)*selected.OutputPer1k
 	// Round up to whole credits (tolerating float noise) and apply the per-request minimum.
-	credits := math.Max(selected.Minimum, math.Ceil(jsRound(exact*1e6)/1e6))
+	exact, credits := RateCredits(*selected, inputTokens, outputTokens)
 	return Estimate{
 		Rate:         *selected,
 		InputTokens:  inputTokens,
@@ -243,4 +258,29 @@ func (c CreditSettings) Estimate(rateID string, inputTokens, outputTokens float6
 		ValueMinor:   jsRound(credits * c.Pack.AmountMinor / c.Pack.Credits),
 		Currency:     c.Pack.Currency,
 	}, nil
+}
+
+// RateCredits prices token usage at a rate: exact = (in/1000)*inputPer1k + (out/1000)*outputPer1k,
+// credits = max(minimum, ceil(round(exact*1e6)/1e6)).
+func RateCredits(r CreditRate, inputTokens, outputTokens float64) (exact, credits float64) {
+	exact = (inputTokens/1000)*r.InputPer1k + (outputTokens/1000)*r.OutputPer1k
+	return exact, math.Max(r.Minimum, math.Ceil(jsRound(exact*1e6)/1e6))
+}
+
+// round4 is Math.round(x*1e4)/1e4 without negative zero.
+func round4(x float64) float64 {
+	return jsRound(x*1e4)/1e4 + 0
+}
+
+// ProviderCost is the provider cost of token usage at a rate (minor units, 4 decimals); ok is
+// false when the rate has no costs.
+func ProviderCost(r CreditRate, inputTokens, outputTokens float64) (cost float64, ok bool) {
+	if r.CostInputPer1k == nil {
+		return 0, false
+	}
+	out := 0.0
+	if r.CostOutputPer1k != nil {
+		out = *r.CostOutputPer1k
+	}
+	return round4((inputTokens/1000)*(*r.CostInputPer1k) + (outputTokens/1000)*out), true
 }
