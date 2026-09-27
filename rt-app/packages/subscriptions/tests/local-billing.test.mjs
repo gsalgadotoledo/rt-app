@@ -47,3 +47,19 @@ test("local billing persists receipts, replays without duplicate invoices and is
   assert.equal((await billing.snapshot(customer)).status, "canceled");
   now.mock.restore();
 });
+
+test("local billing takes an injected clock for periods, invoices and cancellation", async () => {
+  const store = new MemoryStore();
+  let now = Date.parse("2026-01-01T00:00:00.000Z");
+  const billing = new LocalBilling(store, () => now);
+  const plan = { id: "pro", amount: 100, currency: "usd", periodDays: 30 };
+  await billing.change("local_alice", plan, undefined, "k1");
+  const first = await billing.snapshot("local_alice");
+  assert.equal(first.periodStart, now);
+  assert.equal(first.periodEnd, now + 30 * 86400000);
+  assert.equal(first.invoices[0].createdAt, now);
+  await billing.cancel("local_alice");
+  assert.equal((await billing.snapshot("local_alice")).status, "active");
+  now += 30 * 86400000;
+  assert.equal((await billing.snapshot("local_alice")).status, "canceled");
+});

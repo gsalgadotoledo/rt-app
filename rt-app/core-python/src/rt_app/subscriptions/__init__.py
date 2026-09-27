@@ -1,8 +1,11 @@
-"""Subscriptions: the credit ledger, credit settings/pricing and currencies.
+"""Subscriptions: the service (plans, accounts, credits, billing), the credit ledger, credit
+settings/pricing and currencies.
 
-Ports of ``@gsalgadotoledo/rt-app-subscriptions`` (``ledger.ts``, ``validateCredits``/``estimate``
-in ``index.ts`` and ``currency.ts``) with JavaScript float64 semantics, so every language computes
-the same keys, totals and prices. Contracts: ``spec/contracts/subscriptions-{ledger,credits}``.
+Ports of ``@gsalgadotoledo/rt-app-subscriptions`` (``index.ts``, ``local.ts``, ``ledger.ts``,
+``plan-id.ts`` and ``currency.ts``) with JavaScript float64 semantics, so every language computes
+the same keys, totals, prices and statements. Contracts: ``spec/contracts/subscriptions-*``; see
+``docs/polyglot/subscriptions.md``. ``Subscriptions.feature()`` (``rt_app.subscriptions.feature``)
+builds the HTTP feature.
 """
 from .credits import (
     DEFAULT_CREDITS,
@@ -15,6 +18,9 @@ from .credits import (
     validate_credits,
 )
 from .currency import CURRENCY_CODES, currency_decimals, currency_step, major_amount, valid_currency, valid_minor_amount
+from .local import LocalBilling
+from .plans import DEFAULTS, default_settings, plan_id_from_name, validate_metadata, validate_settings
+from .service import BillingProvider, CatalogPublisher, Subscriptions
 from .ledger import (
     LEDGER,
     CurrentWindow,
@@ -31,6 +37,15 @@ from .ledger import (
 )
 
 __all__ = [
+    "Subscriptions",
+    "BillingProvider",
+    "CatalogPublisher",
+    "LocalBilling",
+    "DEFAULTS",
+    "default_settings",
+    "plan_id_from_name",
+    "validate_metadata",
+    "validate_settings",
     "DEFAULT_CREDITS",
     "CreditPricing",
     "CreditRate",

@@ -1,0 +1,115 @@
+contract: 1
+module: subscriptions-overview
+subject: subscriptions
+title: Subscriptions service - overview metrics and maintenance
+description: |
+  Overview and maintenance through the `subscriptions` facade (see subscriptions-settings).
+
+  overview(months = 12): integer(months, 1, 36) (400 "Invalid numeric setting"). Every
+  SUB_ACCOUNTS row (all pages, sort-key order) is normalized; accounts whose effective
+  entitlement is active with now < periodEnd are customers; canceling counts
+  cancelAtPeriodEnd; paying needs a payment provider, entitlement mode == provider mode and
+  plan.amount > 0; paying accounts not canceling add round(amount * 30 / periodDays) to
+  mrrMinor[currency] (Math.round). plans = [{planId, name, customers, paying}] in first-seen
+  order (JavaScript object order: array-index ids first). The snapshot SUB_STATS/snap:<today>
+  {customers, paying, canceling, mrrMinor, at} is written (replacing today's). SUB_STATS day:<date>
+  rows {new, canceled} (written by plan starts, grants, syncs and cancels) give today (date =
+  UTC YYYY-MM-DD of now), month (UTC YYYY-MM) and a series of `months` months ending with the
+  current one: {month, customers and paying of the latest snapshot of that month (null without
+  one), new, canceled}. Returns {asOf: now, customers, paying, canceling, mrrMinor, plans, today:
+  {date, new, canceled}, month: {month, new, canceled}, series}.
+
+  maintenance(): reads SUB_MAINTENANCE/cursor {accounts, mail} and walks SUB_ACCOUNTS pages from
+  the accounts cursor until 100 rows are processed (or 15 s of wall time). Accounts without a
+  plan are skipped. An unpaid active account past its period (not canceling) renews to the
+  period containing now (counters reset); pending window entries are settled; the account is
+  written when it renewed or entries were settled (a Conflict is ignored). When notifications are
+  enabled in settings and for the account, the account has an email and 0 < periodEnd - now <=
+  reminderDays days, SUB_MAIL/<userId>-<periodEnd> {userId, to, subject: "Subscription period
+  ending", text: "Your current subscription period ends on <ISO periodEnd>", sent: false} is
+  created once (the values of the row read before renewal). Then, with a notifier, one page of
+  SUB_MAIL from the mail cursor: unsent rows not locked (lockUntil > now) of users who did not
+  disable notifications are claimed (lockUntil = now + 60000), sent ({to, subject, text}) and
+  marked sent: true. The checkpoint stores {accounts: next cursor or null, mail: next cursor or
+  null}. Returns {processed (rows read), partial: a cursor remains}.
+fixtures:
+  plans: &plans [ { id: starter, name: Starter, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800 } ] }, { id: pro, name: Pro, amount: 2000, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 10000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ] }, { id: max, name: Max, amount: 5000, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 50000, dailyLimit: 5000, weeklyLimit: 25000, daySeconds: 86400, weekSeconds: 604800 } ] }, { id: yearly, name: Yearly, amount: 36500, currency: eur, periodDays: 365, enabled: true, products: [ { id: api, name: API credits, credits: 100000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ] } ]
+  users: &users
+    - { pk: USERS, sk: alice, version: 1, data: { id: alice, email: alice@example.test, name: Alice } }
+    - { pk: USERS, sk: bob, version: 1, data: { id: bob, email: bob@example.test, name: Bob } }
+    - { pk: USERS, sk: dave, version: 1, data: { id: dave, email: dave@example.test, name: Dave } }
+    - { pk: USERS, sk: erin, version: 1, data: { id: erin, email: erin@example.test, name: Erin } }
+    - { pk: USERS, sk: frank, version: 1, data: { id: frank, email: frank@example.test, name: Frank } }
+cases:
+  - name: overview of an empty store
+    steps:
+      - { call: overview, args: [ 0 ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: overview, args: [ 37 ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: overview, args: [ 1.5 ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: overview, args: [ "3" ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: overview, args: [ null ], expect: { value: { asOf: 1767225600000, customers: 0, paying: 0, canceling: 0, mrrMinor: {}, plans: [], today: { date: 2026-01-01, new: 0, canceled: 0 }, month: { month: 2026-01, new: 0, canceled: 0 }, series: [ { month: 2025-02, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-03, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-04, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-05, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-06, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-07, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-08, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-09, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-10, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-11, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-12, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-01, customers: 0, paying: 0, new: 0, canceled: 0 } ] } } }
+      - { call: overview, args: [ 36 ], expect: { value: { $partial: { series: { $length: 36 } } } } }
+      - { call: list, args: [ SUB_STATS ], expect: { value: { items: [ { pk: SUB_STATS, sk: snap:2026-01-01, version: 2, data: { customers: 0, paying: 0, canceling: 0, mrrMinor: {}, at: 1767225600000 } } ] } } }
+
+  - name: customers, paying customers and projected revenue
+    init: { billing: local, rows: *users }
+    steps:
+      - { call: change, args: [ { id: alice, email: alice@example.test }, starter, a1 ], expect: { value: { ok: true } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: true, notifications: true, reminderDays: 3, plans: *plans } }, root ], expect: { value: { version: 1, values: { paymentRequired: true, notifications: true, reminderDays: 3, plans: [ { id: starter, family: starter, description: "", metadata: {}, name: Starter, amount: 0, currency: usd, periodDays: 30, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 }, { id: pro, family: pro, description: "", metadata: {}, name: Pro, amount: 2000, currency: usd, periodDays: 30, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 10000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 }, { id: max, family: max, description: "", metadata: {}, name: Max, amount: 5000, currency: usd, periodDays: 30, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 50000, dailyLimit: 5000, weeklyLimit: 25000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.2 }, { id: yearly, family: yearly, description: "", metadata: {}, name: Yearly, amount: 36500, currency: eur, periodDays: 365, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 100000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 } ], credits: { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: [ { id: standard, name: Standard model, inputPer1k: 1, outputPer1k: 3, minimum: 1 }, { id: advanced, name: Advanced model, inputPer1k: 5, outputPer1k: 15, minimum: 1 } ] } }, provider: local, catalogAvailable: false } } }
+      - { call: setNow, args: [ "2026-01-01T10:00:00.000Z" ], expect: { value: null } }
+      - { call: change, args: [ { id: bob, email: bob@example.test }, pro, b1 ], expect: { value: { subscriptionId: sub_local_bob, status: active, clientSecret: null, requestedPlan: { id: pro, family: pro, description: "", metadata: {}, name: Pro, amount: 2000, currency: usd, periodDays: 30, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 10000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 } } } }
+      - { call: change, args: [ { id: dave, email: dave@example.test }, yearly, d1 ], expect: { value: { subscriptionId: sub_local_dave, status: active, clientSecret: null, requestedPlan: { id: yearly, family: yearly, description: "", metadata: {}, name: Yearly, amount: 36500, currency: eur, periodDays: 365, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 100000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 } } } }
+      - { call: grant, args: [ erin, { requestId: e1, kind: plan, planId: max, reason: Partner, currency: usd, valueMinor: 5000 }, root ], expect: { value: { ok: true } } }
+      - { call: change, args: [ { id: frank, email: frank@example.test }, pro, f1 ], expect: { value: { subscriptionId: sub_local_frank, status: active, clientSecret: null, requestedPlan: { id: pro, family: pro, description: "", metadata: {}, name: Pro, amount: 2000, currency: usd, periodDays: 30, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 10000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 } } } }
+      - { call: cancel, args: [ { id: frank, email: frank@example.test }, f2 ], expect: { value: { ok: true } } }
+      - { call: overview, args: [ null ], expect: { value: { asOf: 1767261600000, customers: 5, paying: 3, canceling: 1, mrrMinor: { usd: 2000, eur: 3000 }, plans: [ { planId: starter, name: Starter, customers: 1, paying: 0 }, { planId: pro, name: Pro, customers: 2, paying: 2 }, { planId: yearly, name: Yearly, customers: 1, paying: 1 }, { planId: max, name: Max, customers: 1, paying: 0 } ], today: { date: 2026-01-01, new: 5, canceled: 1 }, month: { month: 2026-01, new: 5, canceled: 1 }, series: [ { month: 2025-02, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-03, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-04, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-05, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-06, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-07, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-08, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-09, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-10, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-11, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2025-12, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-01, customers: 5, paying: 3, new: 5, canceled: 1 } ] } } }
+      - { call: overview, args: [ 2 ], note: "the snapshot of today is replaced", expect: { value: { asOf: 1767261600000, customers: 5, paying: 3, canceling: 1, mrrMinor: { usd: 2000, eur: 3000 }, plans: [ { planId: starter, name: Starter, customers: 1, paying: 0 }, { planId: pro, name: Pro, customers: 2, paying: 2 }, { planId: yearly, name: Yearly, customers: 1, paying: 1 }, { planId: max, name: Max, customers: 1, paying: 0 } ], today: { date: 2026-01-01, new: 5, canceled: 1 }, month: { month: 2026-01, new: 5, canceled: 1 }, series: [ { month: 2025-12, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-01, customers: 5, paying: 3, new: 5, canceled: 1 } ] } } }
+      - { call: list, args: [ SUB_STATS ], expect: { value: { items: [ { pk: SUB_STATS, sk: day:2026-01-01, version: 6, data: { new: 5, canceled: 1 } }, { pk: SUB_STATS, sk: snap:2026-01-01, version: 2, data: { customers: 5, paying: 3, canceling: 1, mrrMinor: { usd: 2000, eur: 3000 }, at: 1767261600000 } } ] } } }
+      - { call: setNow, args: [ "2026-02-15T00:00:00.000Z" ], expect: { value: null } }
+      - { call: overview, args: [ 3 ], expect: { value: { asOf: 1771113600000, customers: 2, paying: 1, canceling: 0, mrrMinor: { eur: 3000 }, plans: [ { planId: starter, name: Starter, customers: 1, paying: 0 }, { planId: yearly, name: Yearly, customers: 1, paying: 1 } ], today: { date: 2026-02-15, new: 0, canceled: 0 }, month: { month: 2026-02, new: 0, canceled: 0 }, series: [ { month: 2025-12, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-01, customers: 5, paying: 3, new: 5, canceled: 1 }, { month: 2026-02, customers: 2, paying: 1, new: 0, canceled: 0 } ] } } }
+      - { call: setNow, args: [ "2027-03-01T00:00:00.000Z" ], expect: { value: null } }
+      - { call: overview, args: [ 15 ], expect: { value: { asOf: 1803859200000, customers: 1, paying: 0, canceling: 0, mrrMinor: {}, plans: [ { planId: starter, name: Starter, customers: 1, paying: 0 } ], today: { date: 2027-03-01, new: 0, canceled: 0 }, month: { month: 2027-03, new: 0, canceled: 0 }, series: [ { month: 2026-01, customers: 5, paying: 3, new: 5, canceled: 1 }, { month: 2026-02, customers: 2, paying: 1, new: 0, canceled: 0 }, { month: 2026-03, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-04, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-05, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-06, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-07, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-08, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-09, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-10, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-11, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2026-12, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2027-01, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2027-02, customers: null, paying: null, new: 0, canceled: 0 }, { month: 2027-03, customers: 1, paying: 0, new: 0, canceled: 0 } ] } } }
+
+  - name: maintenance sends period reminders once
+    init: { rows: *users }
+    steps:
+      - { call: change, args: [ { id: alice, email: alice@example.test }, starter, a1 ], expect: { value: { ok: true } } }
+      - { call: change, args: [ { id: bob, email: bob@example.test }, starter, b1 ], expect: { value: { ok: true } } }
+      - { call: preferences, args: [ bob, false ], expect: { value: { ok: true } } }
+      - { call: preferences, args: [ dave, true ], expect: { value: { ok: true } } }
+      - { call: setNow, args: [ "2026-01-27T00:00:00.000Z" ], expect: { value: null } }
+      - { call: maintenance, args: [], expect: { value: { processed: 3, partial: false } } }
+      - { call: sent, args: [], expect: { value: [] } }
+      - { call: setNow, args: [ "2026-01-28T00:00:00.000Z" ], expect: { value: null } }
+      - { call: maintenance, args: [], expect: { value: { processed: 3, partial: false } } }
+      - { call: sent, args: [], expect: { value: [ { to: alice@example.test, subject: Subscription period ending, text: Your current subscription period ends on 2026-01-31T00:00:00.000Z } ] } }
+      - { call: list, args: [ SUB_MAIL ], expect: { value: { items: [ { pk: SUB_MAIL, sk: alice-1769817600000, version: 3, data: { userId: alice, to: alice@example.test, subject: Subscription period ending, text: Your current subscription period ends on 2026-01-31T00:00:00.000Z, sent: true, lockUntil: 1769558460000 } } ] } } }
+      - { call: row, args: [ SUB_MAINTENANCE, cursor ], expect: { value: { pk: SUB_MAINTENANCE, sk: cursor, version: 2, data: { accounts: null, mail: null } } } }
+      - { call: maintenance, args: [], expect: { value: { processed: 3, partial: false } } }
+      - { call: sent, args: [], expect: { value: { $length: 1 } } }
+      - { call: setNow, args: [ "2026-02-01T00:00:00.000Z" ], expect: { value: null } }
+      - { call: maintenance, args: [], expect: { value: { processed: 3, partial: false } } }
+      - { call: row, args: [ SUB_ACCOUNTS, alice ], expect: { value: { pk: SUB_ACCOUNTS, sk: alice, version: 3, data: { userId: alice, email: alice@example.test, plan: { id: starter, name: Starter, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800 } ], version: 0.0.1 }, status: active, mode: none, cancelAtPeriodEnd: false, periodStart: 1769817600000, periodEnd: 1772409600000, counters: { api: { period: 0, day: 0, week: 0, dayStart: 1769904000000, weekStart: 1769817600000 } }, createdAt: 1767225600000, updatedAt: 1767225600000, ledgerWindows: { key: own:starter, products: { api: { start: 1769817600000, allowance: 500, name: API credits, weekSeconds: 604800 } } }, ledgerSequence: 6, ledgerTotals: { creditsIn: 1500, creditsOut: 0, expired: 2500, paidMinor: {}, grantedValueMinor: {} } } } } }
+      - { call: list, args: [ "SUB_LEDGER#alice" ], expect: { value: { items: [ { pk: SUB_LEDGER#alice, sk: 001767225600000-0000000001-807d3bf3798545ed, version: 1, data: { at: 1767225600000, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", source: system, available: 100, id: 001767225600000-0000000001-807d3bf3798545ed } }, { pk: SUB_LEDGER#alice, sk: 001767225600000-0000000002-5f89110bcddab35f, version: 1, data: { at: 1767225600000, kind: plan, source: user, credits: 0, planId: starter, reason: "Plan started: Starter", requestId: a1, id: 001767225600000-0000000002-5f89110bcddab35f } }, { pk: SUB_LEDGER#alice, sk: 001767830400000-0000000003-7c69e81b6c50a6bd, version: 1, data: { at: 1767830400000, kind: expiry, credits: -1500, productId: api, reason: "API credits: unused allowance of 3 weeks expired", details: { unused: 500, skippedWeeks: 2 }, source: system, available: 100, id: 001767830400000-0000000003-7c69e81b6c50a6bd } }, { pk: SUB_LEDGER#alice, sk: 001769040000000-0000000004-79daec80fcf245d4, version: 1, data: { at: 1769040000000, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", source: system, available: 100, id: 001769040000000-0000000004-79daec80fcf245d4 } }, { pk: SUB_LEDGER#alice, sk: 001769644800000-0000000005-9bc346604e6eaf0d, version: 1, data: { at: 1769644800000, kind: expiry, credits: -1000, productId: api, reason: "API credits: unused allowance of 2 weeks expired", details: { unused: 500, skippedWeeks: 1 }, source: system, available: 100, id: 001769644800000-0000000005-9bc346604e6eaf0d } }, { pk: SUB_LEDGER#alice, sk: 001769817600000-0000000006-fdc4176c39289331, version: 1, data: { at: 1769817600000, kind: allowance, credits: 500, productId: api, reason: "API credits: weekly allowance", source: system, available: 100, id: 001769817600000-0000000006-fdc4176c39289331 } } ] } } }
+
+  - name: maintenance respects disabled notifications
+    init: { rows: *users }
+    steps:
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: false, reminderDays: 30, plans: *plans } }, root ], expect: { value: { version: 1, values: { paymentRequired: false, notifications: false, reminderDays: 30, plans: [ { id: starter, family: starter, description: "", metadata: {}, name: Starter, amount: 0, currency: usd, periodDays: 30, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 }, { id: pro, family: pro, description: "", metadata: {}, name: Pro, amount: 2000, currency: usd, periodDays: 30, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 10000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 }, { id: max, family: max, description: "", metadata: {}, name: Max, amount: 5000, currency: usd, periodDays: 30, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 50000, dailyLimit: 5000, weeklyLimit: 25000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.2 }, { id: yearly, family: yearly, description: "", metadata: {}, name: Yearly, amount: 36500, currency: eur, periodDays: 365, enabled: true, archived: false, products: [ { id: api, name: API credits, credits: 100000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ], stripeManaged: false, version: 0.0.1 } ], credits: { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: [ { id: standard, name: Standard model, inputPer1k: 1, outputPer1k: 3, minimum: 1 }, { id: advanced, name: Advanced model, inputPer1k: 5, outputPer1k: 15, minimum: 1 } ] } }, provider: none, catalogAvailable: false } } }
+      - { call: change, args: [ { id: alice, email: alice@example.test }, starter, a1 ], expect: { value: { ok: true } } }
+      - { call: maintenance, args: [], expect: { value: { processed: 1, partial: false } } }
+      - { call: list, args: [ SUB_MAIL ], expect: { value: { items: [] } } }
+      - { call: sent, args: [], expect: { value: [] } }
+
+  - name: maintenance keeps a cursor across runs
+    init:
+      rows:
+        - $repeat:
+            count: 120
+            item: { pk: SUB_ACCOUNTS, sk: "user-{i:03}", version: 1, data: { userId: "user-{i:03}" } }
+    steps:
+      - { call: maintenance, args: [], expect: { value: { processed: 100, partial: true } } }
+      - { call: row, args: [ SUB_MAINTENANCE, cursor ], expect: { value: { pk: SUB_MAINTENANCE, sk: cursor, version: 1, data: { accounts: eyJwayI6IlNVQl9BQ0NPVU5UUyIsInNrIjoidXNlci0wOTkifQ, mail: null } } } }
+      - { call: maintenance, args: [], expect: { value: { processed: 20, partial: false } } }
+      - { call: row, args: [ SUB_MAINTENANCE, cursor ], expect: { value: { pk: SUB_MAINTENANCE, sk: cursor, version: 2, data: { accounts: null, mail: null } } } }
+      - { call: maintenance, args: [], expect: { value: { processed: 100, partial: true } } }

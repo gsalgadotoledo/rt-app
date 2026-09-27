@@ -4,7 +4,11 @@ import type { BillingProvider, Plan } from "./index.js";
 /** Explicit simulation: no card numbers, no real charges, persisted in the selected store. */
 export class LocalBilling implements BillingProvider {
   readonly mode = "local" as const;
-  constructor(private store: NoSQL) {
+  /** `now` is the clock in epoch milliseconds (the system clock by default), for tests and contracts. */
+  constructor(
+    private store: NoSQL,
+    private now: () => number = () => Date.now(),
+  ) {
     if (process.env.NODE_ENV === "production")
       throw new Error("Local billing cannot run in production");
   }
@@ -20,7 +24,7 @@ export class LocalBilling implements BillingProvider {
     const existing = await this.store.get("LOCAL_BILLING_OP#" + customer, key);
     if (existing) return existing.data;
     const old = await this.store.get("LOCAL_BILLING", customer),
-      now = Date.now(),
+      now = this.now(),
       continuing = old?.data.status === "active" && old.data.periodEnd > now;
     const invoice = {
       id: "sim_" + key,
@@ -101,7 +105,7 @@ export class LocalBilling implements BillingProvider {
       totals[i.currency].paid += i.amountPaid;
       totals[i.currency].due += i.amountDue;
     }
-    if (data.cancelAtPeriodEnd && Date.now() >= data.periodEnd)
+    if (data.cancelAtPeriodEnd && this.now() >= data.periodEnd)
       data.status = "canceled";
     return {
       ...data,
