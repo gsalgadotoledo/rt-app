@@ -1,4 +1,4 @@
-// Command flagsapi serves the health and feature-flags modules, the API that every RT-App
+// Command api serves every native module (one file per module registers itself), the API that every RT-App
 // backend language implements (rt-app/spec/contracts/feature-flags-api.contract.yaml).
 //
 //	go run . -mode=serve                          # local HTTP server on 127.0.0.1:$PORT
@@ -9,7 +9,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -20,53 +19,43 @@ import (
 	"syscall"
 
 	rtcore "rt.local/core-go"
-	"rt.local/core-go/featureflags"
-	"rt.local/core-go/health"
 	"rt.local/core-go/nosql"
 	"rt.local/core-go/web"
 	"rt.local/core-go/weblambda"
 )
 
-// Components is the composition root: one provider per component, each built lazily once.
-// To swap an implementation, change one constructor here (for example a DynamoDB store in
-// place of nosql.NewMemoryStore); consumers only see the nosql.Store interface.
+// Components are the shared singletons modules build on. Swap the store here (PostgreSQL,
+// DynamoDB…); modules only see the nosql.Store interface.
 type Components struct {
 	Store *rtcore.Singleton[nosql.Store]
-	Flags *rtcore.Singleton[*featureflags.FeatureFlags]
-	App   *rtcore.Singleton[*web.App]
 }
 
-// Compose wires the components. localAdmin mounts owner endpoints for anyone who can reach
-// the server: use it only on a developer machine.
-func Compose(localAdmin bool) *Components {
-	c := &Components{}
-	c.Store = rtcore.New(func() (nosql.Store, error) {
-		return nosql.NewMemoryStore(), nil
-	})
-	c.Flags = rtcore.New(func() (*featureflags.FeatureFlags, error) {
-		store, err := c.Store.Get()
-		if err != nil {
-			return nil, err
-		}
-		return featureflags.New(store), nil
-	})
-	c.App = rtcore.New(func() (*web.App, error) {
-		flags, err := c.Flags.Get()
-		if err != nil {
-			return nil, err
-		}
-		var options []web.Option
-		if localAdmin {
-			options = append(options, web.WithLocalAdmin())
-		}
-		return web.New([]web.Feature{health.Feature(), flags.Feature()}, options...)
-	})
-	return c
-}
+// Module builds the HTTP features of one module from the shared components. Each module file
+// (health.go, featureflags.go, …) registers one in its init function.
+type Module func(*Components) ([]web.Feature, error)
 
-// Close releases the components, consumers before their dependencies.
-func (c *Components) Close() error {
-	return errors.Join(c.App.Close(), c.Flags.Close(), c.Store.Close())
+var modules []Module
+
+func register(module Module) { modules = append(modules, module) }
+
+// Compose builds the app from every registered module. localAdmin lets owner endpoints under
+// /admin/app act as the local owner: use it only on a developer machine.
+func Compose(localAdmin bool) (*web.App, *Components, error) {
+	c := &Components{Store: rtcore.New(func() (nosql.Store, error) { return nosql.NewMemoryStore(), nil })}
+	var features []web.Feature
+	for _, module := range modules {
+		f, err := module(c)
+		if err != nil {
+			return nil, c, err
+		}
+		features = append(features, f...)
+	}
+	var options []web.Option
+	if localAdmin {
+		options = append(options, web.WithLocalAdmin())
+	}
+	app, err := web.New(features, options...)
+	return app, c, err
 }
 
 func main() {
@@ -83,13 +72,12 @@ func main() {
 
 func run(mode string, args []string) int {
 	// Real Lambda deployments never get local admin access.
-	components := Compose(mode != "lambda")
+	app, components, err := Compose(mode != "lambda")
 	defer func() {
-		if err := components.Close(); err != nil {
+		if err := components.Store.Close(); err != nil {
 			log.Print(err)
 		}
 	}()
-	app, err := components.App.Get()
 	if err != nil {
 		log.Print(err)
 		return 1
@@ -102,9 +90,9 @@ func run(mode string, args []string) int {
 
 	switch mode {
 	case "serve":
-		return serve(ctx, addr, app, "Flags API")
+		return serve(ctx, addr, app, "Example API")
 	case "lambda-local":
-		return serve(ctx, addr, weblambda.LocalBridge(weblambda.Handler(app)), "Flags API (Lambda, local bridge)")
+		return serve(ctx, addr, weblambda.LocalBridge(weblambda.Handler(app)), "Example API (Lambda, local bridge)")
 	case "lambda":
 		weblambda.Start(app)
 		return 0

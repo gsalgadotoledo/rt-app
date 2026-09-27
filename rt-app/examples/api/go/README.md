@@ -1,4 +1,4 @@
-# Flags API (Go)
+# Example API (Go)
 
 The health and feature-flags modules served by the Go core (`rt-app/core-go`), in local admin
 mode: owner endpoints are mounted under `/admin/app` and act as `rt-app-root`. `main.go` is the

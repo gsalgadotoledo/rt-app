@@ -1,4 +1,4 @@
-module flagsapi
+module api
 
 go 1.26.0
 

@@ -36,7 +36,7 @@
           "serve",
           "app:app"
         ],
-        "cwd": "../examples/flags-api/python",
+        "cwd": "../examples/api/python",
         "readyPath": "/health/live"
       }
     },
@@ -50,7 +50,7 @@
           "lambda-local",
           "app:app"
         ],
-        "cwd": "../examples/flags-api/python",
+        "cwd": "../examples/api/python",
         "readyPath": "/health/live"
       }
     },
@@ -70,7 +70,7 @@
           ".",
           "-mode=serve"
         ],
-        "cwd": "../examples/flags-api/go",
+        "cwd": "../examples/api/go",
         "readyPath": "/health/live"
       }
     },
@@ -82,7 +82,7 @@
           ".",
           "-mode=lambda-local"
         ],
-        "cwd": "../examples/flags-api/go",
+        "cwd": "../examples/api/go",
         "readyPath": "/health/live"
       }
     }

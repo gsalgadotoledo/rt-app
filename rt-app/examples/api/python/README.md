@@ -1,6 +1,6 @@
-# Flags API (Python)
+# Example API (Python)
 
-Health and feature flags on an in-memory store, in local mode (owner endpoints under `/admin/app`,
+Every native module (one file per module in `modules/`) on an in-memory store, in local mode (owner endpoints under `/admin/app`,
 no login). `app.py` is the composition root: change one line to swap the store.
 
 Run from this folder with Python 3.11+ and `rt-app/core-python/src` on `PYTHONPATH`
