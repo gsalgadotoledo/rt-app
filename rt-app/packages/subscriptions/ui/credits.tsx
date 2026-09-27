@@ -188,6 +188,14 @@ function RecordCredits({ api, userId, products, onRecorded }: { api: Api; userId
 // ---------------------------------------------------------------------------
 
 /** Edit the credit pack (money value of a credit) and the per-model rates. Saved with the settings form. */
+/** Provider costs are a pair: clearing both removes them; setting one writes the other as 0. */
+function costs(rate: any, field: "costInputPer1k" | "costOutputPer1k", text: string) {
+  const other = field === "costInputPer1k" ? "costOutputPer1k" : "costInputPer1k";
+  if (text === "" && rate[other] === undefined) return { [field]: undefined };
+  if (text === "") return { [field]: 0 };
+  return { [field]: Number(text), [other]: rate[other] ?? 0 };
+}
+
 export function CreditRatesEditor({ credits, onChange }: { credits: any; onChange: (credits: any) => void }) {
   const set = (patch: any) => onChange({ ...credits, ...patch });
   const setRate = (index: number, patch: any) => set({ rates: credits.rates.map((r: any, i: number) => (i === index ? { ...r, ...patch } : r)) });
@@ -195,7 +203,7 @@ export function CreditRatesEditor({ credits, onChange }: { credits: any; onChang
   return (
     <fieldset className="credit-rates">
       <legend>Credits</legend>
-      <p className="hint">The pack price sets the money value of one credit ({formatMoney(Math.round(pack.amountMinor / Math.max(1, pack.credits) * 1000), pack.currency)} per 1,000 credits). Rates say how many credits each model charges per 1,000 tokens.</p>
+      <p className="hint">The pack price sets the money value of one credit ({formatMoney(Math.round(pack.amountMinor / Math.max(1, pack.credits) * 1000), pack.currency)} per 1,000 credits). Rates say how many credits each model charges per 1,000 tokens. Provider costs (optional) are what the provider charges you per 1,000 tokens, in minor units of the pack currency (0.3 = 0.3 cents in USD); they feed the margin rules and unit economics.</p>
       <div className="credit-pack">
         <label>Credits per pack<input type="number" min={1} step={1} value={pack.credits} onChange={(e) => set({ pack: { ...pack, credits: Number(e.target.value) } })} /></label>
         <label>Pack price<input type="number" min={0} step={currencyStep(pack.currency)} value={majorAmount(pack.amountMinor, pack.currency)} onChange={(e) => set({ pack: { ...pack, amountMinor: Math.round(Number(e.target.value) * 10 ** currencyDecimals(pack.currency)) } })} /></label>
@@ -203,7 +211,7 @@ export function CreditRatesEditor({ credits, onChange }: { credits: any; onChang
       </div>
       <div className="table-wrap">
         <table>
-          <thead><tr><th>ID</th><th>Model / function</th><th>Credits per 1k input</th><th>Credits per 1k output</th><th>Minimum</th><th /></tr></thead>
+          <thead><tr><th>ID</th><th>Model / function</th><th>Credits per 1k input</th><th>Credits per 1k output</th><th>Minimum</th><th>Cost per 1k input</th><th>Cost per 1k output</th><th /></tr></thead>
           <tbody>
             {credits.rates.map((r: any, i: number) => (
               <tr key={i}>
@@ -212,6 +220,8 @@ export function CreditRatesEditor({ credits, onChange }: { credits: any; onChang
                 <td><input aria-label="Input credits per 1k tokens" type="number" min={0} step={0.0001} value={r.inputPer1k} onChange={(e) => setRate(i, { inputPer1k: Number(e.target.value) })} /></td>
                 <td><input aria-label="Output credits per 1k tokens" type="number" min={0} step={0.0001} value={r.outputPer1k} onChange={(e) => setRate(i, { outputPer1k: Number(e.target.value) })} /></td>
                 <td><input aria-label="Minimum credits" type="number" min={0} step={1} value={r.minimum} onChange={(e) => setRate(i, { minimum: Number(e.target.value) })} /></td>
+                <td><input aria-label="Provider cost per 1k input tokens (minor units)" type="number" min={0} step={0.0001} placeholder="—" value={r.costInputPer1k ?? ""} onChange={(e) => setRate(i, costs(r, "costInputPer1k", e.target.value))} /></td>
+                <td><input aria-label="Provider cost per 1k output tokens (minor units)" type="number" min={0} step={0.0001} placeholder="—" value={r.costOutputPer1k ?? ""} onChange={(e) => setRate(i, costs(r, "costOutputPer1k", e.target.value))} /></td>
                 <td><button type="button" onClick={() => set({ rates: credits.rates.filter((_: any, j: number) => j !== i) })}>Remove</button></td>
               </tr>
             ))}

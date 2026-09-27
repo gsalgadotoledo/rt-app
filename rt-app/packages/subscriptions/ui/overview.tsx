@@ -79,7 +79,63 @@ export function SubscriptionsOverview({ api }: { api: Api }) {
           </tbody>
         </table>
       )}
+      <UnitEconomics api={api} />
     </div>
+  );
+}
+
+/** Money per currency with 4-decimal minor units, e.g. {usd: 1234.5} → "$12.35". */
+const money = (values: Record<string, number>) => {
+  const entries = Object.entries(values ?? {});
+  return entries.length ? entries.map(([currency, minor]) => formatMoney(Math.round(minor), currency)).join(" · ") : "—";
+};
+
+/** Provider cost, revenue and margin per plan and for the most expensive users. */
+function UnitEconomics({ api }: { api: Api }) {
+  const [data, setData] = useState<any>();
+  const [error, setError] = useState("");
+  useEffect(() => {
+    api("/subscriptions/admin/economics?limit=10")
+      .then(setData)
+      .catch((e: Error) => setError(e.message));
+  }, []);
+  if (error) return <p role="alert">{error}</p>;
+  if (!data) return null;
+  return (
+    <section className="unit-economics">
+      <h3>Unit economics</h3>
+      <div className="overview-stats">
+        <article><small>Provider cost · all time</small><strong>{money(data.totals.costMinor)}</strong><span>{data.totals.users} accounts with a plan, cost or payments</span></article>
+        <article><small>Revenue · money paid</small><strong>{money(data.totals.revenueMinor)}</strong><span>Purchases and paid plans</span></article>
+        <article><small>Margin</small><strong>{money(data.totals.marginMinor)}</strong><span>Revenue minus provider cost</span></article>
+      </div>
+      {data.plans.length > 0 && (
+        <table>
+          <thead><tr><th>Plan</th><th>Users</th><th>Provider cost</th><th>Revenue</th><th>Margin</th></tr></thead>
+          <tbody>
+            {data.plans.map((p: any) => (
+              <tr key={p.planId}><td>{p.name ?? "No plan"}</td><td>{p.users}</td><td>{money(p.costMinor)}</td><td>{money(p.revenueMinor)}</td><td>{money(p.marginMinor)}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {data.users.some((u: any) => Object.keys(u.costMinor).length) && (
+        <table>
+          <thead><tr><th>Most expensive users</th><th>Plan</th><th>Cost this period</th><th>Margin cap</th><th>Cost · all time</th><th>Margin · all time</th></tr></thead>
+          <tbody>
+            {data.users.filter((u: any) => Object.keys(u.costMinor).length).map((u: any) => (
+              <tr key={u.userId}>
+                <td>{u.userId}</td><td>{u.planId ?? "—"}</td>
+                <td>{formatMoney(Math.round(u.periodCostMinor), data.currency)}</td>
+                <td>{u.capMinor === null ? "—" : formatMoney(u.capMinor, data.currency)}</td>
+                <td>{money(u.costMinor)}</td><td>{money(u.marginMinor)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <p className="hint">Provider cost comes from settlements and model usage priced with the provider costs of each rate (Settings → Credits); rates without costs count as free. Users are grouped by their current plan. No currency conversion.</p>
+    </section>
   );
 }
 

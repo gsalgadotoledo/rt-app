@@ -21,6 +21,7 @@ import Deployments from "@gsalgadotoledo/rt-app-deployments/admin";
 import UsersPanel from "@gsalgadotoledo/rt-app-users/admin";
 import TasksPanel from "@gsalgadotoledo/rt-app-tasks/admin";
 import PermissionsPanel from "@gsalgadotoledo/rt-app-acl/admin";
+import ServiceKeysPanel from "@gsalgadotoledo/rt-app-auth/service-keys";
 import { SetupWizard } from "./setup";
 import { RootLogin } from "./root-login";
 import "./style.css";
@@ -37,6 +38,7 @@ const components: Record<string, React.ComponentType<any>> = {
   users: UsersPanel,
   tasks: TasksPanel,
   permissions: PermissionsPanel,
+  "service-keys": ServiceKeysPanel,
 };
 const API = browserApiUrl(__RT_APP_CONFIG__);
 function AdminApp({
