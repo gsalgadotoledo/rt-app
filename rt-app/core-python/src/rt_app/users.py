@@ -7,10 +7,13 @@ p=3 and dkLen=64, so hashes interoperate with the TypeScript and Go implementati
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
 import hmac
+import re
 import secrets
 import uuid
+from datetime import datetime, timezone
 from collections.abc import Mapping
 from typing import Any, Literal, Protocol
 
@@ -43,7 +46,7 @@ ADMIN = {
     "resource": "users.list",
     "path": "/users",
     "component": "users",
-    "fields": ["id", "email", "name", "role", "active"],
+    "fields": ["id", "email", "name", "role", "active", "banned"],
     "actions": ["list", "create", "edit", "delete", "permissions"],
     "group": "authentication",
 }
@@ -95,6 +98,72 @@ def verify_password(password: object, stored: str) -> bool:
     return len(expected) == len(actual) and hmac.compare_digest(actual, expected)
 
 
+# Account suspension (bans) as stored on the USERS row -----------------------------------------------
+# The users module owns the row format and this reader, so every sign-in path enforces a ban even
+# when the users_bans module that writes them is not enabled. See docs/polyglot/users-bans.md.
+
+#: The single public message of every refused sign-in, refresh or request of a banned account.
+ACCOUNT_SUSPENDED = "Account suspended"
+
+#: Latest instant accepted: 9999-12-31T23:59:59.999Z.
+MAX_INSTANT_MS = 253402300799999
+
+_INSTANT = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))",
+    re.ASCII,
+)
+_UNIX = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def parse_instant(value: object) -> int | None:
+    """Strict ISO 8601 instant → epoch ms, or None (the grammar of the TypeScript ``parseInstant``).
+
+    ``YYYY-MM-DDTHH:MM:SS``, optional ``.f`` to ``.fff``, then ``Z`` or ``±HH:MM``; ASCII digits, a
+    real calendar date, year 1970 or later, at most ``MAX_INSTANT_MS`` once the offset is applied.
+    ``parse_instant("2026-01-02T03:04:05+01:00")`` → ``1767319445000``.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _INSTANT.fullmatch(value)
+    if not match:
+        return None
+    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+    fraction = int((match.group(7) or "").ljust(3, "0"))
+    offset_hours, offset_minutes = int(match.group(10) or 0), int(match.group(11) or 0)
+    if (
+        year < 1970 or not 1 <= month <= 12 or not 1 <= day <= calendar.monthrange(year, month)[1]
+        or hour > 23 or minute > 59 or second > 59 or offset_hours > 23 or offset_minutes > 59
+    ):
+        return None
+    sign = -1 if match.group(9) == "-" else 1
+    moment = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+    ms = (moment - _UNIX).days * 86400000 + (moment - _UNIX).seconds * 1000 + fraction
+    ms -= sign * (offset_hours * 60 + offset_minutes) * 60000
+    return ms if 0 <= ms <= MAX_INSTANT_MS else None
+
+
+def active_ban(data: Mapping[str, Any] | None, now_ms: float) -> dict[str, Any] | None:
+    """The ban in force on a user row at ``now_ms``, or None.
+
+    ``until`` None is permanent; a temporary ban lifts by itself when ``until <= now`` (nothing is
+    written). An ``until`` that cannot be read keeps the ban in force (fail closed).
+    """
+    ban = data.get("ban") if isinstance(data, Mapping) else None
+    if not isinstance(ban, Mapping):
+        return None
+    if ban.get("until") is not None:
+        until = parse_instant(ban.get("until"))
+        if until is not None and until <= now_ms:
+            return None
+    return {key: ban.get(key) for key in ("reason", "category", "until", "at", "by")}
+
+
+def view_account(data: Mapping[str, Any], now_ms: float) -> dict[str, Any]:
+    """The admin view of an account (GET /users, GET /users/:id): view_user + banned + the ban in force."""
+    ban = active_ban(data, now_ms)
+    return {**view_user(data), "banned": ban is not None, "ban": ban}
+
+
 class CredentialProvider(Protocol):
     """A remote identity provider that owns passwords (e.g. Cognito)."""
 
@@ -118,6 +187,10 @@ class Users:
 
     def get(self, id: str) -> Row | None:
         return self.store.get("USERS", id)
+
+    def view(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """The admin view of a row at the current time: view_user plus banned and the ban in force."""
+        return view_account(data, epoch_ms(self._now))
 
     def by_email(self, email: str) -> Row | None:
         """Exact index lookup; callers normalize the address."""
@@ -198,7 +271,7 @@ class Users:
         return row
 
     def _read(self, c: Context) -> dict[str, Any]:
-        return view_user(self._existing(c.params["id"])["data"])
+        return self.view(self._existing(c.params["id"])["data"])
 
     def _edit(self, c: Context) -> dict[str, Any]:
         row = self.get(c.params["id"])
@@ -238,7 +311,7 @@ class Users:
 
     def feature(self) -> Feature:
         """``/users/me`` for every signed-in user; list/create/read/edit/restore/delete by permission."""
-        fields = ["id", "email", "name", "role", "active"]
+        fields = ["id", "email", "name", "role", "active", "banned"]
         return Feature(
             id="users",
             admin=ADMIN,
@@ -247,7 +320,7 @@ class Users:
                 Endpoint("PATCH", "/users/me", "users.me.edit", "authenticated", lambda c: self.profile(c.actor["id"], c.request.body)),  # type: ignore[index]
                 Endpoint(
                     "GET", "/users", "users.list", "permission",
-                    lambda c: search_page(self.store, "USERS", c.request.query, fields, lambda row: view_user(row["data"])),
+                    lambda c: search_page(self.store, "USERS", c.request.query, fields, lambda row: self.view(row["data"])),
                 ),
                 Endpoint(
                     "POST", "/users", "users.create", "permission",
@@ -262,6 +335,11 @@ class Users:
 
 
 __all__ = [
+    "ACCOUNT_SUSPENDED",
+    "MAX_INSTANT_MS",
+    "active_ban",
+    "parse_instant",
+    "view_account",
     "Users",
     "CredentialProvider",
     "Role",

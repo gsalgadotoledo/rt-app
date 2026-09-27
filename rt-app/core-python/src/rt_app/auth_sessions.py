@@ -220,13 +220,20 @@ class RefreshSessions:
         """The row of one user's session (one read), or None."""
         return self.store.get(session_partition(user_id), session_id)
 
-    def rotate(self, token: object, valid: Callable[[Row], bool]) -> IssuedRefresh:
+    def rotate(
+        self,
+        token: object,
+        valid: Callable[[Row], bool],
+        blocked: Callable[[Row, bool], None] | None = None,
+    ) -> IssuedRefresh:
         """Rotate a refresh token; ``valid(row)`` re-checks the subject in the database.
 
         Returns the new token for the same session and expiry. Raises 401 "Invalid session" for
         anything invalid; reusing a superseded token (other than the previous one inside the grace
         window) revokes the whole session first. Concurrent rotations are version-guarded: a loser
         re-reads (4 attempts) and normally lands in the grace path; then 409.
+        ``blocked(row, holder)`` runs first on any existing row (live or not) and may raise another
+        error; ``holder`` tells whether the token's secret is the current or the previous one.
         """
         parsed = parse_refresh_token(token)
         if parsed is None:
@@ -234,10 +241,14 @@ class RefreshSessions:
         session_id, secret = parsed
         for _ in range(4):
             row, now = self.find(session_id), self._time()
+            presented = self.hash(session_id, secret)
+            # Before liveness: a banned account answers 403 to the holder of the session's secret.
+            if row is not None and blocked is not None:
+                data = row["data"]
+                blocked(row, self._matches(data.get("secretHash"), presented) or self._matches(data.get("previousHash"), presented))
             if row is None or not session_live(row, now) or not valid(row):
                 raise HttpError(401, INVALID_REFRESH)
             data = row["data"]
-            presented = self.hash(session_id, secret)
             changes: dict[str, Any]
             if self._matches(data.get("secretHash"), presented):
                 # Normal rotation: the presented secret becomes the previous one.
@@ -281,6 +292,15 @@ class RefreshSessions:
             except Conflict:
                 continue
         raise Conflict()
+
+    def revoke_all(self, user_id: str, reason: str) -> int:
+        """Revoke every live session of a user with ``reason`` (for example "ban") → how many.
+
+        Each session is a separate version-guarded write (not atomic); callers bump the user's
+        tokenVersion first, which already makes every session unusable.
+        """
+        now = self._time()
+        return sum(1 for row in self.rows(user_id) if session_live(row, now) and self.revoke(user_id, row["sk"], reason))
 
     def rows(self, user_id: str) -> list[Row]:
         """Every stored session row of a user, across all pages (live or not)."""

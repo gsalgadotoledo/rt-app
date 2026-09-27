@@ -37,7 +37,7 @@ from .errors import Conflict, HttpError
 from .auth_sessions import INVALID_REFRESH, RefreshSessions, parse_refresh_token, rate_limit, session_live
 from .jwt import JwtTokens
 from .nosql import NoSQL, Row, Write
-from .users import CredentialProvider, Users, hash_password, node_hex, validate_password, verify_password
+from .users import ACCOUNT_SUSPENDED, CredentialProvider, Users, active_ban, hash_password, node_hex, validate_password, verify_password
 from .web.app import Context, Endpoint, Feature, Request
 
 Purpose = Literal["login", "reset"]
@@ -292,6 +292,12 @@ class Auth:
     def _provider_id(self) -> str:
         return self.provider.id if self.provider else "local"
 
+    def _gate(self, user: Row) -> None:
+        """403 "Account suspended" for a banned account (``users.active_ban``). Called only after the
+        caller proved the credential, so the answer never reveals a ban to anyone else."""
+        if active_ban(user["data"], self._time()):
+            raise HttpError(403, ACCOUNT_SUSPENDED)
+
     def actor(self, header: str | None = None) -> dict[str, Any] | None:
         """The actor of an ``Authorization: Bearer <jwt>`` header; None without a header.
 
@@ -312,6 +318,7 @@ class Auth:
             or (user["data"].get("credentialProvider") or "local") != self._provider_id
         ):
             raise HttpError(401, "Invalid session")
+        self._gate(user)
         if "sid" not in claims:
             return public_user(user["data"])
         if not session_live(self.refresh_sessions.get(claims["id"], claims["sid"]), self._time()):
@@ -359,7 +366,8 @@ class Auth:
         """POST /auth/refresh: rotate a refresh token → a new session response for the same session.
 
         Limits ``refresh-ip:<ip>`` 60 (before the token is read), then ``refresh-session:<id>`` 10
-        per minute; every failure is 401 "Invalid session".
+        per minute; every failure is 401 "Invalid session", except 403 "Account suspended" for the
+        holder of a session of a banned account.
         """
         self.limit(f"refresh-ip:{_js_str(ip)}", 60)
         parsed = parse_refresh_token(refresh_token)
@@ -373,7 +381,14 @@ class Auth:
             user = self._session_user(session)
             return user is not None
 
-        rotated = self.refresh_sessions.rotate(refresh_token, valid)
+        def blocked(session: Row, holder: bool) -> None:
+            # A banned account: 403 for the holder of the session's secret, 401 otherwise; no writes.
+            owner_id = session["data"].get("userId")
+            owner = self.users.get(owner_id) if isinstance(owner_id, str) else None
+            if owner and owner["data"].get("active") is True and active_ban(owner["data"], self._time()):
+                raise HttpError(403, ACCOUNT_SUSPENDED) if holder else HttpError(401, INVALID_REFRESH)
+
+        rotated = self.refresh_sessions.rotate(refresh_token, valid, blocked)
         assert user is not None  # rotate only succeeds after valid() returned True
         return self._respond(user, rotated)
 
@@ -446,6 +461,7 @@ class Auth:
             if not row or not row["data"].get("active") or row["data"].get("credentialProvider") != self.provider.id:
                 raise HttpError(401, "Incorrect email or password")
             result = self.provider.password(row["data"]["id"], validate_password(password))
+            self._gate(row)
             if "challenge" in result:
                 return self._pending(row, "totp", {"providerSession": result.get("session")})
             return self._session(row, ip, user_agent)
@@ -453,6 +469,7 @@ class Auth:
         valid = verify_password(password, stored if stored is not None else DUMMY_HASH)
         if not row or not row["data"].get("active") or not valid:
             raise HttpError(401, "Incorrect email or password")
+        self._gate(row)
         mfa = self.store.get("MFA", row["data"]["id"])
         if mfa and mfa["data"].get("enabled"):
             return self._pending(row, "totp", {})
@@ -546,6 +563,7 @@ class Auth:
                 raise HttpError(400, "Invalid code")
             session = self._vault.open(pending["data"]["sealed"]).get("providerSession")
             self.provider.verify_email_code(user["data"]["id"], session, code)  # type: ignore[arg-type]
+            self._gate(user)
             self._finish_pending(pending)
             return self._session(user, ip, user_agent)
         row = self.store.get("CHALLENGE", self._digest(f"{purpose}:{_js_str(email)}"))
@@ -561,6 +579,8 @@ class Auth:
                 {"row": _bump(user, passwordHash=password_hash, tokenVersion=user["data"]["tokenVersion"] + 1), "expected": user["version"]},
             ])
             return {"message": "Password updated. Sign in to continue."}
+        # A banned account is refused after the code matched; the code stays unused.
+        self._gate(user)
         if self.has_mfa(user["data"]["id"]):
             raise HttpError(403, "Use your password and authenticator")
         self.store.transact([consumed])
@@ -692,6 +712,7 @@ class Auth:
         if not _is_code(code):
             raise HttpError(400, "Invalid code")
         user = self._user(pending["data"]["userId"])
+        self._gate(user)
         if self.provider:
             session = self._vault.open(pending["data"]["sealed"]).get("providerSession")
             self.provider.verify_totp(user["data"]["id"], session, code)  # type: ignore[arg-type]

@@ -1,4 +1,5 @@
-"""Identity: users (/users…, owner endpoints under /admin/app/users) and sign-in (/auth…).
+"""Identity: users (/users…, owner endpoints under /admin/app/users), account bans
+(/users/:id/ban|unban|bans) and sign-in (/auth…).
 
 Sign-in returns a 15-minute access token plus a rotating refresh token (POST /auth/refresh, GET and
 DELETE /auth/sessions, POST /auth/logout). Access tokens authenticate every other module's
@@ -13,11 +14,14 @@ import secrets
 from rt_app.auth import Auth, LocalMailbox
 from rt_app.jwt import JwtTokens
 from rt_app.users import Users
+from rt_app.users_bans import UserBans
 
 
 def features(components):
     secret = os.environ.get("RT_APP_SECRET") or secrets.token_hex(48)
     users = Users(components.store.get())
     auth = Auth(users, JwtTokens(secret), LocalMailbox(), secret)
+    # Bans live on the user row; auth refuses banned accounts, UserBans writes the bans.
+    bans = UserBans(users, sessions=auth.refresh_sessions)
     components.authenticate = auth.actor_from_request
-    return [users.feature(), auth.feature()]
+    return [users.feature(), bans.feature(), auth.feature()]
