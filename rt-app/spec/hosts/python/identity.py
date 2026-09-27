@@ -147,17 +147,19 @@ class AuthFacade:
         users = Users(self._store, now=self._clock.now)
         self._mailbox = LocalMailbox()
         tokens = JwtTokens(secret, now=self._clock.now)
-        self._auth = Auth(users, tokens, self._mailbox, secret, now=self._clock.now)
+        self._auth = Auth(users, tokens, self._mailbox, secret, now=self._clock.now, session_ttl_ms=init.get("sessionTtlMs"))
         self._vault = AuthVault(secret)
 
-    def login(self, email: Any, password: Any, ip: Any) -> Any:
-        return self._auth.login(email, password, ip)
+    def login(self, email: Any, password: Any, ip: Any, user_agent: Any = None) -> Any:
+        return self._auth.login(email, password, ip, user_agent)
 
     def issue(self, email: Any, purpose: Any, ip: Any) -> Any:
         return self._auth.issue(email, purpose, ip)
 
-    def consume(self, email: Any, code: Any, purpose: Any, ip: Any, password: Any = None, challenge_id: Any = None) -> Any:
-        return self._auth.consume(email, code, purpose, ip, password, challenge_id)
+    def consume(
+        self, email: Any, code: Any, purpose: Any, ip: Any, password: Any = None, challenge_id: Any = None, user_agent: Any = None
+    ) -> Any:
+        return self._auth.consume(email, code, purpose, ip, password, challenge_id, user_agent)
 
     def actor(self, header: Any = None) -> Any:
         return self._auth.actor(header)
@@ -180,8 +182,8 @@ class AuthFacade:
     def enable_mfa(self, id: Any, challenge_id: Any, code: Any, ip: Any) -> Any:
         return self._auth.enable_mfa(id, challenge_id, code, ip)
 
-    def verify_mfa(self, challenge_id: Any, code: Any, ip: Any) -> Any:
-        return self._auth.verify_mfa(challenge_id, code, ip)
+    def verify_mfa(self, challenge_id: Any, code: Any, ip: Any, user_agent: Any = None) -> Any:
+        return self._auth.verify_mfa(challenge_id, code, ip, user_agent)
 
     def reset_mfa(self, id: Any) -> Any:
         return self._auth.reset_mfa(id)
@@ -189,8 +191,21 @@ class AuthFacade:
     def request_email_change(self, id: Any, email: Any, ip: Any) -> Any:
         return self._auth.request_email_change(id, email, ip)
 
-    def confirm_email_change(self, id: Any, code: Any, ip: Any) -> Any:
-        return self._auth.confirm_email_change(id, code, ip)
+    def confirm_email_change(self, id: Any, code: Any, ip: Any, user_agent: Any = None) -> Any:
+        return self._auth.confirm_email_change(id, code, ip, user_agent)
+
+    # Refresh sessions (POST /auth/refresh, GET/DELETE /auth/sessions, POST /auth/logout).
+    def refresh(self, refresh_token: Any, ip: Any) -> Any:
+        return self._auth.refresh(refresh_token, ip)
+
+    def sessions(self, user_id: Any, current_session_id: Any = None) -> Any:
+        return self._auth.sessions(user_id, current_session_id)
+
+    def revoke_session(self, user_id: Any, session_id: Any) -> Any:
+        return self._auth.revoke_session(user_id, session_id)
+
+    def logout(self, user_id: Any, session_id: Any = None, all: Any = None) -> Any:
+        return self._auth.logout(user_id, session_id, all)
 
     # Helpers (not Auth methods): captured mail, stored rows, clock, TOTP and vault.
     def mailbox(self) -> list[dict[str, str]]:

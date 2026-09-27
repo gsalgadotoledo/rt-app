@@ -1,7 +1,9 @@
 # Example API (Python)
 
 Every native module (one file per module in `modules/`) on an in-memory store, in local mode (owner endpoints under `/admin/app`,
-no login). `app.py` is the composition root: change one line to swap the store.
+no login). `app.py` is the composition root: change one line to swap the store. `modules/identity.py` serves users and
+sign-in (`/auth/login`, `/auth/refresh`, `/auth/sessions`, `/auth/logout`…); its access tokens authenticate the other
+modules' protected endpoints.
 
 Run from this folder with Python 3.11+ and `rt-app/core-python/src` on `PYTHONPATH`
 (`sh ../../../spec/hosts/python.sh` does both):

@@ -1,8 +1,8 @@
 """Stateless 15-minute session tokens: compact JWS with HS256 (stdlib only).
 
 Tokens are byte-identical to the TypeScript reference (jose): header ``{"alg":"HS256","typ":"JWT"}``,
-payload ``{"v","sub","iss","aud","iat","exp"}`` in that order, compact JSON, base64url without
-padding. Verification follows the jose defaults the reference uses: HS256 only, exact issuer,
+payload ``{"v","sub","iss","aud","iat","exp"}`` in that order (``{"v","sid","sub",…}`` for tokens
+tied to a refresh session), compact JSON, base64url without padding. Verification follows the jose defaults the reference uses: HS256 only, exact issuer,
 audience string or array, required ``exp``/``iat``/``sub``, ``exp <= now`` is expired (no leeway),
 ``nbf`` honored, a future ``iat`` accepted. Every failure is 401 "Invalid or expired session".
 """
@@ -14,7 +14,7 @@ import hmac
 import math
 import re
 from collections.abc import Mapping
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from . import _js
 from .contracts import Clock, epoch_ms
@@ -28,6 +28,8 @@ _B64URL = re.compile(r"[A-Za-z0-9_-]*")
 class Claims(TypedDict):
     id: str
     version: int
+    #: The refresh session of the token, present only when the token carries a sid claim.
+    sid: NotRequired[str]
 
 
 def _b64url_decode(part: str) -> bytes:
@@ -68,11 +70,18 @@ class JwtTokens:
         return hmac.new(self._key, signing_input.encode("ascii"), hashlib.sha256).digest()
 
     def issue(self, user: Mapping[str, Any]) -> str:
-        """Sign a 15-minute session; ``user["id"]`` becomes sub and ``tokenVersion`` enables revocation."""
+        """Sign a 15-minute session; ``user["id"]`` becomes sub and ``tokenVersion`` enables revocation.
+
+        A non-empty string ``user["sid"]`` ties the token to a refresh session: the claim goes right
+        after ``v``. A missing, null or empty sid is ignored (the token is byte-identical to before).
+        """
         now = math.floor(epoch_ms(self._now) / 1000)
         payload: dict[str, Any] = {}
         if user.get("tokenVersion") is not None:
             payload["v"] = user["tokenVersion"]
+        sid = user.get("sid")
+        if isinstance(sid, str) and sid:
+            payload["sid"] = sid
         if user.get("id") is not None:
             payload["sub"] = user["id"]
         payload.update(iss=self.issuer, aud=self.audience, iat=now, exp=now + SESSION_SECONDS)
@@ -80,7 +89,8 @@ class JwtTokens:
         return f"{signing_input}.{_js.base64url_encode(self._sign(signing_input))}"
 
     def verify(self, token: object) -> Claims:
-        """Return ``{id, version}``; malformed, expired or foreign tokens always raise HTTP 401."""
+        """Return ``{id, version}`` (plus ``sid`` when the token has one); malformed, expired or
+        foreign tokens, and a sid claim that is not a non-empty string, always raise HTTP 401."""
         try:
             return self._verify(token)
         except Exception:
@@ -116,8 +126,13 @@ class JwtTokens:
             raise ValueError("Expired")
         if not payload["sub"] or not _is_integer(payload.get("v")):
             raise ValueError("Invalid claims")
+        if "sid" in payload and (not isinstance(payload["sid"], str) or not payload["sid"]):
+            raise ValueError("Invalid sid")
         version = payload["v"]
-        return {"id": payload["sub"], "version": int(version) if isinstance(version, float) else version}
+        claims: Claims = {"id": payload["sub"], "version": int(version) if isinstance(version, float) else version}
+        if "sid" in payload:
+            claims["sid"] = payload["sid"]
+        return claims
 
 
 __all__ = ["JwtTokens", "Claims", "SESSION_SECONDS"]

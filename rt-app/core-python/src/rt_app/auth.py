@@ -6,7 +6,12 @@ with the other implementations:
 - ``RATE/<digest("<key>:<floor(ms/60000)>")>`` ``{count}``, ttl +120 s;
 - ``CHALLENGE/<digest("<purpose>:<email>")>`` and ``CHALLENGE/<digest("email-change:<id>")>``;
 - ``AUTH_FLOW/<uuid>`` pending challenges with a sealed value; ``MFA/<id>`` with the sealed seed;
-- ``SETTINGS/auth`` ``{passwordLogin, emailCodeLogin}``.
+- ``SETTINGS/auth`` ``{passwordLogin, emailCodeLogin}``;
+- ``SESSION/<sessionId>`` and ``SESSIONS#<userId>/<sessionId>``: refresh sessions (``auth_sessions``).
+
+Every sign-in returns ``{token, expiresIn: 900, refreshToken, refreshExpiresAt, sessionId, user}``;
+the access token carries the session id (``sid``) and ``actor`` rejects it once the session is
+revoked or expired.
 
 ``digest(text)`` is ``hex(HMAC-SHA256(secret, text))``. Sealed values use AES-256-GCM with the key
 ``SHA-256("rt-app-auth-vault:" + secret)`` and the layout ``base64url(iv12 || tag16 || ciphertext)``
@@ -29,6 +34,7 @@ from typing import Any, Literal, Protocol, TypedDict
 from . import _js
 from .contracts import Clock, email_address, epoch_ms, public_user, to_datetime, view_user
 from .errors import Conflict, HttpError
+from .auth_sessions import INVALID_REFRESH, RefreshSessions, parse_refresh_token, rate_limit, session_live
 from .jwt import JwtTokens
 from .nosql import NoSQL, Row, Write
 from .users import CredentialProvider, Users, hash_password, node_hex, validate_password, verify_password
@@ -54,6 +60,17 @@ def _js_str(value: object) -> str:
     if isinstance(value, float) and value.is_integer() and abs(value) < 1e21:
         return str(int(value))
     return str(value)
+
+
+def _user_agent(request: Request) -> str | None:
+    """The User-Agent request header when it is a single string."""
+    value = request.headers.get("user-agent")
+    return value if isinstance(value, str) else None
+
+
+def _iso_ms(ms: float) -> str:
+    """``new Date(ms).toISOString()``."""
+    return _js.iso_timestamp(to_datetime(ms))
 
 
 def _is_code(code: object) -> bool:
@@ -241,6 +258,8 @@ class Auth:
         provider: IdentityProvider | None = None,
         *,
         now: Clock | None = None,
+        session_ttl_ms: int | None = None,
+        refresh_grace_ms: int | None = None,
     ) -> None:
         self.users = users
         self.tokens = tokens
@@ -249,6 +268,9 @@ class Auth:
         self._secret = _utf8(secret)
         self._vault = AuthVault(secret)
         self._now = now
+        self._secret_text = secret
+        #: Refresh sessions (rows ``SESSIONS#<userId>/<sessionId>`` and ``SESSION/<sessionId>``).
+        self.refresh_sessions = RefreshSessions(users.store, secret, now=now, ttl_ms=session_ttl_ms, grace_ms=refresh_grace_ms)
 
     def _time(self) -> float:
         return epoch_ms(self._now)
@@ -264,51 +286,156 @@ class Auth:
 
     def limit(self, key: str, max: int) -> None:
         """Count one attempt for ``key`` in the current minute; 429 once ``max`` is reached."""
-        now = self._time()
-        sk = self._digest(f"{_js_str(key)}:{math.floor(now / 60000)}")
-        for _ in range(8):
-            row = self.store.get("RATE", sk)
-            count = (row["data"].get("count") if row else None) or 0
-            if count >= max:
-                raise HttpError(429, "Too many attempts; wait one minute")
-            try:
-                self.store.transact([{
-                    "row": {"pk": "RATE", "sk": sk, "version": (row["version"] if row else 0) + 1, "data": {"count": count + 1}, "ttl": math.floor(now / 1000) + 120},
-                    "expected": row["version"] if row else None,
-                }])
-                return
-            except Conflict:
-                continue
-        raise HttpError(429, "Too many simultaneous attempts")
+        rate_limit(self.store, self._secret_text, self._time(), key, max)
+
+    @property
+    def _provider_id(self) -> str:
+        return self.provider.id if self.provider else "local"
 
     def actor(self, header: str | None = None) -> dict[str, Any] | None:
-        """The actor of an ``Authorization: Bearer <jwt>`` header; None without a header."""
+        """The actor of an ``Authorization: Bearer <jwt>`` header; None without a header.
+
+        The user must exist, be active, use this credential provider and have the token's version.
+        A token with a sid claim also needs its refresh session to be live (one more read), so a
+        revoked session cuts its access tokens at once; the actor then carries ``sessionId``.
+        """
         if not header:
             return None
         if not isinstance(header, str) or not header.startswith("Bearer "):
             raise HttpError(401, "Invalid token")
         claims = self.tokens.verify(header[7:])
         user = self.users.get(claims["id"])
-        provider = self.provider.id if self.provider else "local"
         if (
             not user
             or not user["data"].get("active")
             or user["data"].get("tokenVersion") != claims["version"]
-            or (user["data"].get("credentialProvider") or "local") != provider
+            or (user["data"].get("credentialProvider") or "local") != self._provider_id
         ):
             raise HttpError(401, "Invalid session")
-        return public_user(user["data"])
+        if "sid" not in claims:
+            return public_user(user["data"])
+        if not session_live(self.refresh_sessions.get(claims["id"], claims["sid"]), self._time()):
+            raise HttpError(401, "Invalid session")
+        return {**public_user(user["data"]), "sessionId": claims["sid"]}
 
     def actor_from_request(self, request: Request) -> dict[str, Any] | None:
         """``App(authenticate=auth.actor_from_request)``: the actor of a web request."""
         return self.actor(request.headers.get("authorization"))
 
-    def _session(self, row: Row) -> dict[str, Any]:
-        return {"token": self.tokens.issue(public_user(row["data"])), "expiresIn": 900, "user": view_user(row["data"])}
+    def _respond(self, row: Row, refresh: Mapping[str, Any]) -> dict[str, Any]:
+        """The session response for a user row and its refresh session."""
+        return {
+            "token": self.tokens.issue({**public_user(row["data"]), "sid": refresh["sessionId"]}),
+            "expiresIn": 900,
+            "refreshToken": refresh["refreshToken"],
+            "refreshExpiresAt": _iso_ms(refresh["expiresAt"]),
+            "sessionId": refresh["sessionId"],
+            "user": view_user(row["data"]),
+        }
+
+    def _session(self, row: Row, ip: object = None, user_agent: object = None) -> dict[str, Any]:
+        """Start a refresh session for a user who just signed in → the session response."""
+        subject = {"id": row["data"]["id"], "tokenVersion": row["data"]["tokenVersion"], "provider": self._provider_id}
+        return self._respond(row, self.refresh_sessions.create(subject, {"ip": ip, "userAgent": user_agent}))
+
+    def _session_user(self, session: Row) -> Row | None:
+        """The session's user while it still matches the session (the immediate cut-off)."""
+        data = session["data"]
+        user = self.users.get(data["userId"]) if isinstance(data.get("userId"), str) else None
+        if not user:
+            return None
+        provider = user["data"].get("credentialProvider")
+        valid = (
+            user["data"].get("active") is True
+            and user["data"].get("tokenVersion") == data.get("tokenVersion")
+            and (provider if provider is not None else "local") == data.get("provider")
+            and data.get("provider") == self._provider_id
+        )
+        return user if valid else None
+
+    # Refresh sessions -----------------------------------------------------------------------------
+
+    def refresh(self, refresh_token: object, ip: str) -> dict[str, Any]:
+        """POST /auth/refresh: rotate a refresh token → a new session response for the same session.
+
+        Limits ``refresh-ip:<ip>`` 60 (before the token is read), then ``refresh-session:<id>`` 10
+        per minute; every failure is 401 "Invalid session".
+        """
+        self.limit(f"refresh-ip:{_js_str(ip)}", 60)
+        parsed = parse_refresh_token(refresh_token)
+        if parsed is None:
+            raise HttpError(401, INVALID_REFRESH)
+        self.limit(f"refresh-session:{parsed[0]}", 10)
+        user: Row | None = None
+
+        def valid(session: Row) -> bool:
+            nonlocal user
+            user = self._session_user(session)
+            return user is not None
+
+        rotated = self.refresh_sessions.rotate(refresh_token, valid)
+        assert user is not None  # rotate only succeeds after valid() returned True
+        return self._respond(user, rotated)
+
+    def sessions(self, user_id: str, current_session_id: object = None) -> dict[str, Any]:
+        """GET /auth/sessions: the user's live sessions, newest first (never secrets or hashes)."""
+        user = self.users.get(user_id)
+        now = self._time()
+        version = user["data"].get("tokenVersion") if user else None
+        rows = [
+            row
+            for row in self.refresh_sessions.rows(user_id)
+            if user and session_live(row, now) and row["data"].get("tokenVersion") == version and row["data"].get("provider") == self._provider_id
+        ]
+        # createdAt descending, then id ascending (stable sorts: secondary key first).
+        rows.sort(key=lambda row: row["sk"])
+        rows.sort(key=lambda row: row["data"]["createdAt"], reverse=True)
+        return {"items": [
+            {
+                "id": row["sk"],
+                "createdAt": _iso_ms(row["data"]["createdAt"]),
+                "lastUsedAt": _iso_ms(row["data"]["lastUsedAt"]),
+                "expiresAt": _iso_ms(row["data"]["expiresAt"]),
+                "current": row["sk"] == current_session_id,
+                "ip": row["data"].get("ip"),
+                "userAgent": row["data"].get("userAgent"),
+            }
+            for row in rows
+        ]}
+
+    def revoke_session(self, user_id: str, session_id: object) -> dict[str, Any]:
+        """DELETE /auth/sessions/:id: revoke one of the caller's own live sessions, else 404."""
+        user = self.users.get(user_id)
+        row = self.refresh_sessions.get(user_id, session_id) if isinstance(session_id, str) and _js.utf16_length(session_id) <= 100 else None
+        if (
+            not row
+            or not user
+            or row["data"].get("tokenVersion") != user["data"].get("tokenVersion")
+            or not self.refresh_sessions.revoke(user_id, session_id, "revoked")
+        ):
+            raise HttpError(404, "Session not found")
+        return {"ok": True}
+
+    def logout(self, user_id: str, session_id: object = None, all: object = None) -> dict[str, Any]:
+        """POST /auth/logout: end the current session only.
+
+        With ``all is True`` (the JSON boolean), or for an access token without a session (no sid),
+        sign out everywhere as before: provider logout and ``tokenVersion + 1``.
+        """
+        if all is not True and session_id:
+            self.refresh_sessions.revoke(user_id, session_id, "logout")
+            return {"ok": True}
+        row = self.users.get(user_id)
+        if not row:
+            raise HttpError(401, "Invalid session")
+        if self.provider:
+            self.provider.logout(row["data"]["id"])
+        self._invalidate(row)
+        return {"ok": True}
 
     # Password sign-in ---------------------------------------------------------------------------
 
-    def login(self, email: str, password: object, ip: str) -> dict[str, Any]:
+    def login(self, email: str, password: object, ip: str, user_agent: object = None) -> dict[str, Any]:
         """Session, or ``{challenge: "totp", challengeId}`` for accounts with MFA."""
         if not self.settings()["values"].get("passwordLogin"):
             raise HttpError(403, "Password sign-in is disabled")
@@ -321,7 +448,7 @@ class Auth:
             result = self.provider.password(row["data"]["id"], validate_password(password))
             if "challenge" in result:
                 return self._pending(row, "totp", {"providerSession": result.get("session")})
-            return self._session(row)
+            return self._session(row, ip, user_agent)
         stored = row["data"].get("passwordHash") if row else None
         valid = verify_password(password, stored if stored is not None else DUMMY_HASH)
         if not row or not row["data"].get("active") or not valid:
@@ -329,7 +456,7 @@ class Auth:
         mfa = self.store.get("MFA", row["data"]["id"])
         if mfa and mfa["data"].get("enabled"):
             return self._pending(row, "totp", {})
-        return self._session(row)
+        return self._session(row, ip, user_agent)
 
     # Email codes ----------------------------------------------------------------------------------
 
@@ -397,6 +524,7 @@ class Auth:
         ip: str,
         password: object = None,
         challenge_id: object = None,
+        user_agent: object = None,
     ) -> dict[str, Any]:
         """Redeem an emailed code: a session for login, a new password for reset."""
         if purpose == "login" and not self.settings()["values"].get("emailCodeLogin"):
@@ -419,7 +547,7 @@ class Auth:
             session = self._vault.open(pending["data"]["sealed"]).get("providerSession")
             self.provider.verify_email_code(user["data"]["id"], session, code)  # type: ignore[arg-type]
             self._finish_pending(pending)
-            return self._session(user)
+            return self._session(user, ip, user_agent)
         row = self.store.get("CHALLENGE", self._digest(f"{purpose}:{_js_str(email)}"))
         row = self._challenge(row, lambda _: f"{purpose}:{_js_str(email)}:{code}")
         user = self.users.get(row["data"]["userId"])
@@ -436,7 +564,7 @@ class Auth:
         if self.has_mfa(user["data"]["id"]):
             raise HttpError(403, "Use your password and authenticator")
         self.store.transact([consumed])
-        return self._session(user)
+        return self._session(user, ip, user_agent)
 
     # Email change ---------------------------------------------------------------------------------
 
@@ -474,7 +602,7 @@ class Auth:
         self.mail.send_code(email, code, "email-change")
         return {"message": "We sent a code to the new email address."}
 
-    def confirm_email_change(self, user_id: str, code: object, ip: str) -> dict[str, Any]:
+    def confirm_email_change(self, user_id: str, code: object, ip: str, user_agent: object = None) -> dict[str, Any]:
         """Apply a pending email change atomically (user, both EMAIL index rows) → new session."""
         self.limit(f"email-confirm:{_js_str(user_id)}", 8)
         self.limit(f"email-confirm-ip:{_js_str(ip)}", 20)
@@ -498,7 +626,7 @@ class Auth:
             {"row": index, "expected": index["version"], "delete": True},
             {"row": {"pk": "EMAIL", "sk": new_email, "version": 1, "data": {"id": user_id}}, "expected": None},
         ])
-        return self._session(updated)
+        return self._session(updated, ip, user_agent)
 
     # Pending challenges and MFA ---------------------------------------------------------------------
 
@@ -556,7 +684,7 @@ class Auth:
             raise HttpError(404, "User not found")
         return user
 
-    def verify_mfa(self, id: object, code: object, ip: str) -> dict[str, Any]:
+    def verify_mfa(self, id: object, code: object, ip: str, user_agent: object = None) -> dict[str, Any]:
         """Finish a password sign-in with an authenticator code → session."""
         self.limit(f"mfa-ip:{_js_str(ip)}", 20)
         pending = self._read_pending(id, "totp")
@@ -580,7 +708,7 @@ class Auth:
                 {"row": _bump(row, lastStep=step), "expected": row["version"]},
                 {"row": _bump(pending, used=True), "expected": pending["version"]},
             ])
-        return self._session(user)
+        return self._session(user, ip, user_agent)
 
     def setup_mfa(self, id: str, password: object, ip: str) -> dict[str, Any]:
         """Start TOTP enrollment (password required) → ``{challenge, challengeId, secret, uri}``."""
@@ -689,16 +817,9 @@ class Auth:
 
     # HTTP -------------------------------------------------------------------------------------------
 
-    def _logout(self, c: Context) -> dict[str, Any]:
-        row = self._user(c.actor["id"])  # type: ignore[index]
-        if self.provider:
-            self.provider.logout(row["data"]["id"])
-        self._invalidate(row)
-        return {"ok": True}
-
     def _methods(self, _: Context) -> dict[str, Any]:
         provider = self.provider.id if self.provider else "local"
-        return {**self.settings()["values"], "provider": provider, "totp": True, "selfRegistration": False, "refreshTokens": False}
+        return {**self.settings()["values"], "provider": provider, "totp": True, "selfRegistration": False, "refreshTokens": True}
 
     def feature(self) -> Feature:
         """The endpoints of the TypeScript module, same paths, resources and access."""
@@ -720,7 +841,7 @@ class Auth:
             endpoints=[
                 Endpoint("POST", "/auth/mfa/reset", "auth.mfa.reset", "owner", lambda c: self.reset_mfa(body(c).get("userId"))),
                 Endpoint("POST", "/auth/mfa/verify", "auth.mfa.verify", "guest",
-                         lambda c: self.verify_mfa(body(c).get("challengeId"), body(c).get("code"), c.request.ip)),
+                         lambda c: self.verify_mfa(body(c).get("challengeId"), body(c).get("code"), c.request.ip, _user_agent(c.request))),
                 Endpoint("GET", "/auth/mfa", "auth.mfa.status", "authenticated",
                          lambda c: {"enabled": self.has_mfa(actor_id(c)), "type": "totp"}),
                 Endpoint("POST", "/auth/mfa/setup", "auth.mfa.setup", "authenticated",
@@ -731,12 +852,13 @@ class Auth:
                 Endpoint("GET", "/auth/settings", "auth.settings.read", "permission", lambda c: self.settings()),
                 Endpoint("PUT", "/auth/settings", "auth.settings.write", "owner", lambda c: self.update_settings(body(c))),
                 Endpoint("POST", "/auth/login", "auth.login", "guest",
-                         lambda c: self.login(email_address(body(c).get("email")), body(c).get("password"), c.request.ip)),
+                         lambda c: self.login(email_address(body(c).get("email")), body(c).get("password"), c.request.ip,
+                                              _user_agent(c.request))),
                 Endpoint("POST", "/auth/code", "auth.code", "guest",
                          lambda c: self.issue(email_address(body(c).get("email")), "login", c.request.ip)),
                 Endpoint("POST", "/auth/code/verify", "auth.code.verify", "guest",
                          lambda c: self.consume(email_address(body(c).get("email")), body(c).get("code"), "login", c.request.ip,
-                                                None, body(c).get("challengeId"))),
+                                                None, body(c).get("challengeId"), _user_agent(c.request))),
                 Endpoint("POST", "/auth/forgot-password", "auth.forgot", "guest",
                          lambda c: self.issue(email_address(body(c).get("email")), "reset", c.request.ip)),
                 Endpoint("POST", "/auth/reset-password", "auth.reset", "guest",
@@ -745,8 +867,14 @@ class Auth:
                 Endpoint("POST", "/auth/email-change", "auth.email.change", "authenticated",
                          lambda c: self.request_email_change(actor_id(c), email_address(body(c).get("email")), c.request.ip)),
                 Endpoint("POST", "/auth/email-change/verify", "auth.email.verify", "authenticated",
-                         lambda c: self.confirm_email_change(actor_id(c), body(c).get("code"), c.request.ip)),
-                Endpoint("POST", "/auth/logout", "auth.logout", "authenticated", self._logout),
+                         lambda c: self.confirm_email_change(actor_id(c), body(c).get("code"), c.request.ip, _user_agent(c.request))),
+                Endpoint("POST", "/auth/refresh", "auth.refresh", "guest", lambda c: self.refresh(body(c).get("refreshToken"), c.request.ip)),
+                Endpoint("GET", "/auth/sessions", "auth.sessions.list", "authenticated",
+                         lambda c: self.sessions(actor_id(c), c.actor.get("sessionId"))),  # type: ignore[union-attr]
+                Endpoint("DELETE", "/auth/sessions/:id", "auth.sessions.revoke", "authenticated",
+                         lambda c: self.revoke_session(actor_id(c), c.params.get("id"))),
+                Endpoint("POST", "/auth/logout", "auth.logout", "authenticated",
+                         lambda c: self.logout(actor_id(c), c.actor.get("sessionId"), body(c).get("all"))),  # type: ignore[union-attr]
             ],
         )
 
@@ -754,6 +882,8 @@ class Auth:
 __all__ = [
     "Auth",
     "AuthVault",
+    "RefreshSessions",
+    "rate_limit",
     "IdentityProvider",
     "LocalMailbox",
     "Mailer",

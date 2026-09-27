@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from rt_app import Singleton
 from rt_app.nosql import MemoryStore, NoSQL
-from rt_app.web import App, Feature
+from rt_app.web import App, Feature, Request
 
 
 @dataclass
@@ -25,6 +26,8 @@ class Components:
     """Shared singletons modules build on. Swap the store here (PostgreSQL, DynamoDB…)."""
 
     store: Singleton[NoSQL]
+    #: Resolves the actor of a request (set by the identity module: Bearer access tokens).
+    authenticate: Callable[[Request], dict | None] | None = None
 
 
 def load_modules() -> list:
@@ -44,7 +47,7 @@ def create_app() -> App:
     components = Components(store=Singleton(MemoryStore))
     features: list[Feature] = [f for module in load_modules() for f in module.features(components)]
     # Local mode: owner endpoints under /admin/app run as the local owner "rt-app-root".
-    return App(features, local_admin=True)
+    return App(features, local_admin=True, authenticate=components.authenticate)
 
 
 app = create_app()
