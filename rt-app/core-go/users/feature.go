@@ -17,9 +17,9 @@ import (
 //
 //	GET    /users/me             authenticated  users.me.read   the caller's view
 //	PATCH  /users/me             authenticated  users.me.edit   {name}
-//	GET    /users                permission     users.list      ?id&email&name&role&active&trash&cursor
+//	GET    /users                permission     users.list      ?id&email&name&role&active&banned&trash&cursor
 //	POST   /users                permission     users.create    {email, name, password}
-//	GET    /users/:id            permission     users.read
+//	GET    /users/:id            permission     users.read      the admin view (ViewAccount: banned, ban)
 //	PATCH  /users/:id            permission     users.edit      {name}; owners only for an owner
 //	POST   /users/:id/restore    permission     users.restore
 //	DELETE /users/:id            permission     users.delete    soft delete; revokes sessions
@@ -32,8 +32,8 @@ func (u *Users) Feature() web.Feature {
 			return u.Profile(c.Ctx, c.Actor.ID, c.Request.Body, "")
 		}},
 		{Method: "GET", Path: "/users", Resource: "users.list", Access: web.Permission, Handle: func(c *web.Context) (any, error) {
-			return SearchPage(c.Ctx, u.store, "USERS", c.Request.Query, []string{"id", "email", "name", "role", "active"},
-				func(row nosql.Row) map[string]any { return ViewUser(row.Data) })
+			return SearchPage(c.Ctx, u.store, "USERS", c.Request.Query, []string{"id", "email", "name", "role", "active", "banned"},
+				func(row nosql.Row) map[string]any { return u.View(row.Data) })
 		}},
 		{Method: "POST", Path: "/users", Resource: "users.create", Access: web.Permission, Handle: func(c *web.Context) (any, error) {
 			row, err := u.Create(c.Ctx, c.Request.Body, RoleUser, c.Actor.ID)
@@ -47,7 +47,7 @@ func (u *Users) Feature() web.Feature {
 			if err != nil {
 				return nil, err
 			}
-			return ViewUser(row.Data), nil
+			return u.View(row.Data), nil
 		}},
 		{Method: "PATCH", Path: "/users/:id", Resource: "users.edit", Access: web.Permission, Handle: func(c *web.Context) (any, error) {
 			row, err := u.Get(c.Ctx, c.Params["id"])

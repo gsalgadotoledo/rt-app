@@ -64,6 +64,9 @@ class UserBansFacade:
     def consume(self, email: Any, code: Any, purpose: Any, ip: Any, password: Any = None) -> Any:
         return self._auth.consume(email, code, purpose, ip, password)
 
+    def verify_mfa(self, challenge_id: Any, code: Any, ip: Any) -> Any:
+        return self._auth.verify_mfa(challenge_id, code, ip)
+
     def refresh(self, refresh_token: Any, ip: Any) -> Any:
         return self._auth.refresh(refresh_token, ip)
 

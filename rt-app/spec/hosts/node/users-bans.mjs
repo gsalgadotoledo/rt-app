@@ -36,6 +36,7 @@ async function userBans(init) {
     login: (email, password, ip) => auth.login(email, password, ip),
     issue: (email, purpose, ip) => auth.issue(email, purpose, ip),
     consume: (email, code, purpose, ip, password) => auth.consume(email, code, purpose, ip, opt(password)),
+    verifyMfa: (challengeId, code, ip) => auth.verifyMfa(challengeId, code, ip),
     refresh: (refreshToken, ip) => auth.refresh(refreshToken, ip),
     actor: (header) => auth.actor(opt(header)),
     sessions: (userId) => auth.sessions(userId),

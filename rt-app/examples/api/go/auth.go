@@ -7,10 +7,12 @@ import (
 	"rt.local/core-go/auth"
 	"rt.local/core-go/jwt"
 	"rt.local/core-go/users"
+	"rt.local/core-go/users/bans"
 	"rt.local/core-go/web"
 )
 
-// Accounts and sign-in: /users/me and /admin/app/users (users), /auth/login, /auth/refresh,
+// Accounts and sign-in: /users/me and /admin/app/users (users), account bans (/users/:id/ban,
+// /users/:id/unban, /users/:id/bans; package users/bans), /auth/login, /auth/refresh,
 // /auth/sessions, /auth/logout and the other /auth endpoints (auth), with access tokens resolved
 // by auth.Authenticate. Codes go to a local mailbox (nothing is sent). Tokens and refresh-token
 // hashes are keyed with RT_APP_SECRET (at least 32 characters); without it a random secret is
@@ -31,7 +33,9 @@ func init() {
 		}
 		accounts := users.New(store)
 		sessions := auth.New(accounts, tokens, &auth.LocalMailbox{}, secret)
+		// Bans live on the user row; auth refuses banned accounts, bans writes them.
+		accountBans := bans.New(accounts, bans.WithSessions(sessions))
 		c.Authenticator = sessions.Authenticate
-		return []web.Feature{accounts.Feature(), sessions.Feature()}, nil
+		return []web.Feature{accounts.Feature(), accountBans.Feature(), sessions.Feature()}, nil
 	})
 }

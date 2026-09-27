@@ -93,6 +93,9 @@ func (a *Auth) VerifyMFA(ctx context.Context, challengeID, code any, ip string, 
 	if user == nil {
 		return nil, errors.New("auth: the challenge's user disappeared")
 	}
+	if err := a.gate(user); err != nil {
+		return nil, err
+	}
 	mfa, err := a.store.Get(ctx, "MFA", js.String(user.Data["id"]))
 	if err != nil {
 		return nil, err

@@ -209,6 +209,9 @@ func (a *Auth) sessionUser(ctx context.Context, header string) (*nosql.Row, stri
 	if row == nil || !js.Truthy(row.Data["active"]) || !js.Equal(row.Data["tokenVersion"], float64(claims.Version)) || !localProvider(row.Data) {
 		return nil, "", apperr.New(http.StatusUnauthorized, msgInvalidSession)
 	}
+	if err := a.gate(row); err != nil {
+		return nil, "", err
+	}
 	if claims.SID == "" {
 		return row, "", nil
 	}
@@ -220,6 +223,16 @@ func (a *Auth) sessionUser(ctx context.Context, header string) (*nosql.Row, stri
 		return nil, "", apperr.New(http.StatusUnauthorized, msgInvalidSession)
 	}
 	return row, claims.SID, nil
+}
+
+// gate refuses a banned account (users.ActiveBan) with 403 "Account suspended". It is called
+// only after the caller proved the credential (password, code, TOTP, token), so the answer never
+// reveals a ban to someone who does not hold the account's credentials.
+func (a *Auth) gate(row *nosql.Row) error {
+	if users.ActiveBan(row.Data, a.nowMs()) != nil {
+		return apperr.New(http.StatusForbidden, users.AccountSuspended)
+	}
+	return nil
 }
 
 // localProvider: accounts of an external identity provider cannot use local sessions.
@@ -297,6 +310,9 @@ func (a *Auth) Login(ctx context.Context, email string, password any, ip string,
 	}
 	if row == nil || !js.Truthy(row.Data["active"]) || !valid {
 		return LoginResult{}, apperr.New(http.StatusUnauthorized, msgWrongCredential)
+	}
+	if err := a.gate(row); err != nil {
+		return LoginResult{}, err
 	}
 	mfa, err := a.HasMFA(ctx, js.String(row.Data["id"]))
 	if err != nil {
@@ -446,6 +462,10 @@ func (a *Auth) Consume(ctx context.Context, email string, code any, purpose, ip 
 			return CodeResult{}, err
 		}
 		return CodeResult{Message: "Password updated. Sign in to continue."}, nil
+	}
+	// A banned account is refused after the code matched; the code stays unused.
+	if err := a.gate(user); err != nil {
+		return CodeResult{}, err
 	}
 	mfa, err := a.HasMFA(ctx, js.String(user.Data["id"]))
 	if err != nil {

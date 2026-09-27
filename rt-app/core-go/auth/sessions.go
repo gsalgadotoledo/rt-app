@@ -195,7 +195,8 @@ func (a *Auth) refreshUser(ctx context.Context, session *nosql.Row) (*nosql.Row,
 
 // Refresh rotates a refresh token (POST /auth/refresh) and returns a new access token for the
 // same session and absolute expiry. Limits refresh-ip:<ip> 60, then refresh-session:<id> 10
-// per minute. Every failure is 401 "Invalid session"; reusing a superseded secret (other than
+// per minute. Every failure is 401 "Invalid session" (403 "Account suspended" for the holder of
+// a session of a banned account); reusing a superseded secret (other than
 // the previous one within the grace window) revokes the session ("reuse") first. Concurrent
 // rotations are version-guarded: a loser re-reads and normally lands in the grace branch.
 func (a *Auth) Refresh(ctx context.Context, token any, ip string) (*Session, error) {
@@ -217,6 +218,20 @@ func (a *Auth) Refresh(ctx context.Context, token any, ip string) (*Session, err
 			return nil, err
 		}
 		now := a.nowMs()
+		// Before liveness (the ban revoked the session): a banned account answers 403 to the
+		// holder of the session's current or previous secret, 401 to anyone else; nothing is written.
+		if row != nil {
+			owner, err := a.userOf(ctx, row.Data["userId"])
+			if err != nil {
+				return nil, err
+			}
+			if owner != nil && owner.Data["active"] == true && users.ActiveBan(owner.Data, now) != nil {
+				if hashMatches(row.Data["secretHash"], presented) || hashMatches(row.Data["previousHash"], presented) {
+					return nil, apperr.New(http.StatusForbidden, users.AccountSuspended)
+				}
+				return nil, invalid
+			}
+		}
 		if !sessionLive(row, now) {
 			return nil, invalid
 		}
@@ -374,6 +389,40 @@ func (a *Auth) revokeSession(ctx context.Context, userID, sessionID, reason stri
 		}
 	}
 	return false, apperr.Conflict()
+}
+
+// RevokeAll marks every live session of a user revoked with reason (for example "ban") and
+// returns how many. Each session is a separate version-guarded write (not atomic); callers bump
+// the user's tokenVersion first, which already makes every session unusable.
+func (a *Auth) RevokeAll(ctx context.Context, userID, reason string) (int, error) {
+	now := a.nowMs()
+	var live []string
+	cursor := ""
+	for {
+		page, err := a.store.List(ctx, SessionPartition(userID), cursor)
+		if err != nil {
+			return 0, err
+		}
+		for _, row := range page.Items {
+			if sessionLive(&row, now) {
+				live = append(live, row.SK)
+			}
+		}
+		if cursor = page.Cursor; cursor == "" {
+			break
+		}
+	}
+	count := 0
+	for _, id := range live {
+		revoked, err := a.revokeSession(ctx, userID, id, reason)
+		if err != nil {
+			return count, err
+		}
+		if revoked {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // Logout signs out (POST /auth/logout). With all == true (the JSON boolean), or without a

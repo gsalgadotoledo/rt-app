@@ -72,7 +72,8 @@ description: |
       This runs before the liveness check (the ban revoked the session).
 
   Facade helpers: login(email, password, ip), issue(email, purpose, ip), consume(email, code, purpose,
-  ip, password?), refresh(token, ip), actor(header), sessions(userId) are the auth methods over the
+  ip, password?), verifyMfa(challengeId, code, ip), refresh(token, ip), actor(header), sessions(userId)
+  are the auth methods over the
   same store; activeBan(data), parseInstant(value), view(id), list(query), mailbox(), row(pk, sk),
   endpoints(), setNow(iso).
 init:
@@ -262,6 +263,26 @@ cases:
       - { call: consume, args: [ alice@example.test, { $ref: "2.value[0].code" }, reset, 1.1.1.1, correct horse battery 2 ], expect: { value: { message: Password updated. Sign in to continue. } } }
       - { call: login, args: [ alice@example.test, correct horse battery 2, 1.1.1.1 ], expect: { error: { status: 403, message: Account suspended } } }
       - { call: view, args: [ u-alice ], expect: { value: { $partial: { banned: true } } } }
+
+  - name: the gate reads bans written by any implementation, even without a tokenVersion bump
+    tags: [ interop, security ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - { pk: USERS, sk: u-alice, version: 2, data: { id: u-alice, email: alice@example.test, name: Alice, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 1, ban: { reason: Written elsewhere, category: null, until: null, at: "2026-01-02T00:00:00.000Z", by: rt-app-root } } }
+        - *alice-email
+        - *a1-pointer
+        - *a1
+        # A pending TOTP challenge of the password step (the sealed value is never opened here).
+        - { pk: AUTH_FLOW, sk: flow-alice-0001, version: 1, ttl: 1767323345, data: { userId: u-alice, tokenVersion: 1, kind: totp, expires: 1767323345000, used: false, sealed: not-opened } }
+    steps:
+      - { call: verifyMfa, args: [ flow-alice-0001, "123456", 1.1.1.1 ], expect: { error: { status: 403, message: Account suspended } } }
+      - { call: row, args: [ AUTH_FLOW, flow-alice-0001 ], expect: { value: { $partial: { version: 1, data: { $partial: { used: false } } } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { error: { status: 403, message: Account suspended } } }
+      - { call: refresh, args: [ *current, 1.1.1.1 ], expect: { error: { status: 403, message: Account suspended } }, note: the session is still live }
+      - { call: refresh, args: [ *forged, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: row, args: [ "SESSIONS#u-alice", sessionAlice0000000001 ], expect: { value: *a1 }, note: no reuse revocation and no rotation for a banned account }
 
   # --- temporary bans, unban and idempotency --------------------------------------------------
   - name: a temporary ban lifts by itself exactly at until
