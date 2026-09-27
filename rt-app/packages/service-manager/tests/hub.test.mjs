@@ -55,3 +55,23 @@ test('custom service port bindings update environment without rewriting command 
  assert.equal(config.services[0].env.PGPORT,'15432');assert.equal(config.services[0].env.REDIS_PORT,'16379');
  assert.deepEqual(config.services[0].command,['postgres','-D','.rt-app/postgres']);
 });
+
+test('installDependencies runs npm install once per known project and reports its outcome',async t=>{
+ const folder=await mkdtemp(join(tmpdir(),'rt-install-'));t.after(()=>rm(folder,{recursive:true,force:true}));
+ const project=join(folder,'app');await mkdir(project);await writeFile(join(project,'package.json'),'{"name":"app"}');
+ const {EventEmitter}=await import('node:events');const {PassThrough}=await import('node:stream');
+ const calls=[];let child;
+ const spawn=(bin,args,options)=>{calls.push({bin,args,cwd:options.cwd});child=new EventEmitter();child.stdout=new PassThrough();child.stderr=new PassThrough();return child;};
+ const hub=new ServiceHub({home:join(folder,'home'),spawn});await hub.initialize();hub.registry=[{path:project,name:'app'}];
+ await assert.rejects(hub.installDependencies(join(folder,'elsewhere')),/Unknown project/,'only known projects');
+ const job=await hub.installDependencies(project);
+ assert.equal(job.state,'running');
+ assert.equal(await hub.installDependencies(project),job,'a running install is reused, not started twice');
+ assert.deepEqual(calls,[{bin:process.platform==='win32'?'npm.cmd':'npm',args:['install','--no-audit','--no-fund'],cwd:project}]);
+ child.stdout.write('added 12 packages\n');await delay(5);child.emit('close',0);
+ assert.equal(hub.installStatus(project).state,'succeeded');
+ assert.ok(hub.installStatus(project).log.includes('added 12 packages'));
+ await hub.installDependencies(project);child.emit('close',1);
+ assert.equal(hub.installStatus(project).state,'failed','a new run after the previous finished');
+ assert.equal(hub.installStatus(join(folder,'other')),null);
+});

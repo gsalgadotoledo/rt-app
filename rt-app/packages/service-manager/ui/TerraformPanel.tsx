@@ -1,4 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
+import { TerraformResourcesMap, type TerraformResources } from "./TerraformResources.js";
+import { TerraformGraph } from "./TerraformGraph.js";
 
 export interface TerraformRunError { summary: string; file: string | null; line: number | null }
 export interface TerraformRun {
@@ -17,6 +19,7 @@ export interface TerraformGlobal { key: string; description: string; url?: strin
 export interface TerraformClient {
   terraform?: {
     stacks(): Promise<TerraformStack[]>;
+    resources?(id: string): Promise<TerraformResources>;
     variables(id: string): Promise<TerraformVariable[]>;
     setVariables(id: string, values: Record<string, string>): Promise<TerraformVariable[]>;
     globals(): Promise<TerraformGlobal[]>;
@@ -105,6 +108,42 @@ function ValuesModal({ title, intro, rows, onSave, onClose, open }: {
   );
 }
 
+/** Styled dropdown to pick a stack; shows its path and last run. */
+function StackPicker({ stacks, selected, showProject, onSelect }: { stacks: TerraformStack[]; selected?: string; showProject: boolean; onSelect(id: string): void }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => { if (!root.current?.contains(e.target as Node)) setOpen(false); };
+    const escape = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", escape);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", escape); };
+  }, [open]);
+  const current = stacks.find((s) => s.id === selected);
+  const label = (s: TerraformStack) => (showProject ? `${s.project} / ${s.name}` : s.name);
+  return (
+    <div className="rt-tf-picker" ref={root}>
+      <button className="rt-tf-picker-toggle" aria-haspopup="listbox" aria-expanded={open} title={current?.path} onClick={() => setOpen(!open)}>
+        <svg className="rt-tf-picker-mark" width="18" height="18" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 7l6 3.5v7L9 14z M16.5 11l6-3.5v7l-6 3.5z M16.5 19.5l6-3.5v7l-6 3.5z" fill="currentColor" /></svg>
+        <span><strong>{current ? label(current) : "Choose a stack"}</strong>{current && <small>{current.path.replace(/^\/Users\/[^/]+/, "~")}</small>}</span>
+        {stacks.length > 1 && <em>{stacks.length}</em>}
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" aria-hidden="true"><path d={open ? "M6 15l6-6 6 6" : "M6 9l6 6 6-6"} /></svg>
+      </button>
+      {open && (
+        <div className="rt-tf-picker-list" role="listbox" aria-label="Terraform stacks">
+          {stacks.map((s) => (
+            <button key={s.id} role="option" aria-selected={s.id === selected} title={s.path} onClick={() => { onSelect(s.id); setOpen(false); }}>
+              <span><strong>{label(s)}</strong><small>{s.path.replace(/^\/Users\/[^/]+/, "~")}</small></span>
+              {s.lastRun && <small className={`rt-tf-state rt-tf-${s.lastRun.state}`}>{s.lastRun.command} · {s.lastRun.state}</small>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
  * Terraform stacks of every project (folders with *.tf, `infra/` first): values in a modal, lint,
  * validate, unit tests, plan and apply (only the reviewed plan, with a confirmation) and the run
@@ -117,6 +156,8 @@ export function TerraformPanel({ client, project }: { client: TerraformClient; /
   const [history, setHistory] = useState<TerraformRun[]>([]);
   const [run, setRun] = useState<TerraformRun>();
   const [variables, setVariables] = useState<TerraformVariable[]>();
+  const [resources, setResources] = useState<TerraformResources>();
+  const [view, setView] = useState<"resources" | "graph" | "runs">(tf.resources ? "graph" : "runs");
   const [globals, setGlobals] = useState<TerraformGlobal[]>();
   const [modal, setModal] = useState<"stack" | "globals">();
   const [confirmApply, setConfirmApply] = useState(false);
@@ -138,7 +179,8 @@ export function TerraformPanel({ client, project }: { client: TerraformClient; /
   useEffect(() => { void loadStacks(); }, []);
   useEffect(() => {
     if (!selected) return;
-    setRun(undefined); setConfirmApply(false); setVariables(undefined);
+    setRun(undefined); setConfirmApply(false); setVariables(undefined); setResources(undefined);
+    tf.resources?.(selected).then(setResources).catch((e) => setError((e as Error).message));
     void Promise.all([tf.history(selected), tf.variables(selected)]).then(async ([h, v]) => {
       setHistory(h); setVariables(v);
       if (h[0]) setRun(await tf.getRun(selected, h[0].id));
@@ -175,38 +217,35 @@ export function TerraformPanel({ client, project }: { client: TerraformClient; /
   const projects = [...new Set((stacks ?? []).map((s) => s.project))];
 
   return (
-    <section className="rt-machine rt-terraform" aria-label="Terraform">
-      <div className="rt-services-toolbar">
-        <h2>{project ? "Infrastructure" : "Terraform"}</h2>
-        <button onClick={() => setModal("globals")}>Global variables{globals ? ` (${globals.filter((g) => g.present).length})` : ""}</button>
-        <button onClick={() => void loadStacks()}>Rescan</button>
-      </div>
-      <p className="rt-wizard-note">Every folder with <code>.tf</code> files in your projects (convention: <code>infra/</code>). Values are saved on this Mac only (never in the project) and passed as <code>TF_VAR_*</code> and environment variables.</p>
+    <section className={`rt-machine rt-terraform${project ? " rt-terraform-project" : ""}`} aria-label="Terraform">
       {error && <p role="alert" className="rt-services-error">{error}</p>}
       {!stacks && <p>Scanning projects…</p>}
       {stacks && !stacks.length && <p>No Terraform found{project ? " in this project" : ""}. Add an <code>infra/</code> folder with <code>.tf</code> files{project ? "" : " to a project"}. RT-App projects include <code>infra/stripe</code> for subscription plans.</p>}
       {!!stacks?.length && (
         <div className="rt-tf-layout">
-          <nav className="rt-tf-stacks" aria-label="Terraform stacks">
-            {projects.map((name) => (
-              <div key={name}>
-                {!project && <h3>{name}</h3>}
-                {stacks.filter((s) => s.project === name).map((s) => (
-                  <button key={s.id} aria-current={s.id === selected ? "page" : undefined} title={s.path} onClick={() => setSelected(s.id)}>
-                    <span>{s.name}</span>
-                    {s.lastRun && <small className={`rt-tf-state rt-tf-${s.lastRun.state}`}>{s.lastRun.command} · {s.lastRun.state}</small>}
-                  </button>
-                ))}
-              </div>
-            ))}
-          </nav>
+          <div className="rt-tf-topbar">
+            <StackPicker stacks={stacks} selected={selected} showProject={!project} onSelect={setSelected} />
+            {stack && (
+              <button className="rt-tf-vars" onClick={() => setModal("stack")} title={missing.length ? `Missing required values: ${missing.map((v) => v.name).join(", ")}` : "Values for this stack"}>
+                Variables{variables ? ` ${variables.filter((v) => v.present).length}/${variables.length}` : ""}
+                {missing.length > 0 && <span className="rt-tf-missing" aria-label={`${missing.length} required values missing`}>{missing.length}</span>}
+              </button>
+            )}
+            <button onClick={() => setModal("globals")} title="Cloud credentials and API keys shared by every stack">Global variables{globals ? ` ${globals.filter((g) => g.present).length}` : ""}</button>
+            <button className="rt-tf-icon-button" aria-label="Rescan" title="Rescan projects for .tf files" onClick={() => void loadStacks()}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><path d="M20 7v5h-5 M20 12a8 8 0 1 0-2 5" /></svg></button>
+          </div>
           {stack && (
             <div className="rt-tf-detail">
-              <header>
-                <div><strong>{project ? stack.name : `${stack.project} / ${stack.name}`}</strong><small>{stack.path.replace(/^\/Users\/[^/]+/, "~")}</small></div>
-                <button onClick={() => setModal("stack")}>Variables{variables ? ` (${variables.filter((v) => v.present).length}/${variables.length})` : ""}</button>
-              </header>
-              {missing.length > 0 && <p className="rt-tf-warning">Missing required values: {missing.map((v) => v.name).join(", ")}. <button className="rt-services-link" onClick={() => setModal("stack")}>Fill them in</button></p>}
+              {tf.resources && (
+                <div className="rt-project-tabs rt-tf-view-tabs" role="tablist" aria-label="Stack sections">
+                  <button role="tab" aria-selected={view === "resources"} onClick={() => setView("resources")}>Resources{resources ? ` (${resources.items.filter((i) => i.kind === "resource").length})` : ""}</button>
+                  <button role="tab" aria-selected={view === "graph"} onClick={() => setView("graph")}>Graph</button>
+                  <button role="tab" aria-selected={view === "runs"} onClick={() => setView("runs")}>Run & history{run?.state === "running" ? " · running…" : ""}</button>
+                </div>
+              )}
+              {view === "resources" && (resources ? <TerraformResourcesMap data={resources} /> : <p className="rt-wizard-note">Reading .tf files…</p>)}
+              {view === "graph" && (resources ? <TerraformGraph key={stack.id} data={resources} storageKey={stack.path} /> : <p className="rt-wizard-note">Reading .tf files…</p>)}
+              {view === "runs" && <>
               <div className="rt-tf-actions">
                 {ACTIONS.map(([command, label, hint]) => <button key={command} title={hint} disabled={running} onClick={() => void start(command)}>{label}</button>)}
                 <span className="rt-tf-separator" />
@@ -241,6 +280,7 @@ export function TerraformPanel({ client, project }: { client: TerraformClient; /
                   </button></li>
                 ))}
               </ul>
+              </>}
             </div>
           )}
         </div>

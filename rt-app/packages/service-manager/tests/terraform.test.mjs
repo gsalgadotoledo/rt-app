@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
-import {findStacks,readVariables,parseErrors,TerraformRunner,GLOBAL_VARIABLES,TERRAFORM_COMMANDS} from '../terraform.mjs';
+import {findStacks,readVariables,readResources,parseErrors,TerraformRunner,GLOBAL_VARIABLES,TERRAFORM_COMMANDS} from '../terraform.mjs';
 
 async function tree(t,files){
  const root=await mkdtemp(join(tmpdir(),'sm-tf-'));t.after(()=>rm(root,{recursive:true,force:true}));
@@ -128,4 +128,45 @@ test('runs: failures keep errors, a failed plan cannot be applied, missing terra
  const missing=new TerraformRunner({home,spawn:()=>{const c=new EventEmitter();setImmediate(()=>c.emit('error',Object.assign(new Error('spawn'),{code:'ENOENT'})));return c;}});
  const run=await settle(missing,stack,(await missing.run(stack,'fmt')).id);
  assert.match(run.output,/Install it from Add tools & services/);
+});
+
+test('resources: blocks, providers and local modules (followed only inside the project)',async t=>{
+ const root=await tree(t,{
+  'infra/aws/main.tf':`terraform {
+  required_providers {
+    aws = { source = "hashicorp/aws", version = "= 6.0.0" }
+  }
+  backend "s3" {}
+}
+# resource "aws_s3_bucket" "commented" {}
+provider "aws" { region = "us-east-1" }
+data "aws_caller_identity" "current" {}
+resource "aws_dynamodb_table" "app" {
+  name = "x{y}"
+  dynamic "attribute" { for_each = [] content {} }
+}
+resource "aws_iam_role" "worker" {
+  count = 2
+  name  = "\${var.name}-\${aws_dynamodb_table.app.name}"
+  depends_on = [data.aws_caller_identity.current, module.site]
+}
+module "site" { source = "../modules/site" }
+module "outside" { source = "../../../elsewhere" }
+module "registry" { source = "terraform-aws-modules/vpc/aws" version = "5.0.0" }
+output "url" {
+  value = <<EOT
+resource "fake" "heredoc" {}
+EOT
+}`,
+  'infra/modules/site/main.tf':'resource "aws_s3_bucket" "files" {}\nresource "aws_cloudfront_distribution" "cdn" { origin = aws_s3_bucket.files.bucket_regional_domain_name }\n',
+ });
+ const r=await readResources(join(root,'infra/aws'),{within:root});
+ assert.equal(r.backend,'s3');
+ assert.deepEqual(r.providers,[{name:'aws',source:'hashicorp/aws',version:'= 6.0.0',configured:true,resources:4}]);
+ assert.deepEqual(r.items.map(i=>i.address),['data.aws_caller_identity.current','aws_dynamodb_table.app','aws_iam_role.worker','module.site.aws_s3_bucket.files','module.site.aws_cloudfront_distribution.cdn','output.url'],'comments and heredocs are ignored');
+ assert.equal(r.items.find(i=>i.name==='worker').multiple,true);
+ assert.deepEqual(r.items.find(i=>i.name==='files'),{kind:'resource',type:'aws_s3_bucket',name:'files',address:'module.site.aws_s3_bucket.files',provider:'aws',line:1,multiple:false,file:join('..','modules','site','main.tf'),module:'site',refs:[]});
+ assert.deepEqual(r.items.find(i=>i.name==='worker').refs,['aws_dynamodb_table.app','data.aws_caller_identity.current','module.site'],'var. and attributes are not references');
+ assert.deepEqual(r.items.find(i=>i.name==='cdn').refs,['module.site.aws_s3_bucket.files'],'references resolve inside their module');
+ assert.deepEqual(r.modules.map(m=>[m.name,m.local,m.version]),[['site',true,null],['outside',false,null],['registry',false,'5.0.0']],'sources outside the project are listed but not read');
 });

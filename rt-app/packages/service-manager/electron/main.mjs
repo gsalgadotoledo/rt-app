@@ -50,6 +50,8 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('services:action',(event,action,id)=>{trusted(event);if(!['start','stop','restart'].includes(action)||typeof id!=='string')throw new Error('Invalid action');return hub.action(action,id);});
    ipcMain.handle('services:open-url',async(event,id)=>{trusted(event);await shell.openExternal(await hub.url(id));});
    ipcMain.handle('services:select-project',async(event,path)=>{trusted(event);if(path!==undefined&&!(await hub.projects()).some(p=>p.path===path))throw new Error('Unknown project');if(!path){const selection=await dialog.showOpenDialog(window,{title:'Open RT-App project',properties:['openDirectory']});if(selection.canceled)return hub.snapshot();path=selection.filePaths[0];}return hub.select(path);});
+   ipcMain.handle('projects:install-deps',(event,path)=>{trusted(event);return hub.installDependencies(path);});
+   ipcMain.handle('projects:install-status',(event,path)=>{trusted(event);if(typeof path!=='string')throw new Error('Invalid project');return hub.installStatus(path);});
    ipcMain.handle('services:catalog',(event,action,id)=>{trusted(event);return hub.catalogAction(action,id);});
    ipcMain.handle('services:discover',event=>{trusted(event);return hub.discover();});
    ipcMain.handle('services:add-discovered',(event,id)=>{trusted(event);return hub.addDiscovered(id);});
@@ -68,6 +70,7 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('machine:detach',(event,label)=>{trusted(event);if(typeof label!=='string')throw new Error('Invalid label');return hub.detachAgent(label);});
    ipcMain.handle('machine:open-port',async(event,port)=>{trusted(event);if(!Number.isInteger(port)||port<1||port>65535)throw new Error('Invalid port');await openLocal(`http://localhost:${port}`);});
    ipcMain.handle('terraform:stacks',event=>{trusted(event);return hub.terraformStacks();});
+   ipcMain.handle('terraform:resources',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid stack');return hub.terraformResources(id);});
    ipcMain.handle('terraform:variables',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid stack');return hub.terraformVariables(id);});
    ipcMain.handle('terraform:set-variables',(event,id,values)=>{trusted(event);if(typeof id!=='string'||!values||typeof values!=='object'||Object.values(values).some(v=>typeof v!=='string'))throw new Error('Invalid variables');return hub.terraformSetVariables(id,values);});
    ipcMain.handle('terraform:globals',event=>{trusted(event);return hub.terraformGlobals();});

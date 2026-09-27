@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('rtAppServices',{
  installTools:ids=>ipcRenderer.invoke('projects:install-tools',ids),
  createProject:spec=>ipcRenderer.invoke('projects:create',spec),
  selectProject:path=>ipcRenderer.invoke('services:select-project',path),
+ installDependencies:path=>ipcRenderer.invoke('projects:install-deps',path),
+ installStatus:path=>ipcRenderer.invoke('projects:install-status',path),
  deleteProject:path=>ipcRenderer.invoke('projects:delete',path),
  background:(id,enabled)=>ipcRenderer.invoke('services:background',id,enabled),
  openAdmin:id=>ipcRenderer.invoke('services:open-admin',id),
@@ -40,6 +42,7 @@ contextBridge.exposeInMainWorld('rtAppServices',{
  },
  terraform:{
   stacks:()=>ipcRenderer.invoke('terraform:stacks'),
+  resources:id=>ipcRenderer.invoke('terraform:resources',id),
   variables:id=>ipcRenderer.invoke('terraform:variables',id),
   setVariables:(id,values)=>ipcRenderer.invoke('terraform:set-variables',id,values),
   globals:()=>ipcRenderer.invoke('terraform:globals'),
