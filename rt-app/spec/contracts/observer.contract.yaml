@@ -1,0 +1,863 @@
+contract: 1
+module: observer
+title: Observer pipeline, storage, reports, log search and endpoints
+description: |
+  Observer(outputs, timeoutMs = 1500, {now, newId}) captures logs, metrics and events and fans them
+  out to outputs. ObserverStore(store, {now}) is the output that keeps them in daily partitions and
+  answers reports and log searches; observerFeature(observer, storage, logs, {now}) serves them.
+  TypeScript is the reference; time only comes from the injected clock (epoch ms or a Date) and ids
+  from the injected generator.
+
+  Events, built once per emit(level, kind, source, message, data = {}):
+  {category: "app", id, at, level, kind, source, message, data} followed by the string fields
+  category, requestId and sessionId of the log context (category overrides the default, other
+  context keys and non-string values are ignored).
+  - id = newId(), at = new Date(now()).toISOString() (milliseconds, Z).
+  - source is cut to 80 UTF-16 units; message = String(sanitize(message)); data = sanitize(data);
+    context values = String(sanitize(value)) cut to 120 UTF-16 units. sanitize is pinned by the
+    observer-rules subject (redacted keys and strings, 1000/20/30/depth limits).
+  - Nothing is built (no id is used) when no output is enabled. When 32 emits are already in flight
+    the event is dropped (health.dropped + 1).
+
+  Delivery, per output in declaration order, all awaited in parallel:
+  1. skipped when enabled === false, or level/kind/source not in levels/kinds/sources (source is
+     compared before truncation), or event.category not in categories;
+  2. filter(copy): a throw counts health.failed + 1; a falsy result skips the output;
+  3. budget: maxPerMinute (default 600, 0 drops everything) per output id per clock minute
+     floor(now / 60000); over budget counts health.dropped + 1. Filtered events use no budget;
+  4. handler.write(copy, signal) with a timeout of timeoutMs: a throw, a rejection or the timeout
+     (which aborts the signal) counts health.failed + 1. Errors never reach the caller and never
+     reveal their message. Every output and filter gets its own deep copy.
+
+  Helpers: log/info/debug/warn/warning/error(...values): a string first value is the message and
+  the rest go to data.values; otherwise the message is "Application log" and every value goes to
+  data.values. When the second value is an object (not null), its string category, requestId and
+  sessionId become the log context. write(level, message, context = {}, data = {}) emits kind
+  "log", source "app" under context. countView(message, {url, apiUrl?, source = "spa"}) emits info
+  "pageview" under category "analytics" with data {path: safePath(url), endpointPath:
+  safePath(apiUrl) only when apiUrl is truthy}; a bad URL throws before anything is emitted.
+  recordRequest({method, url, durationMs, status}) needs a finite number durationMs >= 0 and an
+  integer status 100..599 (else TypeError "Invalid request metric", thrown before emitting) and
+  emits kind "request", source "api", message "HTTP request", level error (>= 500), warn (>= 400)
+  or info, data {method: method.toUpperCase(), path: safePath(url), status, durationMs}.
+  measure(name, operation, {source = "app"}) returns the operation's value or rethrows its error
+  unchanged, then emits kind "timing", message name, level info/error, data {name, durationMs,
+  failed}; with an injected clock durationMs = now() after - now() before.
+
+  Storage: write(event) creates {pk: "OBSERVER#" + at[0..10], sk: at + "#" + id, version: 1, ttl:
+  floor(Date.parse(at) / 1000) + 604800, data: event} with expected null (a duplicate sk is a
+  Conflict, so a failed delivery). Rows with a truthy ttl <= now / 1000 are expired and skipped.
+  search(query) validates (validateLogQuery), reads ONE store page (50 rows, query.cursor) and
+  returns {events: matching events, cursor} (an empty filtered page can have a cursor).
+  report(day) needs ^\d{4}-\d{2}-\d{2}$ (ASCII digits) naming a real calendar date (else 400
+  "Invalid day"), reads at most 20 pages and returns {day, counts: {requests, errors, spa, ssr},
+  analytics: [{name, count}] by count desc, requestMetrics, operationMetrics, averageMs, hours:
+  24 × {hour, requests, views}, pages: [{source, path, views}] by views desc (30 max), events:
+  newest first by at (ties keep storage order, 100 max), partial: more pages remained}.
+  - errors: events with level error. analytics: kind "analytics" grouped by message.
+  - requests (kind "request"): requests + 1, duration += Number(data.durationMs) || 0, hour
+    requests + 1, and a request metric keyed String(data.method) + " " + String(data.path)
+    (missing fields read "undefined") when durationMs is a finite number >= 0; errors when
+    Number(data.status) >= 500.
+  - timings (kind "timing"): operation metric keyed source + ":" + String(data.name), name
+    String(data.name), errors when data.failed === true, same durationMs rule.
+  - metrics: {name, source (of the first event), count, minMs, maxMs, errors, averageMs:
+    Math.round(total / count * 100) / 100} sorted by count desc (stable).
+  - averageMs: Math.round(duration / requests), 0 without requests. Math.round rounds halves up.
+  - page views (kind "pageview" with source spa or ssr): counts[source] + 1, hour views + 1,
+    pages keyed source + String(data.path). The hour is the UTC hour of at.
+
+  Endpoints: GET /observer/report (owner, resource observer.read): report(query.day ?? today) plus
+  health {failed, dropped} and outputs [{id, enabled, levels (all four by default), kinds (all five
+  by default)}]; GET /observer/logs (owner): search({day: today, ...query}); POST /observer/events
+  (guest, observer.pageview): body {source, path, message?}. message, when present (null
+  included), must be a string of at most 200 UTF-16 units (400 "Invalid page message"); source
+  must be spa or ssr and path a string of at most 160 units matching ^/[a-zA-Z0-9/_-]*$ (400
+  "Invalid page event"). Then a per-instance limit keyed sha256hex(ip ?? "unknown"): 60 events per
+  clock minute (the 61st and later are 429 "Too many events"); when more than 2000 clients are
+  tracked the ones from older minutes are forgotten, and with 4000 tracked a new client is 429
+  "Too many events". Then countView(message ?? "Page viewed", {source, url: path}) → {ok: true}.
+
+  Facade (subject observer): init {now, ids?, timeoutMs?, outputs?, rows?}. ids are used in order,
+  then random UUIDs. outputs are [{id, type?, behavior?, filter?, enabled?, levels?, kinds?,
+  sources?, categories?, maxPerMinute?}]: type "store" is the ObserverStore over a memory store
+  holding init.rows (always available to the storage and endpoint helpers); other outputs are
+  scripted: behavior "ok" (default) records a copy, "fail" throws a secret-looking error, "hang"
+  never settles (until aborted), "slow" records after 20 ms, "mutate" records and then changes
+  its copy. filter {messageIncludes} keeps events whose message includes the text, {throws: true}
+  throws, {mutates: true} changes its copy and keeps the event.
+  Methods: emit, write, log, info, debug, warn, warning, error, countView, recordRequest (→ null),
+  measure(name, {value?, fail?, advanceMs?}, options?) (the operation advances the clock by
+  advanceMs, then throws Error(fail) or returns value), withContext(context, [{call, args}]) →
+  results of the steps run inside the context, parallel([{context, delayMs, steps}]) → null
+  (concurrent branches), burst(count, level, message) → null (count emits started together),
+  delivered(outputId), aborted(outputId), setBehavior(outputId, behavior), health(), setNow(iso),
+  search(query), storeReport(day), storeWrite(event), list(pk, cursor?) (a raw store page),
+  report(query), logs(query), ingest(body, ip), ingestEach(ips, body), endpoints(), admin().
+subject: observer
+init:
+  now: "2026-03-04T05:06:07.890Z"
+  ids: [ e1, e2, e3, e4, e5, e6, e7, e8, e9 ]
+  timeoutMs: 50
+  outputs: [ { id: all } ]
+cases:
+  # ---------------------------------------------------------------- events
+  - name: emit builds the event with the default app category
+    steps:
+      - { call: emit, args: [ info, log, app, Hello, { n: 1, nested: { ok: true } } ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: Hello, data: { n: 1, nested: { ok: true } } }
+
+  - name: data defaults to an empty object and every kind and level is accepted
+    steps:
+      - { call: emit, args: [ debug, timing, worker, one ], expect: { value: null } }
+      - { call: emit, args: [ warn, analytics, web, two, null ], expect: { value: null } }
+      - { call: emit, args: [ error, pageview, spa, three, {} ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: debug, kind: timing, source: worker, message: one, data: {} }
+            - { category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: warn, kind: analytics, source: web, message: two, data: {} }
+            - { category: app, id: e3, at: "2026-03-04T05:06:07.890Z", level: error, kind: pageview, source: spa, message: three, data: {} }
+
+  - name: the source is cut to 80 UTF-16 units
+    tags: [ limits ]
+    steps:
+      - { call: emit, args: [ info, log, { $text: { repeat: "s", count: 81 } }, x ], expect: { value: null } }
+      - { call: emit, args: [ info, log, { $text: { repeat: "😀", count: 40 } }, y ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { $partial: { id: e1, source: { $text: { repeat: "s", count: 80 } } } }
+            - { $partial: { id: e2, source: { $text: { repeat: "😀", count: 40 } } } }
+
+  - name: messages and data are sanitized
+    tags: [ security ]
+    steps:
+      - call: emit
+        args: [ info, log, app, "Bearer abc.def for me@example.com token=xyz", { password: hunter2, user: { email: a@b.test, name: Ann }, note: "api_key: k-1" } ]
+        expect: { value: null }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: "Bearer [redacted] for [email] token=[redacted]", data: { password: "[redacted]", user: { email: "[redacted]", name: Ann }, note: "api_key: [redacted]" } }
+
+  - name: messages are cut to 1000 UTF-16 units before redaction
+    tags: [ limits ]
+    steps:
+      - { call: emit, args: [ info, log, app, { $text: { repeat: "m", count: 1001 } } ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { $partial: { message: { $text: { repeat: "m", count: 1000 } } } }
+
+  - name: disabled outputs receive nothing
+    init: { now: "2026-03-04T05:06:07.890Z", ids: [ e1, e2 ], outputs: [ { id: off, enabled: false }, { id: on, enabled: true } ] }
+    steps:
+      - { call: info, args: [ hello ], expect: { value: null } }
+      - { call: delivered, args: [ off ], expect: { value: [] } }
+      - { call: delivered, args: [ on ], expect: { value: [ { $partial: { id: e1, message: hello } } ] } }
+      - { call: health, expect: { value: { failed: 0, dropped: 0 } } }
+
+  - name: without enabled outputs nothing is built or counted
+    init: { now: "2026-03-04T05:06:07.890Z", ids: [ e1 ], outputs: [ { id: off, enabled: false } ] }
+    steps:
+      - { call: error, args: [ lost ], expect: { value: null } }
+      - { call: delivered, args: [ off ], expect: { value: [] } }
+      - { call: health, expect: { value: { failed: 0, dropped: 0 } } }
+
+  - name: duplicate output ids are rejected
+    tags: [ validation ]
+    init: { now: "2026-03-04T05:06:07.890Z", outputs: [ { id: same }, { id: same } ] }
+    create: { error: { status: null, message: Duplicate observer output id } }
+
+  # ---------------------------------------------------------------- log context
+  - name: the log context adds category, requestId and sessionId
+    steps:
+      - call: withContext
+        args: [ { requestId: r1, sessionId: s1, category: payments, userId: ignored }, [ { call: emit, args: [ info, log, app, inside ] } ] ]
+        expect: { value: [ null ] }
+      - { call: emit, args: [ info, log, app, outside ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: payments, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: inside, data: {}, requestId: r1, sessionId: s1 }
+            - { category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: outside, data: {} }
+
+  - name: nested contexts merge over the outer one and end with their operation
+    steps:
+      - call: withContext
+        args:
+          - { requestId: r1, category: outer }
+          - - { call: withContext, args: [ { sessionId: s2, category: inner }, [ { call: info, args: [ nested ] } ] ] }
+            - { call: info, args: [ after ] }
+        expect: { value: [ [ null ], null ] }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { $partial: { message: nested, category: inner, requestId: r1, sessionId: s2 } }
+            - { $partial: { message: after, category: outer, requestId: r1, sessionId: null } }
+
+  - name: context values are sanitized and cut to 120 UTF-16 units
+    tags: [ security, limits ]
+    steps:
+      - call: withContext
+        args: [ { requestId: user@example.com, sessionId: { $text: { repeat: "é", count: 130 } }, category: "token=abc" }, [ { call: info, args: [ x ] } ] ]
+        expect: { value: [ null ] }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { $partial: { requestId: "[email]", sessionId: { $text: { repeat: "é", count: 120 } }, category: "token=[redacted]" } }
+
+  - name: concurrent operations keep their own context
+    tags: [ concurrency ]
+    steps:
+      - call: parallel
+        args:
+          - - { context: { requestId: a, category: payments }, delayMs: 30, steps: [ { call: error, args: [ declined ] }, { call: info, args: [ a done ] } ] }
+            - { context: { requestId: b }, delayMs: 0, steps: [ { call: error, args: [ declined ] }, { call: info, args: [ b done ] } ] }
+        expect: { value: null }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { $partial: { message: declined, requestId: b, category: app } }
+            - { $partial: { message: b done, requestId: b, category: app } }
+            - { $partial: { message: declined, requestId: a, category: payments } }
+            - { $partial: { message: a done, requestId: a, category: payments } }
+
+  - name: write emits a log under an explicit context
+    steps:
+      - { call: write, args: [ error, Payment declined, { category: payments, requestId: r9 }, { orderId: o-1 } ], expect: { value: null } }
+      - { call: write, args: [ info, defaults ], expect: { value: null } }
+      - { call: write, args: [ warn, not a category, { category: 5 } ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: payments, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: Payment declined, data: { orderId: o-1 }, requestId: r9 }
+            - { category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: defaults, data: {} }
+            - { category: app, id: e3, at: "2026-03-04T05:06:07.890Z", level: warn, kind: log, source: app, message: not a category, data: {} }
+
+  # ---------------------------------------------------------------- console-style helpers
+  - name: console-style helpers map to levels and keep extra values
+    steps:
+      - { call: log, args: [ Import started, { jobId: j1 } ], expect: { value: null } }
+      - { call: info, args: [ Import completed, { count: 42, category: jobs, requestId: r1 } ], expect: { value: null } }
+      - { call: debug, args: [ Cache lookup, { hit: true } ], expect: { value: null } }
+      - { call: warn, args: [ Retrying, { attempt: 2 }, extra, 3 ], expect: { value: null } }
+      - { call: warning, args: [ Alias ], expect: { value: null } }
+      - { call: error, args: [ Import failed ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: Import started, data: { values: [ { jobId: j1 } ] } }
+            - { category: jobs, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: Import completed, data: { values: [ { count: 42, category: jobs, requestId: r1 } ] }, requestId: r1 }
+            - { category: app, id: e3, at: "2026-03-04T05:06:07.890Z", level: debug, kind: log, source: app, message: Cache lookup, data: { values: [ { hit: true } ] } }
+            - { category: app, id: e4, at: "2026-03-04T05:06:07.890Z", level: warn, kind: log, source: app, message: Retrying, data: { values: [ { attempt: 2 }, extra, 3 ] } }
+            - { category: app, id: e5, at: "2026-03-04T05:06:07.890Z", level: warn, kind: log, source: app, message: Alias, data: { values: [] } }
+            - { category: app, id: e6, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: Import failed, data: { values: [] } }
+
+  - name: a first value that is not a string becomes a generic message
+    tags: [ edge ]
+    steps:
+      - { call: info, args: [ { a: 1 } ], expect: { value: null } }
+      - { call: info, args: [ 5, { requestId: r2, sessionId: 7 } ], expect: { value: null } }
+      - { call: info, expect: { value: null } }
+      - { call: info, args: [ list, [ not, metadata ] ], expect: { value: null } }
+      - { call: info, args: [ null, { category: nulls } ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: Application log, data: { values: [ { a: 1 } ] } }
+            - { category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: Application log, data: { values: [ 5, { requestId: r2, sessionId: 7 } ] }, requestId: r2 }
+            - { category: app, id: e3, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: Application log, data: { values: [] } }
+            - { category: app, id: e4, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: list, data: { values: [ [ not, metadata ] ] } }
+            - { category: nulls, id: e5, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: Application log, data: { values: [ null, { category: nulls } ] } }
+
+  - name: logged values are sanitized
+    tags: [ security ]
+    steps:
+      - { call: error, args: [ login failed, { password: x, email: a@b.test, ip: 10.0.0.1, detail: "secret=s3 for x@y.io" } ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { $partial: { message: login failed, data: { values: [ { password: "[redacted]", email: "[redacted]", ip: "[redacted]", detail: "secret=[redacted] for [email]" } ] } } }
+
+  # ---------------------------------------------------------------- page views
+  - name: countView keeps only the path of the page and of the API
+    tags: [ security ]
+    steps:
+      - call: countView
+        args: [ Home, { url: "https://user:password@example.test/home?token=secret#private", apiUrl: "https://api.test/v1?key=secret", source: ssr } ]
+        expect: { value: null }
+      - { call: countView, args: [ Docs, { url: /docs/intro } ], expect: { value: null } }
+      - { call: countView, args: [ Empty api, { url: "a/b", apiUrl: "" } ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: analytics, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: pageview, source: ssr, message: Home, data: { path: /home, endpointPath: /v1 } }
+            - { category: analytics, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: pageview, source: spa, message: Docs, data: { path: /docs/intro } }
+            - { category: analytics, id: e3, at: "2026-03-04T05:06:07.890Z", level: info, kind: pageview, source: spa, message: Empty api, data: { path: /a/b } }
+
+  - name: countView uses the analytics category over the caller's context
+    steps:
+      - call: withContext
+        args: [ { category: http, requestId: r1 }, [ { call: countView, args: [ Home, { url: / } ] } ] ]
+        expect: { value: [ null ] }
+      - { call: delivered, args: [ all ], expect: { value: [ { $partial: { category: analytics, requestId: r1, data: { path: / } } } ] } }
+
+  - name: countView rejects URLs that are not HTTP before emitting
+    tags: [ validation ]
+    steps:
+      - { call: countView, args: [ x, { url: "javascript:alert(1)" } ], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: countView, args: [ x, { url: "mailto:ops@example.test" } ], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: countView, args: [ x, { url: /ok, apiUrl: "ftp://files.test/x" } ], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: countView, args: [ x, { url: "http://" } ], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: delivered, args: [ all ], expect: { value: [] } }
+
+  # ---------------------------------------------------------------- request metrics
+  - name: recordRequest levels follow the status
+    steps:
+      - { call: recordRequest, args: [ { method: get, url: "/users/:id?token=secret", durationMs: 12.5, status: 200 } ], expect: { value: null } }
+      - { call: recordRequest, args: [ { method: POST, url: /orders, durationMs: 0, status: 399 } ], expect: { value: null } }
+      - { call: recordRequest, args: [ { method: Put, url: "https://api.test/v1/x#y", durationMs: 3, status: 400 } ], expect: { value: null } }
+      - { call: recordRequest, args: [ { method: delete, url: /x, durationMs: 4, status: 499 } ], expect: { value: null } }
+      - { call: recordRequest, args: [ { method: get, url: /y, durationMs: 5, status: 500 } ], expect: { value: null } }
+      - { call: recordRequest, args: [ { method: get, url: /z, durationMs: 6, status: 599 } ], expect: { value: null } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: request, source: api, message: HTTP request, data: { method: GET, path: "/users/:id", status: 200, durationMs: 12.5 } }
+            - { category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: request, source: api, message: HTTP request, data: { method: POST, path: /orders, status: 399, durationMs: 0 } }
+            - { category: app, id: e3, at: "2026-03-04T05:06:07.890Z", level: warn, kind: request, source: api, message: HTTP request, data: { method: PUT, path: /v1/x, status: 400, durationMs: 3 } }
+            - { category: app, id: e4, at: "2026-03-04T05:06:07.890Z", level: warn, kind: request, source: api, message: HTTP request, data: { method: DELETE, path: /x, status: 499, durationMs: 4 } }
+            - { category: app, id: e5, at: "2026-03-04T05:06:07.890Z", level: error, kind: request, source: api, message: HTTP request, data: { method: GET, path: /y, status: 500, durationMs: 5 } }
+            - { category: app, id: e6, at: "2026-03-04T05:06:07.890Z", level: error, kind: request, source: api, message: HTTP request, data: { method: GET, path: /z, status: 599, durationMs: 6 } }
+
+  - name: recordRequest rejects invalid metrics before emitting
+    tags: [ validation ]
+    steps:
+      - { call: recordRequest, args: [ { method: GET, url: /, durationMs: -1, status: 200 } ], expect: { error: { status: null, message: Invalid request metric } } }
+      - { call: recordRequest, args: [ { method: GET, url: /, durationMs: "5", status: 200 } ], expect: { error: { status: null, message: Invalid request metric } } }
+      - { call: recordRequest, args: [ { method: GET, url: /, status: 200 } ], expect: { error: { status: null, message: Invalid request metric } } }
+      - { call: recordRequest, args: [ { method: GET, url: /, durationMs: 1, status: 99 } ], expect: { error: { status: null, message: Invalid request metric } } }
+      - { call: recordRequest, args: [ { method: GET, url: /, durationMs: 1, status: 600 } ], expect: { error: { status: null, message: Invalid request metric } } }
+      - { call: recordRequest, args: [ { method: GET, url: /, durationMs: 1, status: 200.5 } ], expect: { error: { status: null, message: Invalid request metric } } }
+      - { call: recordRequest, args: [ { method: GET, url: /, durationMs: 1, status: "200" } ], expect: { error: { status: null, message: Invalid request metric } } }
+      - { call: recordRequest, args: [ { method: GET, url: /, durationMs: true, status: 200 } ], expect: { error: { status: null, message: Invalid request metric } } }
+      - { call: recordRequest, args: [ { method: GET, url: "javascript:x", durationMs: 1, status: 200 } ], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: delivered, args: [ all ], expect: { value: [] } }
+
+  # ---------------------------------------------------------------- timings
+  - name: measure returns the value and records the elapsed time
+    steps:
+      - { call: measure, args: [ users.lookup, { value: 42, advanceMs: 25 } ], expect: { value: 42 } }
+      - { call: measure, args: [ queue.drain, { value: { ok: true } }, { source: worker } ], expect: { value: { ok: true } } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: app, id: e1, at: "2026-03-04T05:06:07.915Z", level: info, kind: timing, source: app, message: users.lookup, data: { name: users.lookup, durationMs: 25, failed: false } }
+            - { category: app, id: e2, at: "2026-03-04T05:06:07.915Z", level: info, kind: timing, source: worker, message: queue.drain, data: { name: queue.drain, durationMs: 0, failed: false } }
+
+  - name: measure rethrows the operation's error after recording it
+    steps:
+      - { call: measure, args: [ users.lookup, { fail: lookup failed, advanceMs: 7 } ], expect: { error: { status: null, message: lookup failed } } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: app, id: e1, at: "2026-03-04T05:06:07.897Z", level: error, kind: timing, source: app, message: users.lookup, data: { name: users.lookup, durationMs: 7, failed: true } }
+
+  # ---------------------------------------------------------------- subscriptions
+  - name: outputs subscribe by level, kind, source and category
+    init:
+      now: "2026-03-04T05:06:07.890Z"
+      ids: [ e1, e2, e3, e4, e5, e6 ]
+      outputs:
+        - { id: errors, levels: [ error ] }
+        - { id: requests, kinds: [ request ] }
+        - { id: workers, sources: [ worker ] }
+        - { id: payments, categories: [ payments, purchases ] }
+        - { id: none, levels: [] }
+    steps:
+      - { call: error, args: [ boom ], expect: { value: null } }
+      - { call: recordRequest, args: [ { method: GET, url: /, durationMs: 1, status: 503 } ], expect: { value: null } }
+      - { call: emit, args: [ info, timing, worker, job ], expect: { value: null } }
+      - { call: write, args: [ info, paid, { category: payments } ], expect: { value: null } }
+      - { call: delivered, args: [ errors ], expect: { value: [ { $partial: { id: e1 } }, { $partial: { id: e2 } } ] } }
+      - { call: delivered, args: [ requests ], expect: { value: [ { $partial: { id: e2 } } ] } }
+      - { call: delivered, args: [ workers ], expect: { value: [ { $partial: { id: e3 } } ] } }
+      - { call: delivered, args: [ payments ], expect: { value: [ { $partial: { id: e4 } } ] } }
+      - { call: delivered, args: [ none ], expect: { value: [] } }
+
+  - name: sources are compared before they are cut
+    tags: [ edge ]
+    init:
+      now: "2026-03-04T05:06:07.890Z"
+      ids: [ e1 ]
+      outputs: [ { id: long, sources: [ { $text: { repeat: "s", count: 81 } } ] } ]
+    steps:
+      - { call: emit, args: [ info, log, { $text: { repeat: "s", count: 81 } }, x ], expect: { value: null } }
+      - { call: delivered, args: [ long ], expect: { value: [ { $partial: { id: e1, source: { $text: { repeat: "s", count: 80 } } } } ] } }
+
+  - name: filters see copies and throwing filters count as failures
+    init:
+      now: "2026-03-04T05:06:07.890Z"
+      ids: [ e1, e2 ]
+      outputs:
+        - { id: declined, filter: { messageIncludes: declined } }
+        - { id: broken, filter: { throws: true } }
+        - { id: mutating, filter: { mutates: true } }
+        - { id: plain }
+    steps:
+      - { call: error, args: [ card declined ], expect: { value: null } }
+      - { call: error, args: [ card accepted ], expect: { value: null } }
+      - { call: delivered, args: [ declined ], expect: { value: [ { $partial: { id: e1, message: card declined } } ] } }
+      - { call: delivered, args: [ broken ], expect: { value: [] } }
+      - { call: delivered, args: [ mutating ], expect: { value: [ { $partial: { id: e1, message: card declined, data: { values: [] } } }, { $partial: { id: e2, message: card accepted, data: { values: [] } } } ] } }
+      - { call: delivered, args: [ plain ], expect: { value: [ { $partial: { id: e1, message: card declined, data: { values: [] } } }, { $partial: { id: e2, message: card accepted, data: { values: [] } } } ] } }
+      - { call: health, expect: { value: { failed: 2, dropped: 0 } } }
+
+  - name: an output changing its copy does not affect the others
+    init:
+      now: "2026-03-04T05:06:07.890Z"
+      ids: [ e1 ]
+      outputs: [ { id: first, behavior: mutate }, { id: second } ]
+    steps:
+      - { call: info, args: [ original, { k: v } ], expect: { value: null } }
+      - { call: delivered, args: [ first ], expect: { value: [ { $partial: { message: original, data: { values: [ { k: v } ] } } } ] } }
+      - { call: delivered, args: [ second ], expect: { value: [ { $partial: { message: original, data: { values: [ { k: v } ] } } } ] } }
+
+  # ---------------------------------------------------------------- delivery failures
+  - name: failing outputs are counted and never reach the caller
+    tags: [ security ]
+    init:
+      now: "2026-03-04T05:06:07.890Z"
+      ids: [ e1, e2 ]
+      outputs: [ { id: broken, behavior: fail }, { id: ok } ]
+    steps:
+      - { call: error, args: [ first ], expect: { value: null } }
+      - { call: error, args: [ second ], expect: { value: null } }
+      - { call: delivered, args: [ ok ], expect: { value: [ { $partial: { id: e1 } }, { $partial: { id: e2 } } ] } }
+      - { call: health, expect: { value: { failed: 2, dropped: 0 } } }
+
+  - name: slow outputs time out and are aborted
+    tags: [ timeout ]
+    init:
+      now: "2026-03-04T05:06:07.890Z"
+      ids: [ e1, e2 ]
+      timeoutMs: 50
+      outputs: [ { id: hanging, behavior: hang }, { id: slow, behavior: slow }, { id: ok } ]
+    steps:
+      - { call: info, args: [ waits ], expect: { value: null } }
+      - { call: aborted, args: [ hanging ], expect: { value: true } }
+      - { call: aborted, args: [ slow ], expect: { value: false } }
+      - { call: delivered, args: [ slow ], expect: { value: [ { $partial: { id: e1 } } ] } }
+      - { call: delivered, args: [ ok ], expect: { value: [ { $partial: { id: e1 } } ] } }
+      - { call: health, expect: { value: { failed: 1, dropped: 0 } } }
+      - { call: setBehavior, args: [ hanging, ok ], expect: { value: null } }
+      - { call: info, args: [ recovered ], expect: { value: null } }
+      - { call: delivered, args: [ hanging ], expect: { value: [ { $partial: { id: e2, message: recovered } } ] } }
+
+  # ---------------------------------------------------------------- limits
+  - name: each output has its own budget per clock minute
+    tags: [ limits ]
+    init:
+      now: "2026-03-04T05:06:59.999Z"
+      ids: [ e1, e2, e3, e4, e5, e6 ]
+      outputs: [ { id: pager, maxPerMinute: 2 }, { id: all }, { id: muted, maxPerMinute: 0 } ]
+    steps:
+      - { call: error, args: [ one ], expect: { value: null } }
+      - { call: error, args: [ two ], expect: { value: null } }
+      - { call: error, args: [ three ], expect: { value: null } }
+      - { call: health, expect: { value: { failed: 0, dropped: 4 } } }
+      - { call: setNow, args: [ "2026-03-04T05:07:00.000Z" ], expect: { value: null } }
+      - { call: error, args: [ four ], expect: { value: null } }
+      - { call: delivered, args: [ pager ], expect: { value: [ { $partial: { message: one } }, { $partial: { message: two } }, { $partial: { message: four } } ] } }
+      - { call: delivered, args: [ all ], expect: { value: { $length: 4 } } }
+      - { call: delivered, args: [ muted ], expect: { value: [] } }
+      - { call: health, expect: { value: { failed: 0, dropped: 5 } } }
+
+  - name: filtered events use no budget
+    tags: [ limits ]
+    init:
+      now: "2026-03-04T05:06:07.890Z"
+      ids: [ e1, e2, e3 ]
+      outputs: [ { id: pager, levels: [ error ], filter: { messageIncludes: page }, maxPerMinute: 1 } ]
+    steps:
+      - { call: info, args: [ page me ], expect: { value: null } }
+      - { call: error, args: [ ignored ], expect: { value: null } }
+      - { call: error, args: [ page now ], expect: { value: null } }
+      - { call: delivered, args: [ pager ], expect: { value: [ { $partial: { message: page now } } ] } }
+      - { call: health, expect: { value: { failed: 0, dropped: 0 } } }
+
+  - name: the default budget is 600 events per minute
+    tags: [ limits ]
+    init: { now: "2026-03-04T05:06:07.890Z", outputs: [ { id: all } ] }
+    steps:
+      - { call: emitMany, args: [ 601, info, many ], expect: { value: null } }
+      - { call: delivered, args: [ all ], expect: { value: { $length: 600 } } }
+      - { call: health, expect: { value: { failed: 0, dropped: 1 } } }
+
+  - name: at most 32 emits are in flight
+    tags: [ limits, concurrency ]
+    init: { now: "2026-03-04T05:06:07.890Z", timeoutMs: 300, outputs: [ { id: hanging, behavior: hang } ] }
+    steps:
+      - { call: burst, args: [ 33, info, busy ], expect: { value: null } }
+      - { call: health, expect: { value: { failed: 32, dropped: 1 } } }
+
+  # ---------------------------------------------------------------- storage
+  - name: the store output writes daily partitions with a seven-day TTL
+    init: { now: "2026-03-04T05:06:07.890Z", ids: [ e1, e1, e2 ], outputs: [ { id: store, type: store } ] }
+    steps:
+      - { call: info, args: [ stored ], expect: { value: null } }
+      - { call: info, args: [ duplicate id ], expect: { value: null } }
+      - { call: health, expect: { value: { failed: 1, dropped: 0 } } }
+      - { call: setNow, args: [ "2026-03-05T00:00:00.000Z" ], expect: { value: null } }
+      - { call: info, args: [ next day ], expect: { value: null } }
+      - call: list
+        args: [ "OBSERVER#2026-03-04" ]
+        expect:
+          value:
+            items:
+              - pk: "OBSERVER#2026-03-04"
+                sk: "2026-03-04T05:06:07.890Z#e1"
+                version: 1
+                ttl: 1773205567
+                data: { category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: stored, data: { values: [] } }
+      - call: list
+        args: [ "OBSERVER#2026-03-05" ]
+        expect: { value: { items: [ { $partial: { sk: "2026-03-05T00:00:00.000Z#e2", ttl: 1773273600 } } ] } }
+
+  - name: storeWrite rejects a duplicate event
+    tags: [ edge ]
+    steps:
+      - { call: storeWrite, args: [ { category: app, id: x, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} } ], expect: { value: null } }
+      - { call: storeWrite, args: [ { category: app, id: x, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: other, data: {} } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+
+  # ---------------------------------------------------------------- reports
+  - name: report aggregates requests, views, analytics and timings
+    init: { now: "2026-03-04T05:06:07.890Z", ids: [ r1, r2, r3, v1, v2, v3, a1, a2, a3, t1, t2, l1, x1 ], outputs: [ { id: store, type: store } ] }
+    steps:
+      - { call: recordRequest, args: [ { method: GET, url: /a, durationMs: 10, status: 200 } ], expect: { value: null } }
+      - { call: recordRequest, args: [ { method: get, url: /a, durationMs: 30, status: 500 } ], expect: { value: null } }
+      - { call: recordRequest, args: [ { method: POST, url: /b, durationMs: 5, status: 404 } ], expect: { value: null } }
+      - { call: setNow, args: [ "2026-03-04T07:00:00.000Z" ], expect: { value: null } }
+      - { call: countView, args: [ Home, { url: / } ], expect: { value: null } }
+      - { call: countView, args: [ Home, { url: "/?utm=x" } ], expect: { value: null } }
+      - { call: countView, args: [ About, { url: /about, source: ssr } ], expect: { value: null } }
+      - { call: emit, args: [ info, analytics, app, signup ], expect: { value: null } }
+      - { call: emit, args: [ info, analytics, web, checkout ], expect: { value: null } }
+      - { call: emit, args: [ info, analytics, app, signup ], expect: { value: null } }
+      - { call: measure, args: [ db.query, { advanceMs: 7 } ], expect: { value: null } }
+      - { call: measure, args: [ db.query, { advanceMs: 3, fail: timeout } ], expect: { error: { status: null, message: timeout } } }
+      - { call: error, args: [ boom ], expect: { value: null } }
+      - { call: setNow, args: [ "2026-03-05T00:00:00.000Z" ], expect: { value: null } }
+      - { call: error, args: [ other day ], expect: { value: null } }
+      - { call: storeReport, args: [ "2026-03-04" ], expect: { value: { day: 2026-03-04, counts: { requests: 3, errors: 3, spa: 2, ssr: 1 }, analytics: [ { name: signup, count: 2 }, { name: checkout, count: 1 } ], requestMetrics: [ { name: GET /a, source: api, count: 2, minMs: 10, maxMs: 30, errors: 1, averageMs: 20 }, { name: POST /b, source: api, count: 1, minMs: 5, maxMs: 5, errors: 0, averageMs: 5 } ], operationMetrics: [ { name: db.query, source: app, count: 2, minMs: 3, maxMs: 7, errors: 1, averageMs: 5 } ], averageMs: 15, hours: [ { hour: 0, requests: 0, views: 0 }, { hour: 1, requests: 0, views: 0 }, { hour: 2, requests: 0, views: 0 }, { hour: 3, requests: 0, views: 0 }, { hour: 4, requests: 0, views: 0 }, { hour: 5, requests: 3, views: 0 }, { hour: 6, requests: 0, views: 0 }, { hour: 7, requests: 0, views: 3 }, { hour: 8, requests: 0, views: 0 }, { hour: 9, requests: 0, views: 0 }, { hour: 10, requests: 0, views: 0 }, { hour: 11, requests: 0, views: 0 }, { hour: 12, requests: 0, views: 0 }, { hour: 13, requests: 0, views: 0 }, { hour: 14, requests: 0, views: 0 }, { hour: 15, requests: 0, views: 0 }, { hour: 16, requests: 0, views: 0 }, { hour: 17, requests: 0, views: 0 }, { hour: 18, requests: 0, views: 0 }, { hour: 19, requests: 0, views: 0 }, { hour: 20, requests: 0, views: 0 }, { hour: 21, requests: 0, views: 0 }, { hour: 22, requests: 0, views: 0 }, { hour: 23, requests: 0, views: 0 } ], pages: [ { source: spa, path: /, views: 2 }, { source: ssr, path: /about, views: 1 } ], events: [ { category: app, id: l1, at: 2026-03-04T07:00:00.010Z, level: error, kind: log, source: app, message: boom, data: { values: [] } }, { category: app, id: t2, at: 2026-03-04T07:00:00.010Z, level: error, kind: timing, source: app, message: db.query, data: { name: db.query, durationMs: 3, failed: true } }, { category: app, id: t1, at: 2026-03-04T07:00:00.007Z, level: info, kind: timing, source: app, message: db.query, data: { name: db.query, durationMs: 7, failed: false } }, { category: app, id: a1, at: 2026-03-04T07:00:00.000Z, level: info, kind: analytics, source: app, message: signup, data: {} }, { category: app, id: a2, at: 2026-03-04T07:00:00.000Z, level: info, kind: analytics, source: web, message: checkout, data: {} }, { category: app, id: a3, at: 2026-03-04T07:00:00.000Z, level: info, kind: analytics, source: app, message: signup, data: {} }, { category: analytics, id: v1, at: 2026-03-04T07:00:00.000Z, level: info, kind: pageview, source: spa, message: Home, data: { path: / } }, { category: analytics, id: v2, at: 2026-03-04T07:00:00.000Z, level: info, kind: pageview, source: spa, message: Home, data: { path: / } }, { category: analytics, id: v3, at: 2026-03-04T07:00:00.000Z, level: info, kind: pageview, source: ssr, message: About, data: { path: /about } }, { category: app, id: r1, at: 2026-03-04T05:06:07.890Z, level: info, kind: request, source: api, message: HTTP request, data: { method: GET, path: /a, status: 200, durationMs: 10 } }, { category: app, id: r2, at: 2026-03-04T05:06:07.890Z, level: error, kind: request, source: api, message: HTTP request, data: { method: GET, path: /a, status: 500, durationMs: 30 } }, { category: app, id: r3, at: 2026-03-04T05:06:07.890Z, level: warn, kind: request, source: api, message: HTTP request, data: { method: POST, path: /b, status: 404, durationMs: 5 } } ], partial: false } } }
+
+  - name: report metrics tolerate malformed stored events
+    tags: [edge]
+    init:
+      now: "2026-03-04T12:00:00.000Z"
+      rows:
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T01:00:00.000Z#1", version: 1, data: { id: "1", at: "2026-03-04T01:00:00.000Z", level: info, kind: request, source: api, message: m, data: { path: /x, durationMs: 0.125, status: "503" } } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T01:00:00.000Z#2", version: 1, data: { id: "2", at: "2026-03-04T01:00:00.000Z", level: info, kind: request, source: api, message: m, data: { method: GET, path: /x, durationMs: "8", status: 200 } } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T01:00:00.000Z#3", version: 1, data: { id: "3", at: "2026-03-04T01:00:00.000Z", level: info, kind: request, source: api, message: m, data: { method: GET, path: /x, durationMs: 0.125, status: 200 } } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T02:00:00.000Z#4", version: 1, data: { id: "4", at: "2026-03-04T02:00:00.000Z", level: warn, kind: request, source: edge, message: m, data: { method: GET, path: /x, durationMs: 4.25, status: 500 } } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T02:00:00.000Z#5", version: 1, data: { id: "5", at: "2026-03-04T02:00:00.000Z", level: info, kind: request, source: api, message: m, data: { method: GET, path: /x, status: 200 } } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T03:00:00.000Z#6", version: 1, data: { id: "6", at: "2026-03-04T03:00:00.000Z", level: info, kind: timing, source: app, message: m, data: { durationMs: 1, failed: "yes" } } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T03:00:00.000Z#7", version: 1, data: { id: "7", at: "2026-03-04T03:00:00.000Z", level: info, kind: timing, source: app, message: m, data: { name: n, durationMs: -1, failed: true } } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T03:00:00.000Z#8", version: 1, data: { id: "8", at: "2026-03-04T03:00:00.000Z", level: info, kind: pageview, source: web, message: m, data: { path: /ignored } } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T03:00:00.000Z#9", version: 1, data: { id: "9", at: "2026-03-04T03:00:00.000Z", level: info, kind: pageview, source: spa, message: m, data: {} } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T03:00:00.000Z#a", version: 1, data: { id: a, at: not a date, level: info, kind: pageview, source: ssr, message: m, data: { path: /late } } }
+    steps:
+      - call: storeReport
+        args: ["2026-03-04"]
+        expect:
+          value:
+            $partial:
+              counts: { requests: 5, errors: 0, spa: 1, ssr: 1 }
+              analytics: []
+              requestMetrics:
+                - { name: GET /x, source: api, count: 2, minMs: 0.125, maxMs: 4.25, errors: 1, averageMs: 2.19 }
+                - { name: undefined /x, source: api, count: 1, minMs: 0.125, maxMs: 0.125, errors: 1, averageMs: 0.13 }
+              operationMetrics:
+                - { name: undefined, source: app, count: 1, minMs: 1, maxMs: 1, errors: 0, averageMs: 1 }
+              averageMs: 3
+              pages: [{ source: spa, path: undefined, views: 1 }, { source: ssr, path: /late, views: 1 }]
+              events: [{ $partial: { id: a } }, { $partial: { id: "6" } }, { $partial: { id: "7" } }, { $partial: { id: "8" } }, { $partial: { id: "9" } }, { $partial: { id: "4" } }, { $partial: { id: "5" } }, { $partial: { id: "1" } }, { $partial: { id: "2" } }, { $partial: { id: "3" } }]
+              partial: false
+      - call: storeReport
+        args: ["2026-03-04"]
+        expect: { value: { $partial: { hours: [{ hour: 0, requests: 0, views: 0 }, { hour: 1, requests: 3, views: 0 }, { hour: 2, requests: 2, views: 0 }, { hour: 3, requests: 0, views: 1 }, { $repeat: { count: 20, start: 4, item: { hour: "{i}", requests: 0, views: 0 } } }] } } }
+
+  - name: report skips expired rows but keeps rows without a TTL
+    tags: [ edge ]
+    init:
+      now: "2026-03-04T12:00:00.000Z"
+      rows:
+        - { pk: "OBSERVER#2026-03-04", sk: a, version: 1, ttl: 1772625600, data: { id: expired, at: "2026-03-04T01:00:00.000Z", level: error, kind: log, source: app, message: m, data: {} } }
+        - { pk: "OBSERVER#2026-03-04", sk: b, version: 1, ttl: 1772625601, data: { id: live, at: "2026-03-04T01:00:00.000Z", level: error, kind: log, source: app, message: m, data: {} } }
+        - { pk: "OBSERVER#2026-03-04", sk: c, version: 1, ttl: 0, data: { id: zero, at: "2026-03-04T01:00:00.000Z", level: error, kind: log, source: app, message: m, data: {} } }
+        - { pk: "OBSERVER#2026-03-04", sk: d, version: 1, data: { id: none, at: "2026-03-04T01:00:00.000Z", level: error, kind: log, source: app, message: m, data: {} } }
+    steps:
+      - call: storeReport
+        args: [ "2026-03-04" ]
+        expect: { value: { $partial: { counts: { requests: 0, errors: 3, spa: 0, ssr: 0 }, events: [ { $partial: { id: live } }, { $partial: { id: zero } }, { $partial: { id: none } } ], partial: false } } }
+      - call: search
+        args: [ { day: "2026-03-04" } ]
+        expect: { value: { events: [ { $partial: { id: live } }, { $partial: { id: zero } }, { $partial: { id: none } } ] } }
+
+  - name: report reads at most 20 pages and keeps the newest 100 events
+    tags: [ limits ]
+    init:
+      now: "2026-03-04T12:00:00.000Z"
+      rows: [ { $repeat: { count: 1001, item: { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T00:00:00.000Z#{i:04}", version: 1, data: { id: "{i:04}", at: "2026-03-04T00:00:00.000Z", level: info, kind: log, source: app, message: m, data: {} } } } } ]
+    steps:
+      - call: storeReport
+        args: [ "2026-03-04" ]
+        expect:
+          value:
+            $partial:
+              counts: { requests: 0, errors: 0, spa: 0, ssr: 0 }
+              events: { $length: 100 }
+              partial: true
+      - call: storeReport
+        args: [ "2026-03-04" ]
+        expect: { value: { $partial: { events: [ { $partial: { id: "0000" } }, { $repeat: { count: 99, start: 1, item: { $partial: { id: "{i:04}" } } } } ] } } }
+
+  - name: report and search order events newest first
+    init:
+      now: "2026-03-04T12:00:00.000Z"
+      rows:
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T01:00:00.000Z#b", version: 1, data: { id: b, at: "2026-03-04T01:00:00.000Z", level: info, kind: log, source: app, message: m, data: {} } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T01:00:00.000Z#a", version: 1, data: { id: a, at: "2026-03-04T01:00:00.000Z", level: info, kind: log, source: app, message: m, data: {} } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2026-03-04T09:00:00.000Z#c", version: 1, data: { id: c, at: "2026-03-04T09:00:00.000Z", level: info, kind: log, source: app, message: m, data: {} } }
+    steps:
+      - { call: storeReport, args: [ "2026-03-04" ], expect: { value: { $partial: { events: [ { $partial: { id: c } }, { $partial: { id: a } }, { $partial: { id: b } } ] } } } }
+      - { call: search, args: [ { day: "2026-03-04" } ], expect: { value: { events: [ { $partial: { id: a } }, { $partial: { id: b } }, { $partial: { id: c } } ] } }, note: search keeps storage (sort key) order }
+
+  - name: report days must be real calendar dates
+    tags: [ validation ]
+    steps:
+      - { call: storeReport, args: [ "2026-02-30" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "2026-02-29" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "2026-04-31" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "2026-13-01" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "2026-00-01" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "2026-01-00" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "2026-1-01" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "+02026-01-01" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "2026-01-01T00:00:00Z" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "２０２６-01-01" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "" ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ null ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: storeReport, args: [ "2024-02-29" ], expect: { value: { $partial: { day: "2024-02-29", partial: false } } } }
+      - { call: storeReport, args: [ "2000-02-29" ], expect: { value: { $partial: { day: "2000-02-29" } } } }
+      - { call: storeReport, args: [ "0000-02-29" ], expect: { value: { $partial: { day: "0000-02-29" } } } }
+      - { call: storeReport, args: [ "1900-02-29" ], expect: { error: { status: 400, message: Invalid day } } }
+
+  - name: an empty day has zero counts and 24 empty hours
+    steps:
+      - call: storeReport
+        args: [ "2026-03-04" ]
+        expect:
+          value:
+            day: "2026-03-04"
+            counts: { requests: 0, errors: 0, spa: 0, ssr: 0 }
+            analytics: []
+            requestMetrics: []
+            operationMetrics: []
+            averageMs: 0
+            hours: [ { $repeat: { count: 24, item: { hour: "{i}", requests: 0, views: 0 } } } ]
+            pages: []
+            events: []
+            partial: false
+
+  # ---------------------------------------------------------------- log search
+  - name: search filters by level, category, correlation ids and text
+    init:
+      now: "2026-03-04T12:00:00.000Z"
+      rows:
+        - { pk: "OBSERVER#2026-03-04", sk: "1", version: 1, data: { category: app, id: "1", at: "2026-03-04T01:00:00.000Z", level: debug, kind: log, source: app, message: hidden, data: {} } }
+        - { pk: "OBSERVER#2026-03-04", sk: "2", version: 1, data: { category: payments, id: "2", at: "2026-03-04T01:00:00.000Z", level: error, kind: log, source: app, message: Card DECLINED, data: { orderId: o-77 }, requestId: r1, sessionId: s1 } }
+        - { pk: "OBSERVER#2026-03-04", sk: "3", version: 1, data: { category: http, id: "3", at: "2026-03-04T01:00:00.000Z", level: info, kind: request, source: api, message: HTTP request, data: { path: /x }, requestId: r2 } }
+        - { pk: "OBSERVER#2026-03-04", sk: "4", version: 1, data: { category: app, id: "4", at: "2026-03-04T01:00:00.000Z", level: warn, kind: log, source: app, message: "say \"hi\"", data: {} } }
+    steps:
+      - { call: search, args: [ { day: "2026-03-04" } ], expect: { value: { events: [ { $partial: { id: "2" } }, { $partial: { id: "3" } }, { $partial: { id: "4" } } ] } } }
+      - { call: search, args: [ { day: "2026-03-04", level: debug } ], expect: { value: { events: [ { $partial: { id: "1" } } ] } } }
+      - { call: search, args: [ { day: "2026-03-04", level: "" } ], expect: { value: { events: { $length: 3 } } } }
+      - { call: search, args: [ { day: "2026-03-04", category: payments } ], expect: { value: { events: [ { $partial: { id: "2" } } ] } } }
+      - { call: search, args: [ { day: "2026-03-04", category: Payments } ], expect: { value: { events: [] } } }
+      - { call: search, args: [ { day: "2026-03-04", requestId: r2 } ], expect: { value: { events: [ { $partial: { id: "3" } } ] } } }
+      - { call: search, args: [ { day: "2026-03-04", sessionId: s1, requestId: r1 } ], expect: { value: { events: [ { $partial: { id: "2" } } ] } } }
+      - { call: search, args: [ { day: "2026-03-04", text: declined } ], expect: { value: { events: [ { $partial: { id: "2" } } ] } } }
+      - { call: search, args: [ { day: "2026-03-04", text: O-77 } ], expect: { value: { events: [ { $partial: { id: "2" } } ] } } }
+      - { call: search, args: [ { day: "2026-03-04", text: "\\\"hi\\\"" } ], expect: { value: { events: [ { $partial: { id: "4" } } ] } }, note: text matches the JSON text of the event, escapes included }
+      - { call: search, args: [ { day: "2026-03-04", text: "\"hi\"" } ], expect: { value: { events: [] } } }
+      - { call: search, args: [ { day: "2026-03-04", text: "", category: "" } ], expect: { value: { events: { $length: 3 } } } }
+      - { call: search, args: [ { day: "2026-03-05" } ], expect: { value: { events: [] } } }
+
+  - name: search reads one page and keeps the cursor of empty filtered pages
+    init:
+      now: "2026-03-04T12:00:00.000Z"
+      rows:
+        - { $repeat: { count: 50, item: { pk: "OBSERVER#2026-03-04", sk: "a{i:02}", version: 1, data: { category: app, id: "a{i:02}", at: "2026-03-04T01:00:00.000Z", level: debug, kind: log, source: app, message: m, data: {} } } } }
+        - { pk: "OBSERVER#2026-03-04", sk: b, version: 1, data: { category: app, id: b, at: "2026-03-04T01:00:00.000Z", level: error, kind: log, source: app, message: m, data: {} } }
+    steps:
+      - { call: search, args: [ { day: "2026-03-04" } ], expect: { value: { events: [], cursor: { $type: string } } } }
+      - { call: search, args: [ { day: "2026-03-04", cursor: { $ref: "0.value.cursor" } } ], expect: { value: { events: [ { $partial: { id: b } } ] } } }
+      - { call: search, args: [ { day: "2026-03-05", cursor: { $ref: "0.value.cursor" } } ], expect: { error: { status: 400, message: Invalid cursor } } }
+      - { call: search, args: [ { day: "2026-03-04", cursor: "not-a-cursor" } ], expect: { error: { status: 400, message: Invalid cursor } } }
+
+  - name: search validates the query before reading
+    tags: [ validation ]
+    steps:
+      - { call: search, args: [ { day: "2026-02-30" } ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: search, args: [ { day: 20260304 } ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: search, args: [ {} ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: search, args: [ { day: "2026-03-04", level: fatal } ], expect: { error: { status: 400, message: Invalid level } } }
+      - { call: search, args: [ { day: "2026-03-04", level: ERROR } ], expect: { error: { status: 400, message: Invalid level } } }
+      - { call: search, args: [ { day: bad, level: fatal } ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: search, args: [ { day: "2026-03-04", category: { $text: { repeat: "c", count: 201 } } } ], expect: { error: { status: 400, message: Invalid log filter } } }
+      - { call: search, args: [ { day: "2026-03-04", text: { $text: { repeat: "😀", count: 101 } } } ], expect: { error: { status: 400, message: Invalid log filter } } }
+      - { call: search, args: [ { day: "2026-03-04", text: { $text: { repeat: "😀", count: 100 } } } ], expect: { value: { events: [] } } }
+      - { call: search, args: [ { day: "2026-03-04", requestId: 5 } ], expect: { error: { status: 400, message: Invalid log filter } } }
+      - { call: search, args: [ { day: "2026-03-04", sessionId: true } ], expect: { error: { status: 400, message: Invalid log filter } } }
+      - { call: search, args: [ { day: "2026-03-04", cursor: { $text: { repeat: "c", count: 8193 } } } ], expect: { error: { status: 400, message: Invalid log filter } } }
+      - { call: search, args: [ { day: "2026-03-04", level: fatal, text: 5 } ], expect: { error: { status: 400, message: Invalid level } } }
+
+  # ---------------------------------------------------------------- endpoints
+  - name: the feature declares three endpoints and an owner-only admin page
+    steps:
+      - call: endpoints
+        expect:
+          value:
+            - { method: GET, path: /observer/report, resource: observer.read, access: owner }
+            - { method: GET, path: /observer/logs, resource: observer.read, access: owner }
+            - { method: POST, path: /observer/events, resource: observer.pageview, access: guest }
+      - call: admin
+        expect: { value: { id: observer, title: Observer, resource: observer.read, path: /observer/report, component: observer, ownerOnly: true, fields: [], actions: [] } }
+
+  - name: the report endpoint adds health and the outputs
+    init:
+      now: "2026-03-04T05:06:07.890Z"
+      ids: [ e1 ]
+      outputs:
+        - { id: store, type: store }
+        - { id: pager, enabled: false, levels: [ error ], kinds: [ log, request ], maxPerMinute: 1 }
+        - { id: broken, behavior: fail, categories: [ payments ] }
+    steps:
+      - { call: write, args: [ error, declined, { category: payments } ], expect: { value: null } }
+      - call: report
+        args: [ {} ]
+        expect:
+          value:
+            $partial:
+              day: "2026-03-04"
+              counts: { requests: 0, errors: 1, spa: 0, ssr: 0 }
+              health: { failed: 1, dropped: 0 }
+              outputs:
+                - { id: store, enabled: true, levels: [ debug, info, warn, error ], kinds: [ log, request, pageview, timing, analytics ] }
+                - { id: pager, enabled: false, levels: [ error ], kinds: [ log, request ] }
+                - { id: broken, enabled: true, levels: [ debug, info, warn, error ], kinds: [ log, request, pageview, timing, analytics ] }
+      - { call: report, args: [ { day: "2026-03-03" } ], expect: { value: { $partial: { day: "2026-03-03", events: [] } } } }
+      - { call: report, args: [ { day: "" } ], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: report, args: [ { day: "03/04/2026" } ], expect: { error: { status: 400, message: Invalid day } } }
+
+  - name: the logs endpoint searches today by default
+    init: { now: "2026-03-04T23:59:59.999Z", ids: [ e1 ], outputs: [ { id: store, type: store } ] }
+    steps:
+      - { call: warn, args: [ late ], expect: { value: null } }
+      - { call: logs, args: [ {} ], expect: { value: { events: [ { $partial: { id: e1, message: late } } ] } } }
+      - { call: setNow, args: [ "2026-03-05T00:00:00.000Z" ], expect: { value: null } }
+      - { call: logs, args: [ {} ], expect: { value: { events: [] } } }
+      - { call: logs, args: [ { day: "2026-03-04", level: warn, unknown: ignored } ], expect: { value: { events: [ { $partial: { id: e1 } } ] } } }
+      - { call: logs, args: [ { level: nope } ], expect: { error: { status: 400, message: Invalid level } } }
+
+  - name: page events are counted as views
+    init: { now: "2026-03-04T05:06:07.890Z", ids: [ e1, e2, e3 ], outputs: [ { id: all } ] }
+    steps:
+      - { call: ingest, args: [ { source: spa, path: / }, 10.0.0.1 ], expect: { value: { ok: true } } }
+      - { call: ingest, args: [ { source: ssr, path: /docs/getting_started-2, message: Docs }, 10.0.0.1 ], expect: { value: { ok: true } } }
+      - { call: ingest, args: [ { source: spa, path: /a, message: "" }, 10.0.0.1 ], expect: { value: { ok: true } } }
+      - call: delivered
+        args: [ all ]
+        expect:
+          value:
+            - { category: analytics, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: pageview, source: spa, message: Page viewed, data: { path: / } }
+            - { category: analytics, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: pageview, source: ssr, message: Docs, data: { path: /docs/getting_started-2 } }
+            - { category: analytics, id: e3, at: "2026-03-04T05:06:07.890Z", level: info, kind: pageview, source: spa, message: "", data: { path: /a } }
+
+  - name: page events are validated
+    tags: [ validation ]
+    steps:
+      - { call: ingest, args: [ { source: spa, path: /, message: 5 }, ip ], expect: { error: { status: 400, message: Invalid page message } } }
+      - { call: ingest, args: [ { source: spa, path: /, message: null }, ip ], expect: { error: { status: 400, message: Invalid page message } } }
+      - { call: ingest, args: [ { source: spa, path: /, message: { $text: { repeat: "m", count: 201 } } }, ip ], expect: { error: { status: 400, message: Invalid page message } } }
+      - { call: ingest, args: [ { source: spa, path: /, message: { $text: { repeat: "😀", count: 101 } } }, ip ], expect: { error: { status: 400, message: Invalid page message } } }
+      - { call: ingest, args: [ { source: nope, path: "/?x", message: 5 }, ip ], expect: { error: { status: 400, message: Invalid page message } }, note: the message is checked first }
+      - { call: ingest, args: [ { source: SPA, path: / }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { path: / }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: "" }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: docs }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: "/?token=private" }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: "/a b" }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: "/é" }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: "/a\n" }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: [ "/" ] }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: //evil.test/x }, ip ], expect: { error: { status: 400, message: Invalid page event } }, note: "protocol-relative paths would name a host (TypeScript answered 500 before this was fixed)" }
+      - { call: ingest, args: [ { source: spa, path: "//" }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: { $text: { repeat: "a", count: 161 } } }, ip ], expect: { error: { status: 400, message: Invalid page event } } }
+      - { call: ingest, args: [ { source: spa, path: /x//y/_-Z9, message: { $text: { repeat: "😀", count: 100 } } }, ip ], expect: { value: { ok: true } } }
+      - { call: ingest, args: [ { source: spa, path: { $text: { repeat: "/a", count: 80 } } }, ip ], expect: { value: { ok: true } } }
+      - { call: delivered, args: [ all ], expect: { value: [ { $partial: { id: e1, data: { path: /x//y/_-Z9 } } }, { $partial: { id: e2, data: { path: { $text: { repeat: "/a", count: 80 } } } } } ] } }
+
+  - name: page events are limited to 60 per client per clock minute
+    tags: [ limits, security ]
+    init: { now: "2026-03-04T05:06:00.000Z", outputs: [] }
+    steps:
+      - { call: ingestEach, args: [ [ { $repeat: { count: 60, item: 10.0.0.1 } } ], { source: spa, path: / } ], expect: { value: null } }
+      - { call: ingest, args: [ { source: spa, path: / }, 10.0.0.1 ], expect: { error: { status: 429, message: Too many events } } }
+      - { call: ingest, args: [ { source: spa, path: bad }, 10.0.0.1 ], expect: { error: { status: 400, message: Invalid page event } }, note: validation comes before the limit }
+      - { call: ingest, args: [ { source: spa, path: / }, 10.0.0.2 ], expect: { value: { ok: true } } }
+      - { call: setNow, args: [ "2026-03-04T05:06:59.999Z" ], expect: { value: null } }
+      - { call: ingest, args: [ { source: spa, path: / }, 10.0.0.1 ], expect: { error: { status: 429, message: Too many events } } }
+      - { call: setNow, args: [ "2026-03-04T05:07:00.000Z" ], expect: { value: null } }
+      - { call: ingest, args: [ { source: spa, path: / }, 10.0.0.1 ], expect: { value: { ok: true } } }
+
+  - name: clients without an ip share one limit
+    tags: [ limits, edge ]
+    init: { now: "2026-03-04T05:06:00.000Z", outputs: [] }
+    steps:
+      - { call: ingestEach, args: [ [ { $repeat: { count: 60, item: unknown } } ], { source: spa, path: / } ], expect: { value: null } }
+      - { call: ingest, args: [ { source: spa, path: / }, null ], expect: { error: { status: 429, message: Too many events } } }
+
+  - name: at most 4000 clients are tracked per minute
+    tags: [ limits, security ]
+    init: { now: "2026-03-04T05:06:00.000Z", outputs: [] }
+    steps:
+      - { call: ingestEach, args: [ [ { $repeat: { count: 4000, item: "10.1.{i}" } } ], { source: spa, path: / } ], expect: { value: null } }
+      - { call: ingest, args: [ { source: spa, path: / }, 10.2.0.1 ], expect: { error: { status: 429, message: Too many events } } }
+      - { call: ingest, args: [ { source: spa, path: / }, 10.1.7 ], expect: { value: { ok: true } } }
+      - { call: setNow, args: [ "2026-03-04T05:07:00.000Z" ], expect: { value: null } }
+      - { call: ingest, args: [ { source: spa, path: / }, 10.2.0.1 ], expect: { value: { ok: true } } }

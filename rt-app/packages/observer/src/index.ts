@@ -130,6 +130,13 @@ export function sanitize(value: unknown, depth = 0): unknown {
     );
   return String(value);
 }
+/** Injectable time and ids (tests, contracts); production defaults are the system clock and UUIDs. */
+export interface ObserverOptions {
+  /** Epoch milliseconds or a Date: event times, per-minute budgets and, when given, `measure` durations. */
+  now?: () => number | Date;
+  /** Event ids; `randomUUID` by default. */
+  newId?: () => string;
+}
 export class Observer {
   readonly outputs: ObserverOutput[];
   readonly console = {
@@ -164,13 +171,21 @@ export class Observer {
   }
 
   readonly health = { failed: 0, dropped: 0 };
+  private clock: () => number;
+  private elapsed: () => number;
+  private newId: () => string;
   constructor(
     outputs: ObserverOutput[] = [],
     private timeoutMs = 1500,
+    options: ObserverOptions = {},
   ) {
     if (new Set(outputs.map((o) => o.handler.id)).size !== outputs.length)
       throw new Error("Duplicate observer output id");
     this.outputs = outputs;
+    const now = options.now;
+    this.clock = now ? () => +now() : Date.now;
+    this.elapsed = now ? this.clock : () => performance.now();
+    this.newId = options.newId ?? randomUUID;
   }
   async emit(
     level: LogLevel,
@@ -187,8 +202,8 @@ export class Observer {
     this.inFlight++;
     const event: ObserverEvent = {
       category: "app",
-      id: randomUUID(),
-      at: new Date().toISOString(),
+      id: this.newId(),
+      at: new Date(this.clock()).toISOString(),
       level,
       kind,
       source: source.slice(0, 80),
@@ -225,7 +240,7 @@ export class Observer {
             this.health.failed++;
             return;
           }
-          const minute = Math.floor(Date.now() / 60000),
+          const minute = Math.floor(this.clock() / 60000),
             budget = this.budgets.get(output.handler.id);
           const next =
             budget?.minute === minute ? budget : { minute, count: 0 };
@@ -329,7 +344,7 @@ export class Observer {
     operation: () => T | Promise<T>,
     options: { source?: string } = {},
   ): Promise<T> {
-    const start = performance.now();
+    const start = this.elapsed();
     let failed = false;
     try {
       return await operation();
@@ -342,7 +357,7 @@ export class Observer {
         "timing",
         options.source ?? "app",
         name,
-        { name, durationMs: performance.now() - start, failed },
+        { name, durationMs: this.elapsed() - start, failed },
       );
     }
   }
@@ -350,7 +365,14 @@ export class Observer {
 /** Daily partitions + seven-day TTL; bounded reads explicitly report partial results. */
 export class ObserverStore implements ObserverOutputHandler, ObserverLogReader {
   readonly id = "store";
-  constructor(private store: NoSQL) {}
+  private clock: () => number;
+  constructor(
+    private store: NoSQL,
+    options: { now?: () => number | Date } = {},
+  ) {
+    const now = options.now;
+    this.clock = now ? () => +now() : Date.now;
+  }
   async write(event: ObserverEvent) {
     await this.store.transact([
       {
@@ -371,7 +393,7 @@ export class ObserverStore implements ObserverOutputHandler, ObserverLogReader {
     const page = await this.store.list("OBSERVER#" + query.day, query.cursor);
     return {
       events: page.items
-        .filter((row) => !row.ttl || row.ttl > Date.now() / 1000)
+        .filter((row) => !row.ttl || row.ttl > this.clock() / 1000)
         .map((row) => row.data as ObserverEvent)
         .filter((event) => matchesLog(event, query)),
       cursor: page.cursor,
@@ -391,7 +413,7 @@ export class ObserverStore implements ObserverOutputHandler, ObserverLogReader {
       const page = await this.store.list("OBSERVER#" + day, cursor);
       events.push(
         ...page.items
-          .filter((r) => !r.ttl || r.ttl > Date.now() / 1000)
+          .filter((r) => !r.ttl || r.ttl > this.clock() / 1000)
           .map((r) => r.data as ObserverEvent),
       );
       cursor = page.cursor;
@@ -504,8 +526,12 @@ export function observerFeature(
   observer: Observer,
   storage: ObserverStore,
   logs: ObserverLogReader = storage,
+  options: { now?: () => number | Date } = {},
 ): Feature {
   const rates = new Map<string, { minute: number; count: number }>();
+  const now = options.now;
+  const clock = now ? () => +now() : Date.now;
+  const today = () => new Date(clock()).toISOString().slice(0, 10);
   return {
     id: "observer",
     migrations: [],
@@ -527,7 +553,7 @@ export function observerFeature(
         access: "owner",
         handle: async (c) => ({
           ...(await storage.report(
-            c.request.query.day ?? new Date().toISOString().slice(0, 10),
+            c.request.query.day ?? today(),
           )),
           health: { ...observer.health },
           outputs: observer.outputs.map((o) => ({
@@ -551,7 +577,7 @@ export function observerFeature(
         access: "owner",
         handle: (c) =>
           logs.search({
-            day: new Date().toISOString().slice(0, 10),
+            day: today(),
             ...c.request.query,
           } as LogQuery),
       },
@@ -571,10 +597,12 @@ export function observerFeature(
             !["spa", "ssr"].includes(source) ||
             typeof path !== "string" ||
             path.length > 160 ||
-            !/^\/[a-zA-Z0-9/_-]*$/.test(path)
+            !/^\/[a-zA-Z0-9/_-]*$/.test(path) ||
+            // "//host/x" is protocol-relative: it names a host (or none) instead of a page.
+            path.startsWith("//")
           )
             throw new HttpError(400, "Invalid page event");
-          const minute = Math.floor(Date.now() / 60000),
+          const minute = Math.floor(clock() / 60000),
             key = createHash("sha256")
               .update(c.request.ip ?? "unknown")
               .digest("hex");

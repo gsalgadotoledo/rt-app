@@ -1,0 +1,106 @@
+contract: 1
+module: observer-email
+title: Observer email outputs (SES and the local mail viewer)
+description: |
+  EmailOutput(from, to, client = SESv2) (id "email") sends one SES v2 SendEmail per event:
+  {FromEmailAddress: from, Destination: {ToAddresses: [to]}, Content: {Simple: {Subject: {Data:
+  "[<level>] <source>"}, Body: {Text: {Data: JSON.stringify(event, null, 2)}}}}}. from and to must
+  both contain "@" (Error "Observer email requires valid from/to addresses"). Client errors reach
+  the caller unchanged (the Observer counts them as failed deliveries). The client is created
+  lazily in Python (boto3 "sesv2") and injected in Go (email.Client); tests use fakes.
+
+  LocalEmailOutput(from, to, port = 1025) (id "email") sends {from, to, subject, text} with the
+  same subject and text to the local mail viewer at 127.0.0.1:port over plain SMTP (1 s timeouts).
+  It refuses production (Error "Local observer email is disabled in production", checked first:
+  NODE_ENV=production in every language) and ports that are not integers in 1024..65535 (Error
+  "Invalid local SMTP port"). Addresses are not validated.
+
+  Pretty JSON: two-space indentation, ": " after keys, "{}" and "[]" for empty containers, keys in
+  event order, JSON.stringify escapes and numbers.
+
+  Facades: observer-email init {from, to, fail?}: id(), write(event) → null, sent() → [SES input].
+  observer-email-local init {from, to, port?, production?, fail?}: id(), write(event) → null,
+  sent() → [{from, to, subject, text}], setFailure(message | null). No socket is opened.
+subject: observer-email
+init: { from: sender@example.test, to: ops@example.test }
+cases:
+  - name: each event is one SES message with a pretty JSON body
+    steps:
+      - { call: id, expect: { value: email } }
+      - { call: write, args: [{ category: payments, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: Declined, data: { amount: 12.5, empty: {}, none: [], tags: [a] }, requestId: r1 }], expect: { value: null } }
+      - call: sent
+        expect:
+          value:
+            - FromEmailAddress: sender@example.test
+              Destination: { ToAddresses: [ops@example.test] }
+              Content:
+                Simple:
+                  Subject: { Data: "[error] app" }
+                  Body:
+                    Text:
+                      Data: "{\n  \"category\": \"payments\",\n  \"id\": \"e1\",\n  \"at\": \"2026-03-04T05:06:07.890Z\",\n  \"level\": \"error\",\n  \"kind\": \"log\",\n  \"source\": \"app\",\n  \"message\": \"Declined\",\n  \"data\": {\n    \"amount\": 12.5,\n    \"empty\": {},\n    \"none\": [],\n    \"tags\": [\n      \"a\"\n    ]\n  },\n  \"requestId\": \"r1\"\n}"
+        note: data keys keep their order; they are given in code point order, the order Go writes map keys in
+
+  - name: client errors reach the caller
+    init: { from: sender@example.test, to: ops@example.test, fail: SES throttled }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: SES throttled } } }
+
+  - name: the sender must look like an address
+    tags: [validation]
+    init: { from: invalid, to: ops@example.test }
+    create: { error: { status: null, message: Observer email requires valid from/to addresses } }
+  - name: the recipient must look like an address
+    tags: [validation]
+    init: { from: sender@example.test, to: invalid }
+    create: { error: { status: null, message: Observer email requires valid from/to addresses } }
+
+  # ---------------------------------------------------------------- local mail viewer
+  - name: local email sends the same subject and text
+    subject: observer-email-local
+    init: { from: a@example.test, to: b@example.test }
+    steps:
+      - { call: id, expect: { value: email } }
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: warn, kind: timing, source: worker, message: slow, data: {} }], expect: { value: null } }
+      - call: sent
+        expect:
+          value:
+            - from: a@example.test
+              to: b@example.test
+              subject: "[warn] worker"
+              text: "{\n  \"category\": \"app\",\n  \"id\": \"e1\",\n  \"at\": \"2026-03-04T05:06:07.890Z\",\n  \"level\": \"warn\",\n  \"kind\": \"timing\",\n  \"source\": \"worker\",\n  \"message\": \"slow\",\n  \"data\": {}\n}"
+      - { call: setFailure, args: [connection refused], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: warn, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: connection refused } } }
+
+  - name: local email is disabled in production
+    tags: [security]
+    subject: observer-email-local
+    init: { from: a@example.test, to: b@example.test, production: true, port: 1 }
+    create: { error: { status: null, message: Local observer email is disabled in production } }
+  - name: local SMTP ports below 1024 are refused
+    tags: [validation]
+    subject: observer-email-local
+    init: { from: a@example.test, to: b@example.test, port: 1023 }
+    create: { error: { status: null, message: Invalid local SMTP port } }
+  - name: local SMTP ports above 65535 are refused
+    tags: [validation]
+    subject: observer-email-local
+    init: { from: a@example.test, to: b@example.test, port: 65536 }
+    create: { error: { status: null, message: Invalid local SMTP port } }
+  - name: local SMTP ports must be integers
+    tags: [validation]
+    subject: observer-email-local
+    init: { from: a@example.test, to: b@example.test, port: 2.5 }
+    create: { error: { status: null, message: Invalid local SMTP port } }
+  - name: local SMTP port bounds are inclusive
+    subject: observer-email-local
+    init: { from: a@example.test, to: b@example.test, port: 65535 }
+    steps:
+      - { call: id, expect: { value: email } }
+  - name: local addresses are not validated
+    tags: [edge]
+    subject: observer-email-local
+    init: { from: me, to: you, port: 1024 }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: sent, expect: { value: [{ $partial: { from: me, to: you, subject: "[info] app" } }] } }

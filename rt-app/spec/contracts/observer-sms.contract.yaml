@@ -1,0 +1,76 @@
+contract: 1
+module: observer-sms
+title: Observer SMS output
+description: |
+  SmsOutput(phone, client = SNS) (id "sms") publishes one SMS per event: {PhoneNumber: phone,
+  Message: ("<LEVEL> <source>: <message>").slice(0, 140)} (level upper-cased, 140 UTF-16 units).
+  phone must match ^\+[1-9]\d{7,14}$ (E.164, ASCII digits, nothing after the last digit), else
+  Error "Observer SMS requires E.164 phone number". Client errors reach the caller unchanged. The
+  client is created lazily in Python (boto3 "sns") and injected in Go (sms.Client).
+
+  Facade (subject observer-sms): init {phone, fail?}; id(), write(event) → null, sent() →
+  [{PhoneNumber, Message}].
+subject: observer-sms
+init: { phone: "+15555550123" }
+cases:
+  - name: events become short text messages
+    steps:
+      - { call: id, expect: { value: sms } }
+      - { call: write, args: [{ category: payments, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: Declined, data: { secret: never sent } }], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: warn, kind: log, source: worker, message: { $text: { repeat: "x", count: 200 } }, data: {} }], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e3, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: { $text: { repeat: "😀", count: 70 } }, data: {} }], expect: { value: null } }
+      - call: sent
+        expect:
+          value:
+            - { PhoneNumber: "+15555550123", Message: "ERROR app: Declined" }
+            - { PhoneNumber: "+15555550123", Message: { $length: 140 } }
+            - { PhoneNumber: "+15555550123", Message: { $length: 140 } }
+      - call: sent
+        expect:
+          value:
+            - { $partial: {} }
+            - { $partial: { Message: { $regex: "^WARN worker: x{127}$" } } }
+            - { $partial: { Message: { $regex: "^INFO app: (😀){65}$" } } }
+        note: "the prefix is 10 units and each emoji 2, so 65 emoji fill the 140 units exactly"
+
+  - name: client errors reach the caller
+    init: { phone: "+15555550123", fail: SNS unavailable }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: SNS unavailable } } }
+
+  - name: the shortest and longest E.164 numbers are accepted
+    init: { phone: "+12345678" }
+    steps:
+      - { call: id, expect: { value: sms } }
+  - name: fifteen digits are accepted
+    init: { phone: "+123456789012345" }
+    steps:
+      - { call: id, expect: { value: sms } }
+  - name: numbers need the plus sign
+    tags: [validation]
+    init: { phone: "15555550123" }
+    create: { error: { status: null, message: Observer SMS requires E.164 phone number } }
+  - name: numbers cannot start with zero
+    tags: [validation]
+    init: { phone: "+05555550123" }
+    create: { error: { status: null, message: Observer SMS requires E.164 phone number } }
+  - name: numbers need eight digits
+    tags: [validation]
+    init: { phone: "+1234567" }
+    create: { error: { status: null, message: Observer SMS requires E.164 phone number } }
+  - name: numbers have at most fifteen digits
+    tags: [validation]
+    init: { phone: "+1234567890123456" }
+    create: { error: { status: null, message: Observer SMS requires E.164 phone number } }
+  - name: only ASCII digits count
+    tags: [validation, edge]
+    init: { phone: "+1555555012３" }
+    create: { error: { status: null, message: Observer SMS requires E.164 phone number } }
+  - name: nothing may follow the number
+    tags: [validation, edge]
+    init: { phone: "+15555550123\n" }
+    create: { error: { status: null, message: Observer SMS requires E.164 phone number } }
+  - name: spaces are not allowed
+    tags: [validation]
+    init: { phone: "+1 555 555 0123" }
+    create: { error: { status: null, message: Observer SMS requires E.164 phone number } }

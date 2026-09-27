@@ -1,0 +1,92 @@
+contract: 1
+kind: http
+module: observer-api
+title: Observer HTTP API (local mode)
+description: |
+  Observer endpoints as every backend language serves them in local mode. POST /observer/events is
+  public (rate limited per client ip: all cases together send well under 60 events); GET
+  /observer/report and GET /observer/logs are owner-only and admin-only: they are served under
+  /admin/app only. Which outputs an API configures is its own choice (the TypeScript reference API
+  has none, the Python and Go examples keep events in an ObserverStore), so these cases read days
+  in the past only and do not pin the output list; the module contract (observer.contract.yaml)
+  pins reports with data.
+cases:
+  - name: page events are accepted
+    requests:
+      - request: { method: POST, path: /observer/events, body: { source: spa, path: /pricing } }
+        expect: { status: 200, body: { ok: true }, headers: { cache-control: no-store } }
+      - request: { method: POST, path: /observer/events, body: { source: ssr, path: /docs/start_here-2, message: Docs } }
+        expect: { status: 200, body: { ok: true } }
+
+  - name: page events are validated
+    tags: [validation]
+    requests:
+      - { request: { method: POST, path: /observer/events, body: { source: spa, path: /, message: 5 } }, expect: { status: 400, body: { error: Invalid page message } } }
+      - { request: { method: POST, path: /observer/events, body: { source: spa, path: /, message: null } }, expect: { status: 400, body: { error: Invalid page message } } }
+      - { request: { method: POST, path: /observer/events, body: { source: spa, path: /, message: { $text: { repeat: "m", count: 201 } } } }, expect: { status: 400, body: { error: Invalid page message } } }
+      - { request: { method: POST, path: /observer/events, body: { source: web, path: / } }, expect: { status: 400, body: { error: Invalid page event } } }
+      - { request: { method: POST, path: /observer/events, body: {} }, expect: { status: 400, body: { error: Invalid page event } } }
+      - { request: { method: POST, path: /observer/events, body: { source: spa, path: "/?token=secret" } }, expect: { status: 400, body: { error: Invalid page event } } }
+      - { request: { method: POST, path: /observer/events, body: { source: spa, path: "//evil.test/x" } }, expect: { status: 400, body: { error: Invalid page event } } }
+      - { request: { method: POST, path: /observer/events, body: { source: spa, path: { $text: { repeat: "a", count: 161 } } } }, expect: { status: 400, body: { error: Invalid page event } } }
+
+  - name: page event bodies must be JSON objects
+    tags: [validation, edge]
+    requests:
+      - { request: { method: POST, path: /observer/events, body: [1] }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - { request: { method: POST, path: /observer/events, headers: { content-type: application/json }, raw: "{bad" }, expect: { status: 400, body: { error: Invalid JSON } } }
+
+  - name: the report of a past day is empty
+    requests:
+      - request: { method: GET, path: /admin/app/observer/report, query: { day: "2020-01-01" } }
+        expect:
+          status: 200
+          headers: { cache-control: no-store }
+          body:
+            day: "2020-01-01"
+            counts: { requests: 0, errors: 0, spa: 0, ssr: 0 }
+            analytics: []
+            requestMetrics: []
+            operationMetrics: []
+            averageMs: 0
+            hours: [{ $repeat: { count: 24, item: { hour: "{i}", requests: 0, views: 0 } } }]
+            pages: []
+            events: []
+            partial: false
+            health: { failed: { $type: integer }, dropped: { $type: integer } }
+            outputs: { $type: array }
+
+  - name: the report defaults to today
+    requests:
+      - request: { method: GET, path: /admin/app/observer/report }
+        expect: { status: 200, body: { $partial: { day: { $regex: "^\\d{4}-\\d{2}-\\d{2}$" }, partial: false, outputs: { $type: array } } } }
+
+  - name: report days are validated
+    tags: [validation]
+    requests:
+      - { request: { method: GET, path: /admin/app/observer/report, query: { day: "2026-02-30" } }, expect: { status: 400, body: { error: Invalid day } } }
+      - { request: { method: GET, path: /admin/app/observer/report, query: { day: "" } }, expect: { status: 400, body: { error: Invalid day } } }
+      - { request: { method: GET, path: /admin/app/observer/report, query: { day: yesterday } }, expect: { status: 400, body: { error: Invalid day } } }
+
+  - name: logs of a past day are empty
+    requests:
+      - { request: { method: GET, path: /admin/app/observer/logs, query: { day: "2020-01-01" } }, expect: { status: 200, body: { events: [] }, headers: { cache-control: no-store } } }
+      - { request: { method: GET, path: /admin/app/observer/logs, query: { day: "2020-01-01", level: error, category: payments, text: declined, other: ignored } }, expect: { status: 200, body: { events: [] } } }
+      - { request: { method: GET, path: /admin/app/observer/logs }, expect: { status: 200, body: { $partial: { events: { $type: array } } } } }
+
+  - name: log queries are validated
+    tags: [validation]
+    requests:
+      - { request: { method: GET, path: /admin/app/observer/logs, query: { day: "2026-13-01" } }, expect: { status: 400, body: { error: Invalid day } } }
+      - { request: { method: GET, path: /admin/app/observer/logs, query: { day: "2020-01-01", level: fatal } }, expect: { status: 400, body: { error: Invalid level } } }
+      - { request: { method: GET, path: /admin/app/observer/logs, query: { day: "2020-01-01", text: { $text: { repeat: "t", count: 201 } } } }, expect: { status: 400, body: { error: Invalid log filter } } }
+      - { request: { method: GET, path: /admin/app/observer/logs, query: { day: "2020-01-01", cursor: not-a-cursor } }, expect: { status: 400, body: { error: Invalid cursor } } }
+
+  - name: reports and logs are only served under /admin/app
+    tags: [security]
+    requests:
+      - { request: { method: GET, path: /observer/report }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /observer/logs }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /admin/app/observer/events, body: { source: spa, path: / } }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /observer/events }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /admin/app/observer/report }, expect: { status: 404, body: { error: Endpoint not found } } }

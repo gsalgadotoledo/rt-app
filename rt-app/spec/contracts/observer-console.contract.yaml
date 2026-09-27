@@ -1,0 +1,44 @@
+contract: 1
+module: observer-console
+title: Observer console output
+description: |
+  ConsoleOutput (id "console") writes each event as one line of JSON.stringify(event) through the
+  console method of its level (debug, info, warn, error); nothing else is added or removed.
+  TypeScript writes to the global console by default and accepts a sink with the four methods;
+  Python and Go take a sink (level, line) and default to stdout for debug/info and stderr for
+  warn/error, like Node's console.
+
+  JSON text: object keys in event order (category, id, at, level, kind, source, message, data,
+  requestId, sessionId), compact separators, integral numbers without a fraction, non-ASCII
+  characters written as is, only '"', '\' and control characters escaped.
+
+  Facade (subject observer-console): id(), write(event) → null, lines() → [{level, line}].
+subject: observer-console
+cases:
+  - name: the output id is console
+    call: id
+    expect: { value: console }
+
+  - name: each level uses its console method with one JSON line
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: debug, kind: log, source: app, message: d, data: {} }], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: i, data: { n: 1 } }], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e3, at: "2026-03-04T05:06:07.890Z", level: warn, kind: log, source: app, message: w, data: {} }], expect: { value: null } }
+      - { call: write, args: [{ category: payments, id: e4, at: "2026-03-04T05:06:07.890Z", level: error, kind: request, source: api, message: e, data: { list: [1.5, null], ok: false, status: 500 }, requestId: r1, sessionId: s1 }], expect: { value: null } }
+      - call: lines
+        expect:
+          value:
+            - { level: debug, line: '{"category":"app","id":"e1","at":"2026-03-04T05:06:07.890Z","level":"debug","kind":"log","source":"app","message":"d","data":{}}' }
+            - { level: info, line: '{"category":"app","id":"e2","at":"2026-03-04T05:06:07.890Z","level":"info","kind":"log","source":"app","message":"i","data":{"n":1}}' }
+            - { level: warn, line: '{"category":"app","id":"e3","at":"2026-03-04T05:06:07.890Z","level":"warn","kind":"log","source":"app","message":"w","data":{}}' }
+            - { level: error, line: '{"category":"payments","id":"e4","at":"2026-03-04T05:06:07.890Z","level":"error","kind":"request","source":"api","message":"e","data":{"list":[1.5,null],"ok":false,"status":500},"requestId":"r1","sessionId":"s1"}' }
+        note: data keys here are already in code point order, which every language keeps
+
+  - name: strings are escaped like JSON.stringify
+    tags: [edge]
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: "quote \" slash \\ tab \t nl \n é 😀 <&>", data: { x: "\u0001" } }], expect: { value: null } }
+      - call: lines
+        expect:
+          value:
+            - { level: info, line: '{"category":"app","id":"e1","at":"2026-03-04T05:06:07.890Z","level":"info","kind":"log","source":"app","message":"quote \" slash \\ tab \t nl \n é 😀 <&>","data":{"x":"\u0001"}}' }

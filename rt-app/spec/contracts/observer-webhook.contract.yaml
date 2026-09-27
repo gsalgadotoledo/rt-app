@@ -1,0 +1,109 @@
+contract: 1
+module: observer-webhook
+title: Observer webhook output
+description: |
+  WebhookOutput(id, url, headers = {}, transport = fetch) posts each event as JSON to a trusted
+  HTTPS receiver configured in server code. It uses postOutput (shared with the Slack output).
+
+  - Constructor: new URL(url) must parse (TypeError "Invalid URL") and use https: (Error "Webhook
+    output requires HTTPS"). The id is the one given.
+  - write(event): postOutput(url, JSON.stringify(event), {"Content-Type": "application/json",
+    ...headers}) → the configured headers come after, so they can replace Content-Type.
+  - postOutput(url, body, headers, signal?, transport): parses url again (WHATWG URL) and refuses
+    anything but https: without username and password (Error "Observer destinations require HTTPS
+    without URL credentials", nothing is sent). It sends one POST to the serialized URL (href:
+    lowercase host, default port removed, path, query and fragment percent-encoded, dot segments
+    resolved) with redirects disabled, then drops the response body. A status outside 200-299
+    (redirects included) is Error "Observer destination returned HTTP <status>"; transport errors
+    reach the caller unchanged. The Observer turns every failure into health.failed, so messages
+    never leave the server; the request bodies are the already sanitized events.
+
+  Facade (subject observer-webhook): init {id, url, headers?, status? (200), fail? (a transport
+  error message)}; id(), write(event) → null, requests() → [{url, method, headers, body}],
+  setStatus(status), setFailure(message | null).
+subject: observer-webhook
+init: { id: custom, url: "https://logs.example.test" }
+cases:
+  - name: events are posted as JSON with the configured headers
+    init: { id: audit, url: "https://logs.example.test", headers: { X-Api-Key: k-1 } }
+    steps:
+      - { call: id, expect: { value: audit } }
+      - { call: write, args: [{ category: payments, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: Declined, data: { orderId: o-1 }, requestId: request-1 }], expect: { value: null } }
+      - call: requests
+        expect:
+          value:
+            - url: "https://logs.example.test/"
+              method: POST
+              headers: { Content-Type: application/json, X-Api-Key: k-1 }
+              body: '{"category":"payments","id":"e1","at":"2026-03-04T05:06:07.890Z","level":"error","kind":"log","source":"app","message":"Declined","data":{"orderId":"o-1"},"requestId":"request-1"}'
+
+  - name: configured headers can replace the content type
+    tags: [edge]
+    init: { id: custom, url: "https://logs.example.test/in", headers: { Content-Type: text/plain } }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: requests, expect: { value: [{ $partial: { headers: { Content-Type: text/plain } } }] } }
+
+  - name: the destination URL is normalized
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: requests, expect: { value: [{ $partial: { url: "https://logs.example.test/" } }] } }
+  - name: host case, default port, dot segments and query encoding are normalized
+    init: { id: custom, url: "https://LOGS.Example.TEST:443/a b/../in?x=a b&r='#frag" }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: requests, expect: { value: [{ $partial: { url: "https://logs.example.test/in?x=a%20b&r=%27#frag" } }] } }
+  - name: other ports and IP hosts are kept in their canonical form
+    init: { id: custom, url: "https://[2001:DB8::0:1]:8443/x" }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: requests, expect: { value: [{ $partial: { url: "https://[2001:db8::1]:8443/x" } }] } }
+  - name: IPv4 shorthand is expanded
+    init: { id: custom, url: "https://127.1/in" }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: requests, expect: { value: [{ $partial: { url: "https://127.0.0.1/in" } }] } }
+
+  - name: statuses outside 2xx are errors
+    steps:
+      - { call: setStatus, args: [204], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: setStatus, args: [299], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: setStatus, args: [302], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e3, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: Observer destination returned HTTP 302 } } }
+      - { call: setStatus, args: [429], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e4, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: Observer destination returned HTTP 429 } } }
+      - { call: setStatus, args: [500], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e5, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: Observer destination returned HTTP 500 } } }
+      - { call: requests, expect: { value: { $length: 5 } } }
+
+  - name: transport errors reach the caller unchanged
+    init: { id: custom, url: "https://logs.example.test", fail: "connect ECONNREFUSED 10.0.0.1:443" }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: "connect ECONNREFUSED 10.0.0.1:443" } } }
+
+  - name: URL credentials are refused before sending
+    tags: [security]
+    init: { id: custom, url: "https://user:secret@logs.example.test/in" }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: Observer destinations require HTTPS without URL credentials } } }
+      - { call: requests, expect: { value: [] } }
+  - name: a username alone is refused too
+    tags: [security]
+    init: { id: custom, url: "https://user@logs.example.test/in" }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: Observer destinations require HTTPS without URL credentials } } }
+
+  - name: webhooks require HTTPS
+    tags: [validation, security]
+    init: { id: custom, url: "http://logs.example.test" }
+    create: { error: { status: null, message: Webhook output requires HTTPS } }
+  - name: webhook URLs must parse
+    tags: [validation]
+    init: { id: custom, url: not a url }
+    create: { error: { status: null, message: Invalid URL } }
+  - name: webhook URLs with a bad port do not parse
+    tags: [validation]
+    init: { id: custom, url: "https://logs.example.test:99999/" }
+    create: { error: { status: null, message: Invalid URL } }

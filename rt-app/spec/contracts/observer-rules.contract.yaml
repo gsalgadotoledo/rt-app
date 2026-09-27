@@ -1,0 +1,278 @@
+contract: 1
+module: observer-rules
+title: Observer redaction, URL paths and log queries
+description: |
+  The pure rules of @gsalgadotoledo/rt-app-observer that every event goes through.
+
+  sanitize(value, depth = 0):
+  - depth > 4 → "[truncated]" (whatever the value);
+  - strings: cut to 1000 UTF-16 units, then, in this order (case-insensitive, ASCII letters only):
+    /Bearer\s+\S+/ → "Bearer [redacted]"; /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ → "[email]";
+    /((?:password|token|secret|api[_-]?key)\s*[=:]\s*)[^\s,;]+/ → "$1[redacted]". \s and \S are
+    the JavaScript sets (NBSP, U+2028 and U+FEFF are whitespace, U+200B is not);
+  - null, numbers and booleans unchanged; arrays keep their first 20 items; objects keep their
+    first 30 keys in JavaScript property order (array-index keys like "2" first, ascending, then the
+    others in insertion order) and every key matching
+    /password|secret|token|authorization|cookie|credential|email|phone|body|headers|ip|code/
+    (case-insensitive ASCII substring: "zip", "description" and "barcode" match) has its value
+    replaced by "[redacted]"; nested values use depth + 1. Errors become {name}; other values
+    String(value).
+
+  safePath(url): new URL(url, "http://observer.local") (WHATWG URL): a protocol other than http:
+  or https: throws TypeError "Observer expects an HTTP URL or path"; an unparsable URL throws
+  TypeError "Invalid URL". Returns the pathname (percent-encoded, dot segments resolved, query,
+  fragment, credentials and host dropped) cut to 160 units.
+
+  validateLogQuery(query): day must match ^\d{4}-\d{2}-\d{2}$ and name a real calendar date (400
+  "Invalid day"); level, when truthy, one of debug/info/warn/error (400 "Invalid level");
+  category, requestId, sessionId, text and cursor, when present, strings of at most 200 UTF-16
+  units (cursor 8192) (400 "Invalid log filter"). Checked in that order.
+
+  matchesLog(event, query): level equal to query.level, or not debug without one; category,
+  requestId and sessionId equal when the filter is truthy; text (when truthy) a case-insensitive
+  substring (toLowerCase) of JSON.stringify(event).
+
+  Facade (subject observer-rules): sanitize(value), safePath(url), validateLogQuery(query) → null,
+  matchesLog(event, query) → boolean.
+subject: observer-rules
+cases:
+  # ---------------------------------------------------------------- sanitize: keys
+  - name: secret keys are redacted at every depth
+    tags: [security]
+    call: sanitize
+    args:
+      - password: p
+        Secret: s
+        accessToken: t
+        Authorization: a
+        cookie: c
+        credentials: [c]
+        userEmail: e
+        phoneNumber: "1"
+        body: { x: 1 }
+        HEADERS: { a: b }
+        ip: 10.0.0.1
+        code: 123456
+        name: kept
+        nested: { list: [{ token: t, keep: k }] }
+    expect:
+      value:
+        password: "[redacted]"
+        Secret: "[redacted]"
+        accessToken: "[redacted]"
+        Authorization: "[redacted]"
+        cookie: "[redacted]"
+        credentials: "[redacted]"
+        userEmail: "[redacted]"
+        phoneNumber: "[redacted]"
+        body: "[redacted]"
+        HEADERS: "[redacted]"
+        ip: "[redacted]"
+        code: "[redacted]"
+        name: kept
+        nested: { list: [{ token: "[redacted]", keep: k }] }
+
+  - name: key matching is a substring match
+    tags: [security, edge]
+    call: sanitize
+    args: [{ zip: "12345", description: text, barcode: "0001", shipping: fast, recipient: r, name: n, "\u017fecret": kept, "\u212aey": kept }]
+    expect: { value: { zip: "[redacted]", description: "[redacted]", barcode: "[redacted]", shipping: "[redacted]", recipient: "[redacted]", name: n, "\u017fecret": kept, "\u212aey": kept } }
+    note: "\u017f (U+017F) is not s: only ASCII letters match case-insensitively"
+
+  # ---------------------------------------------------------------- sanitize: strings
+  - name: bearer tokens are redacted
+    tags: [security]
+    steps:
+      - { call: sanitize, args: ["Authorization: Bearer abc.def"], expect: { value: "Authorization: Bearer [redacted]" } }
+      - { call: sanitize, args: ["bearer\tx y"], expect: { value: "Bearer [redacted] y" } }
+      - { call: sanitize, args: ["BEARER  a,b;c"], expect: { value: "Bearer [redacted]" } }
+      - { call: sanitize, args: ["Bearer\u00a0nbsp"], expect: { value: "Bearer [redacted]" } }
+      - { call: sanitize, args: ["Bearer\u2028sep"], expect: { value: "Bearer [redacted]" } }
+      - { call: sanitize, args: ["Bearer\u200bzero"], expect: { value: "Bearer\u200bzero" } }
+      - { call: sanitize, args: ["Bearer"], expect: { value: "Bearer" } }
+      - { call: sanitize, args: ["xBearer y"], expect: { value: "xBearer [redacted]" } }
+
+  - name: e-mail addresses are redacted
+    tags: [security]
+    steps:
+      - { call: sanitize, args: ["mail a.b+c@EXAMPLE.co.uk now"], expect: { value: "mail [email] now" } }
+      - { call: sanitize, args: ["two: a@b.io, c_d%e@f-g.dev"], expect: { value: "two: [email], [email]" } }
+      - { call: sanitize, args: ["no tld user@host"], expect: { value: "no tld user@host" } }
+      - { call: sanitize, args: ["short x@y.c"], expect: { value: "short x@y.c" } }
+      - { call: sanitize, args: ["ü@example.com"], expect: { value: "ü@example.com" } }
+      - { call: sanitize, args: ["\u212a@example.com"], expect: { value: "\u212a@example.com" } }
+      - { call: sanitize, args: ["user@exam_ple.com"], expect: { value: "user@exam_ple.com" } }
+      - { call: sanitize, args: ["user@a.b.cd.e"], expect: { value: "[email].e" } }
+
+  - name: key-value secrets are redacted
+    tags: [security]
+    steps:
+      - { call: sanitize, args: ["password=abc def"], expect: { value: "password=[redacted] def" } }
+      - { call: sanitize, args: ["TOKEN : abc;rest"], expect: { value: "TOKEN : [redacted];rest" } }
+      - { call: sanitize, args: ["api_key=1,apikey:2 api-key =3"], expect: { value: "api_key=[redacted],apikey:[redacted] api-key =[redacted]" } }
+      - { call: sanitize, args: ["mytoken=abc"], expect: { value: "mytoken=[redacted]" } }
+      - { call: sanitize, args: ["secret="], expect: { value: "secret=" } }
+      - { call: sanitize, args: ["api key=abc"], expect: { value: "api key=abc" } }
+      - { call: sanitize, args: ["password=me@example.com"], expect: { value: "password=[redacted]" } }
+      - { call: sanitize, args: ["secret:\u00a0value"], expect: { value: "secret:\u00a0[redacted]" } }
+
+  - name: strings are cut to 1000 UTF-16 units before redaction
+    tags: [limits]
+    steps:
+      - { call: sanitize, args: [{ $text: { repeat: "a", count: 1001 } }], expect: { value: { $text: { repeat: "a", count: 1000 } } } }
+      - call: sanitize
+        args: [{ $text: { repeat: "😀", count: 500 } }]
+        expect: { value: { $text: { repeat: "😀", count: 500 } } }
+      - call: sanitize
+        args: [{ $text: { repeat: "😀", count: 501 } }]
+        expect: { value: { $text: { repeat: "😀", count: 500 } } }
+      - call: sanitize
+        args: [{ $text: { repeat: "token=abcdefgh ", count: 67 } }]
+        expect: { value: { $length: 1138 } }
+        note: "66 full repeats plus the tail \"token=abcd\"; each value becomes [redacted]"
+
+  # ---------------------------------------------------------------- sanitize: structure
+  - name: scalars pass through
+    steps:
+      - { call: sanitize, args: [null], expect: { value: null } }
+      - { call: sanitize, args: [0], expect: { value: 0 } }
+      - { call: sanitize, args: [-1.5], expect: { value: -1.5 } }
+      - { call: sanitize, args: [true], expect: { value: true } }
+      - { call: sanitize, args: [[1, "a", null, false, []]], expect: { value: [1, "a", null, false, []] } }
+      - { call: sanitize, args: [{}], expect: { value: {} } }
+
+  - name: nesting deeper than four levels is truncated
+    tags: [limits]
+    steps:
+      - call: sanitize
+        args: [{ a: { b: { c: { d: { e: 1, f: {} } } } } }]
+        expect: { value: { a: { b: { c: { d: { e: "[truncated]", f: "[truncated]" } } } } } }
+      - call: sanitize
+        args: [[[[[[1]]]]]]
+        expect: { value: [[[[["[truncated]"]]]]] }
+      - call: sanitize
+        args: [{ a: { b: { c: { d: [] } } } }]
+        expect: { value: { a: { b: { c: { d: [] } } } } }
+
+  - name: arrays keep 20 items and objects 30 keys
+    tags: [limits]
+    steps:
+      - call: sanitize
+        args: [[{ $repeat: { count: 25, item: "{i}" } }]]
+        expect: { value: [{ $repeat: { count: 20, item: "{i}" } }] }
+      - call: sanitize
+        args: [{ k00: 0, k01: 1, k02: 2, k03: 3, k04: 4, k05: 5, k06: 6, k07: 7, k08: 8, k09: 9, k10: 10, k11: 11, k12: 12, k13: 13, k14: 14, k15: 15, k16: 16, k17: 17, k18: 18, k19: 19, k20: 20, k21: 21, k22: 22, k23: 23, k24: 24, k25: 25, k26: 26, k27: 27, k28: 28, k29: 29, k30: 30 }]
+        expect: { value: { k00: 0, k01: 1, k02: 2, k03: 3, k04: 4, k05: 5, k06: 6, k07: 7, k08: 8, k09: 9, k10: 10, k11: 11, k12: 12, k13: 13, k14: 14, k15: 15, k16: 16, k17: 17, k18: 18, k19: 19, k20: 20, k21: 21, k22: 22, k23: 23, k24: 24, k25: 25, k26: 26, k27: 27, k28: 28, k29: 29 } }
+
+  - name: array-index keys come first when objects are cut
+    tags: [limits, edge]
+    call: sanitize
+    args: [{ k00: 0, k01: 1, k02: 2, k03: 3, k04: 4, k05: 5, k06: 6, k07: 7, k08: 8, k09: 9, k10: 10, k11: 11, k12: 12, k13: 13, k14: 14, k15: 15, k16: 16, k17: 17, k18: 18, k19: 19, k20: 20, k21: 21, k22: 22, k23: 23, k24: 24, k25: 25, k26: 26, k27: 27, k28: 28, "10": ten, "9": nine }]
+    expect: { value: { "9": nine, "10": ten, k00: 0, k01: 1, k02: 2, k03: 3, k04: 4, k05: 5, k06: 6, k07: 7, k08: 8, k09: 9, k10: 10, k11: 11, k12: 12, k13: 13, k14: 14, k15: 15, k16: 16, k17: 17, k18: 18, k19: 19, k20: 20, k21: 21, k22: 22, k23: 23, k24: 24, k25: 25, k26: 26, k27: 27 } }
+    note: 'JavaScript orders "9" and "10" first, so k28 is the 31st key and dropped ("01" or "4294967295" would not be array indexes)'
+
+  # ---------------------------------------------------------------- safePath
+  - name: safePath keeps only the path
+    steps:
+      - { call: safePath, args: [/users/42], expect: { value: /users/42 } }
+      - { call: safePath, args: ["/x?y=1#z"], expect: { value: /x } }
+      - { call: safePath, args: ["https://user:pw@Example.test:8443/a/b?token=1#f"], expect: { value: /a/b } }
+      - { call: safePath, args: ["HTTP://X/Y"], expect: { value: /Y } }
+      - { call: safePath, args: ["//evil.test/x"], expect: { value: /x } }
+      - { call: safePath, args: ["\\\\host\\a\\b"], expect: { value: /a/b } }
+      - { call: safePath, args: ["http://[::1]:80/p"], expect: { value: /p } }
+      - { call: safePath, args: ["http://0x7f.1/"], expect: { value: / } }
+      - { call: safePath, args: ["http:foo"], expect: { value: /foo } }
+      - { call: safePath, args: ["https:foo"], expect: { value: / } }
+
+  - name: safePath resolves relative paths and dot segments
+    steps:
+      - { call: safePath, args: [""], expect: { value: / } }
+      - { call: safePath, args: ["?q"], expect: { value: / } }
+      - { call: safePath, args: ["#f"], expect: { value: / } }
+      - { call: safePath, args: ["a/b"], expect: { value: /a/b } }
+      - { call: safePath, args: ["../../x"], expect: { value: /x } }
+      - { call: safePath, args: ["/a/./b/../c"], expect: { value: /a/c } }
+      - { call: safePath, args: ["/%2e%2E/x"], expect: { value: /x } }
+      - { call: safePath, args: ["/a/%2e"], expect: { value: /a/ } }
+      - { call: safePath, args: ["/a/.."], expect: { value: / } }
+      - { call: safePath, args: ["/a/..%2f"], expect: { value: /a/..%2f } }
+      - { call: safePath, args: ["/a/b/.%2E/c"], expect: { value: /a/c } }
+      - { call: safePath, args: ["  /x  "], expect: { value: /x } }
+      - { call: safePath, args: ["/x\t\ny"], expect: { value: /xy } }
+
+  - name: safePath percent-encodes like a browser
+    steps:
+      - { call: safePath, args: ["/a b"], expect: { value: /a%20b } }
+      - { call: safePath, args: ["/{}`<>\"^|"], expect: { value: "/%7B%7D%60%3C%3E%22%5E|" } }
+      - { call: safePath, args: ["/é😀"], expect: { value: /%C3%A9%F0%9F%98%80 } }
+      - { call: safePath, args: ["/a\u0000b\u007fc"], expect: { value: /a%00b%7Fc } }
+      - { call: safePath, args: ["/%zz/%41"], expect: { value: /%zz/%41 } }
+      - { call: safePath, args: ["/!$&'()*+,;=:@~"], expect: { value: "/!$&'()*+,;=:@~" } }
+
+  - name: safePath cuts the path to 160 units
+    tags: [limits]
+    steps:
+      - { call: safePath, args: [{ $text: { repeat: "/a", count: 81 } }], expect: { value: { $text: { repeat: "/a", count: 80 } } } }
+      - { call: safePath, args: [{ $text: { repeat: "/é", count: 30 } }], expect: { value: { $length: 160 } } }
+
+  - name: safePath accepts only HTTP URLs
+    tags: [validation]
+    steps:
+      - { call: safePath, args: ["javascript:alert(1)"], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: safePath, args: ["mailto:x"], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: safePath, args: ["ftp://h/x"], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: safePath, args: ["file:///etc/passwd"], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: safePath, args: ["data:text/plain,x"], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: safePath, args: ["blob:http://x/y"], expect: { error: { status: null, message: Observer expects an HTTP URL or path } } }
+      - { call: safePath, args: ["http://"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://a b/"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://h:99999/"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://h:8x/"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://[::1/"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://user@/x"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["//"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://1.2.3.4.5/"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://256.0.0.1/"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://a%20b/"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: safePath, args: ["http://a^b/"], expect: { error: { status: null, message: Invalid URL } } }
+
+  # ---------------------------------------------------------------- log queries
+  - name: validateLogQuery accepts real days and known filters
+    steps:
+      - { call: validateLogQuery, args: [{ day: "2026-03-04" }], expect: { value: null } }
+      - { call: validateLogQuery, args: [{ day: "2024-02-29", level: error, category: c, requestId: r, sessionId: s, text: t, cursor: x }], expect: { value: null } }
+      - { call: validateLogQuery, args: [{ day: "2026-03-04", level: "" }], expect: { value: null } }
+      - { call: validateLogQuery, args: [{ day: "2026-03-04", category: { $text: { repeat: "c", count: 200 } }, cursor: { $text: { repeat: "c", count: 8192 } } }], expect: { value: null } }
+      - { call: validateLogQuery, args: [{ day: "2026-03-04", other: 5 }], expect: { value: null } }
+
+  - name: validateLogQuery rejects bad days, levels and filters in order
+    tags: [validation]
+    steps:
+      - { call: validateLogQuery, args: [{ day: "2026-02-29" }], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: validateLogQuery, args: [{ day: "2026-3-4" }], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: validateLogQuery, args: [{ day: ["2026-03-04"] }], expect: { error: { status: 400, message: Invalid day } } }
+      - { call: validateLogQuery, args: [{ day: "2026-03-04", level: Info }], expect: { error: { status: 400, message: Invalid level } } }
+      - { call: validateLogQuery, args: [{ day: "2026-03-04", level: 3 }], expect: { error: { status: 400, message: Invalid level } } }
+      - { call: validateLogQuery, args: [{ day: "2026-03-04", cursor: 1 }], expect: { error: { status: 400, message: Invalid log filter } } }
+      - { call: validateLogQuery, args: [{ day: "2026-03-04", sessionId: { $text: { repeat: "s", count: 201 } } }], expect: { error: { status: 400, message: Invalid log filter } } }
+      - { call: validateLogQuery, args: [{ day: "2026-03-04", requestId: [] }], expect: { error: { status: 400, message: Invalid log filter } } }
+
+  - name: matchesLog hides debug unless asked and filters exactly
+    steps:
+      - { call: matchesLog, args: [{ level: debug, message: m }, { day: d }], expect: { value: false } }
+      - { call: matchesLog, args: [{ level: debug, message: m }, { day: d, level: debug }], expect: { value: true } }
+      - { call: matchesLog, args: [{ level: info, message: m }, { day: d, level: error }], expect: { value: false } }
+      - { call: matchesLog, args: [{ level: info, message: m, category: pay }, { day: d, category: pay }], expect: { value: true } }
+      - { call: matchesLog, args: [{ level: info, message: m, category: pay }, { day: d, category: pa }], expect: { value: false } }
+      - { call: matchesLog, args: [{ level: info, message: m }, { day: d, requestId: r }], expect: { value: false } }
+      - { call: matchesLog, args: [{ level: info, message: m, sessionId: s }, { day: d, sessionId: s, requestId: "" }], expect: { value: true } }
+
+  - name: matchesLog text searches the event JSON case-insensitively
+    steps:
+      - { call: matchesLog, args: [{ level: info, message: Payment DECLINED }, { day: d, text: declined }], expect: { value: true } }
+      - { call: matchesLog, args: [{ level: info, message: m, data: { orderId: O-1 } }, { day: d, text: "o-1" }], expect: { value: true } }
+      - { call: matchesLog, args: [{ level: info, message: m }, { day: d, text: "\"level\":\"info\"" }], expect: { value: true } }
+      - { call: matchesLog, args: [{ level: info, message: "tab\there" }, { day: d, text: "tab\\there" }], expect: { value: true } }
+      - { call: matchesLog, args: [{ level: info, message: "ÉCOLE" }, { day: d, text: "école" }], expect: { value: true } }
+      - { call: matchesLog, args: [{ level: info, message: m }, { day: d, text: missing }], expect: { value: false } }

@@ -66,3 +66,22 @@ test('log search validates filters and preserves continuation on empty filtered 
  await assert.rejects(reader.search({...query,level:'invalid'}),/Invalid level/);
  const endpoint=observerFeature(new Observer(),reader).endpoints.find(e=>e.path==='/observer/logs');assert.equal(endpoint.access,'owner');
 });
+
+test('injected clocks and ids pin event times, budgets, timings, TTL filtering and the default day',async()=>{
+ let now=Date.parse('2026-03-04T05:06:07.890Z');const ids=['e1','e2','e3'];
+ const store=new Store(),storage=new ObserverStore(store,{now:()=>now}),observer=new Observer([{handler:storage,maxPerMinute:2}],1500,{now:()=>new Date(now),newId:()=>ids.shift()});
+ await observer.info('one');await observer.measure('op',()=>{now+=25;return 1;});await observer.info('dropped');
+ assert.equal(observer.health.dropped,1);
+ const rows=[...store.rows.values()];assert.deepEqual(rows.map(r=>r.sk),['2026-03-04T05:06:07.890Z#e1','2026-03-04T05:06:07.915Z#e2']);
+ assert.equal(rows[1].data.data.durationMs,25);
+ now+=60000;await observer.info('next minute');assert.equal(store.rows.size,3);
+ const feature=observerFeature(observer,storage,storage,{now:()=>now});
+ const report=await feature.endpoints[0].handle({request:{query:{}}});assert.equal(report.day,'2026-03-04');assert.equal(report.events.length,3);
+ now+=7*86400000;assert.equal((await storage.report('2026-03-04')).events.length,0);
+});
+
+test('protocol-relative page paths are invalid events, not internal errors',async()=>{
+ const storage=new ObserverStore(new Store()),ingest=observerFeature(new Observer([{handler:storage}]),storage).endpoints.find(e=>e.method==='POST');
+ for(const path of ['//','//evil.test/x'])await assert.rejects(ingest.handle({request:{ip:'1',body:{source:'spa',path}}}),/Invalid page event/);
+ assert.deepEqual(await ingest.handle({request:{ip:'1',body:{source:'spa',path:'/a//b'}}}),{ok:true});
+});

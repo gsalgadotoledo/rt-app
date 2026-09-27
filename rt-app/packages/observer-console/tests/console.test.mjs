@@ -18,3 +18,10 @@ test("each severity uses its matching console method with structured JSON", (t) 
     sink.mock.restore();
   }
 });
+
+test("an injected sink receives the same JSON line", () => {
+  const lines = [];
+  const sink = Object.fromEntries(["debug", "info", "warn", "error"].map((level) => [level, (line) => lines.push([level, line])]));
+  new ConsoleOutput(sink).write({ level: "warn", message: "x" });
+  assert.deepEqual(lines, [["warn", '{"level":"warn","message":"x"}']]);
+});

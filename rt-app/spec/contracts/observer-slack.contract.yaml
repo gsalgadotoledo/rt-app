@@ -1,0 +1,87 @@
+contract: 1
+module: observer-slack
+title: Observer Slack output
+description: |
+  SlackOutput(webhook, transport = fetch) (id "slack") posts a plain-text message to a Slack
+  incoming webhook through postOutput (see observer-webhook: HTTPS without credentials, POST of the
+  normalized URL, no redirects, "Observer destination returned HTTP <status>").
+
+  - Constructor: new URL(webhook) must parse (TypeError "Invalid URL"); protocol https:, hostname
+    exactly hooks.slack.com or hooks.slack-gov.com (after WHATWG lowercasing) and a pathname
+    starting with /services/, else Error "Invalid Slack incoming webhook".
+  - write(event): body JSON.stringify({text, mrkdwn: false}) with text
+    "[<level>] <category ?? source>: <message>\nRequest: <requestId ?? id>", header
+    {"Content-Type": "application/json"}. Observer events always carry a category.
+
+  Facade (subject observer-slack): init {webhook, status?, fail?}; id(), write(event) → null,
+  requests() → [{url, method, headers, body}], setStatus(status), setFailure(message | null).
+subject: observer-slack
+init: { webhook: "https://hooks.slack.com/services/T000/B000/XXXX" }
+cases:
+  - name: events become plain-text messages
+    steps:
+      - { call: id, expect: { value: slack } }
+      - { call: write, args: [{ category: payments, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: Declined, data: {}, requestId: request-1 }], expect: { value: null } }
+      - call: requests
+        expect:
+          value:
+            - url: "https://hooks.slack.com/services/T000/B000/XXXX"
+              method: POST
+              headers: { Content-Type: application/json }
+              body: '{"text":"[error] payments: Declined\nRequest: request-1","mrkdwn":false}'
+
+  - name: without category and request id the source and event id are used
+    tags: [edge]
+    init: { webhook: "https://hooks.slack-gov.com/services/x" }
+    steps:
+      - { call: write, args: [{ id: e1, at: "2026-03-04T05:06:07.890Z", level: warn, kind: log, source: worker, message: "say \"hi\"", data: {} }], expect: { value: null } }
+      - { call: requests, expect: { value: [{ $partial: { url: "https://hooks.slack-gov.com/services/x", body: '{"text":"[warn] worker: say \"hi\"\nRequest: e1","mrkdwn":false}' } }] } }
+
+  - name: the webhook host is compared after lowercasing
+    init: { webhook: "https://HOOKS.SLACK.COM/services/a/b" }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: info, kind: log, source: app, message: m, data: {} }], expect: { value: null } }
+      - { call: requests, expect: { value: [{ $partial: { url: "https://hooks.slack.com/services/a/b" } }] } }
+
+  - name: delivery failures are errors
+    init: { webhook: "https://hooks.slack.com/services/x", status: 404 }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: Observer destination returned HTTP 404 } } }
+      - { call: setStatus, args: [200], expect: { value: null } }
+      - { call: setFailure, args: [network down], expect: { value: null } }
+      - { call: write, args: [{ category: app, id: e2, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: network down } } }
+
+  - name: only Slack incoming webhooks are accepted
+    tags: [validation, security]
+    init: { webhook: "http://hooks.slack.com/services/x" }
+    create: { error: { status: null, message: Invalid Slack incoming webhook } }
+  - name: other hosts are refused
+    tags: [validation, security]
+    init: { webhook: "https://attacker.test/services/x" }
+    create: { error: { status: null, message: Invalid Slack incoming webhook } }
+  - name: look-alike hosts are refused
+    tags: [validation, security]
+    init: { webhook: "https://hooks.slack.com.attacker.test/services/x" }
+    create: { error: { status: null, message: Invalid Slack incoming webhook } }
+  - name: a trailing dot is another host
+    tags: [validation, edge]
+    init: { webhook: "https://hooks.slack.com./services/x" }
+    create: { error: { status: null, message: Invalid Slack incoming webhook } }
+  - name: other paths are refused
+    tags: [validation]
+    init: { webhook: "https://hooks.slack.com/wrong/services/x" }
+    create: { error: { status: null, message: Invalid Slack incoming webhook } }
+  - name: the services prefix needs its slash
+    tags: [validation, edge]
+    init: { webhook: "https://hooks.slack.com/services" }
+    create: { error: { status: null, message: Invalid Slack incoming webhook } }
+  - name: Slack webhooks must parse
+    tags: [validation]
+    init: { webhook: "hooks.slack.com/services/x" }
+    create: { error: { status: null, message: Invalid URL } }
+  - name: credentials in a Slack webhook are refused when sending
+    tags: [security]
+    init: { webhook: "https://u:p@hooks.slack.com/services/x" }
+    steps:
+      - { call: write, args: [{ category: app, id: e1, at: "2026-03-04T05:06:07.890Z", level: error, kind: log, source: app, message: m, data: {} }], expect: { error: { status: null, message: Observer destinations require HTTPS without URL credentials } } }
+      - { call: requests, expect: { value: [] } }
