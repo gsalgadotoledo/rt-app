@@ -70,10 +70,26 @@ export interface WorkerOptions {
   idleMs?: number;
 }
 
+/** Optional clock and jitter source; tests and contracts pass fixed ones. */
+export interface QueueOptions {
+  /** Clock for createdAt: epoch milliseconds or a Date (the system clock by default). */
+  now?: () => number | Date;
+  /** Jitter source in [0, 1) for delayed retries (Math.random by default). */
+  random?: () => number;
+}
+
 /** At-least-once delivery. Handlers own business idempotency; enqueue acceptance is not completion. */
 export class Queue {
   private working = false;
-  constructor(readonly adapter: QueueAdapter) {}
+  private now: () => number | Date;
+  private random: () => number;
+  constructor(
+    readonly adapter: QueueAdapter,
+    options: QueueOptions = {},
+  ) {
+    this.now = options.now ?? Date.now;
+    this.random = options.random ?? Math.random;
+  }
 
   /** Return the logical message ID. Reuse a supplied ID on retries; brokers can still duplicate it. */
   async send(
@@ -85,7 +101,7 @@ export class Queue {
       id: options.id ?? randomUUID(),
       type,
       payload,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(this.now()).toISOString(),
       ...(options.traceId ? { traceId: options.traceId } : {}),
     });
     await this.adapter.publish(message);
@@ -127,7 +143,7 @@ export class Queue {
               await delivery.retry(
                 this.adapter.capabilities.delayedRetry
                   ? Math.floor(
-                      Math.random() *
+                      this.random() *
                         (Math.min(
                           max,
                           base * 2 ** Math.min(delivery.attempts - 1, 20),

@@ -1,0 +1,80 @@
+contract: 1
+kind: http
+module: queue-api
+title: Queue HTTP API (local mode, in-memory adapter)
+description: |
+  The queue endpoints as served by an API composed with the queue module on a MemoryQueue, started
+  in local mode. All three are owner endpoints: they are served at their path (401 "Sign in"
+  without a session) and again under /admin/app, where the local owner "rt-app-root" is the actor.
+
+    GET  /queue/status          → {supported: true, capabilities: {delayedRetry: true,
+                                   leaseRenewal: true, durable: false, failedAdmin: true}}
+    POST /queue/failed/inspect  body {limit = 10}: 400 "Limit must be between 1 and 10" unless an
+                                   integer 1-10 → {items: [{token, id, message, retryable}]}
+    POST /queue/failed/retry    body {token}: 400 "Invalid retry token" unless a non-empty string
+                                   of at most 400000 UTF-16 units; 409 "Message is no longer
+                                   available; refresh the list" for an unknown token → {queued: true}
+
+  Nothing publishes to the queue over HTTP, so the dead-letter list stays empty. Bodies must be
+  JSON objects (400 "Invalid JSON") of at most 16 KiB (413 "Request body too large").
+cases:
+  - name: status reports the memory adapter capabilities
+    requests:
+      - request: { method: GET, path: /admin/app/queue/status }
+        expect:
+          status: 200
+          body: { supported: true, capabilities: { delayedRetry: true, leaseRenewal: true, durable: false, failedAdmin: true } }
+          headers: { cache-control: no-store }
+
+  - name: owner endpoints at their path need a session
+    tags: [security]
+    requests:
+      - { request: { method: GET, path: /queue/status }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: /queue/failed/inspect, body: {} }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: /queue/failed/retry, body: { token: x } }, expect: { status: 401, body: { error: Sign in } } }
+
+  - name: unknown methods and routes are 404
+    tags: [edge]
+    requests:
+      - { request: { method: GET, path: /admin/app/queue/failed/inspect }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /admin/app/queue/status, body: {} }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /admin/app/queue/failed }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: inspection lists no dead letters
+    requests:
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, body: {} }, expect: { status: 200, body: { items: [] } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, body: { limit: 10 } }, expect: { status: 200, body: { items: [] } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, body: { limit: null } }, expect: { status: 200, body: { items: [] } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect/, body: { limit: 1 } }, expect: { status: 200, body: { items: [] } }, note: one trailing slash is allowed }
+
+  - name: the inspection limit is an integer from 1 to 10
+    tags: [validation]
+    requests:
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, body: { limit: 0 } }, expect: { status: 400, body: { error: Limit must be between 1 and 10 } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, body: { limit: 11 } }, expect: { status: 400, body: { error: Limit must be between 1 and 10 } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, body: { limit: 2.5 } }, expect: { status: 400, body: { error: Limit must be between 1 and 10 } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, body: { limit: "5" } }, expect: { status: 400, body: { error: Limit must be between 1 and 10 } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, body: { limit: true } }, expect: { status: 400, body: { error: Limit must be between 1 and 10 } } }
+
+  - name: retry tokens are validated
+    tags: [validation]
+    requests:
+      - { request: { method: POST, path: /admin/app/queue/failed/retry, body: {} }, expect: { status: 400, body: { error: Invalid retry token } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/retry, body: { token: "" } }, expect: { status: 400, body: { error: Invalid retry token } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/retry, body: { token: 5 } }, expect: { status: 400, body: { error: Invalid retry token } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/retry, body: { token: [ x ] } }, expect: { status: 400, body: { error: Invalid retry token } } }
+
+  - name: an unknown token is no longer available
+    requests:
+      - request: { method: POST, path: /admin/app/queue/failed/retry, body: { token: api-queue-unknown-token } }
+        expect: { status: 409, body: { error: "Message is no longer available; refresh the list" } }
+      - request: { method: POST, path: /admin/app/queue/failed/retry, body: { token: "00000000-0000-4000-8000-000000000000" } }
+        expect: { status: 409, body: { error: "Message is no longer available; refresh the list" } }
+
+  - name: bodies must be small JSON objects
+    tags: [edge, validation]
+    requests:
+      - { request: { method: POST, path: /admin/app/queue/failed/inspect, headers: { content-type: application/json }, raw: "{bad" }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - { request: { method: POST, path: /admin/app/queue/failed/retry, body: [ token ] }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - request: { method: POST, path: /admin/app/queue/failed/retry, body: { token: { $text: { repeat: a, count: 17000 } } } }
+        expect: { status: 413, body: { error: Request body too large } }

@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import { createApplication } from "@gsalgadotoledo/rt-app-framework";
 import { MemoryStore } from "@gsalgadotoledo/rt-app-dynamodb";
 import { LocalMailbox } from "@gsalgadotoledo/rt-app-auth";
+import { MemoryQueue } from "@gsalgadotoledo/rt-app-queue";
 import { localChoiceProvider } from "./node/choice.mjs";
 
 const app = createApplication({
@@ -16,6 +17,7 @@ const app = createApplication({
   // Choice is opt-in (no provider, no endpoint); the local provider is deterministic, see choice-api.
   choiceProvider: localChoiceProvider(),
   observerOutputs: [],
+  queueAdapter: new MemoryQueue(),
 });
 await app.migrate();
 

@@ -136,3 +136,18 @@ test("validation, broker failures and failed acknowledgements stay visible", asy
     broken.run(async () => {}, {}, new AbortController().signal),
   );
 });
+test("injected clock and jitter make createdAt and retry delays deterministic", async () => {
+  let now = Date.parse("2026-01-02T03:04:05.678Z");
+  const adapter = new MemoryQueue(10, 30, () => now),
+    queue = new Queue(adapter, { now: () => new Date(now), random: () => 0.999 });
+  await queue.send("x", 1, { id: "a" });
+  const [delivery] = await adapter.receive(1);
+  assert.equal(delivery.message.createdAt, "2026-01-02T03:04:05.678Z");
+  await delivery.retry(0);
+  await queue.workOnce(async () => { throw Error("again"); }, { baseDelaySeconds: 4, maxDelaySeconds: 60 });
+  // attempts 2 → min(60, 4 * 2) = 8 → floor(0.999 * 9) = 8 seconds
+  now += 7999;
+  assert.equal((await adapter.receive(1)).length, 0);
+  now += 1;
+  assert.equal((await adapter.receive(1))[0].attempts, 3);
+});

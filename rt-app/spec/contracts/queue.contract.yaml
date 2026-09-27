@@ -1,0 +1,816 @@
+contract: 1
+module: queue
+title: Queue (core worker + in-memory adapter)
+description: |
+  Queue (at-least-once worker, owner DLQ endpoints) over MemoryQueue (bounded, leased, in-memory
+  adapter). Other adapters (SQS, RabbitMQ) implement the same QueueAdapter surface: capabilities
+  {delayedRetry, leaseRenewal, durable, failedAdmin?}, publish(message), receive(limit) →
+  deliveries {message, attempts, ack(), retry(seconds), extend(seconds), deadLetter()}, and
+  optionally inspectFailures(limit) / retryFailure(token).
+
+  Message envelope {id, type, payload, createdAt, traceId?}. validateMessage(message), in order:
+    1. Invalid queue message (no status) unless: message is an object; id is a string, not blank
+       after JavaScript trim(), at most 200 UTF-16 units; type the same with 120; createdAt is a
+       string Date.parse accepts (ports accept the ECMAScript date-time format: YYYY[-MM[-DD]],
+       ±YYYYYY (not -000000), then optionally [Tt ]HH:mm[:ss[.fraction]] with hour 24 only as
+       24:00:00.000, then optionally Z/z or ±HH[:]mm; days 01-31 in any month; within ±8.64e15 ms);
+       traceId absent, or a string of at most 200 units (empty allowed; null is invalid).
+    2. The canonical JSON (the cache module's: keys sorted by UTF-16 units, JavaScript numbers)
+       of the whole message must be at most 240000 UTF-8 bytes: "Queue message exceeds 240 KB".
+    Returns JSON.parse(canonical(message)): unknown envelope fields are kept, numbers normalized.
+
+  MemoryQueue(capacity = 1000, leaseSeconds = 30, clock): integers >= 1, else "Invalid memory
+  queue limits". Entries keep publish order. There is no deduplication: the same id can be
+  pending twice.
+    publish: pending + leased entries >= capacity → "Queue capacity exceeded" (checked before the
+      message is validated); the entry is visible from now (available = now).
+    receive(limit): limit an integer 1-10 else "Invalid receive limit". Returns the first `limit`
+      entries (publish order, not availability order) with available <= now; each gets a new
+      receipt, attempts + 1, available = now + lease, and a deep copy of the message.
+    A delivery is stale when its receipt was replaced (redelivered or retried), its entry is gone
+      (acked, dead-lettered), or available <= now (the lease ended, exactly at the boundary):
+      every operation then fails "Stale queue receipt" before checking its argument.
+    ack(): removes the entry. retry(s)/extend(s): s an integer 0-43200 else "Invalid visibility
+      delay"; retry clears the receipt (the delivery becomes stale) and sets available = now + s;
+      extend keeps the receipt and sets available = now + s (it can shorten; 0 ends the lease).
+    deadLetter(): dead letters >= capacity → "Dead-letter capacity exceeded" (the entry stays
+      leased); else appends {token: random UUID v4, message} and removes the entry.
+    inspectFailures(limit): validateFailureLimit (400 "Limit must be between 1 and 10"), then the
+      first `limit` dead letters {token, id, message, retryable: true}; nothing is removed.
+    retryFailure(token): unknown → 409 "Message is no longer available; refresh the list";
+      pending + leased >= capacity → 409 "Queue capacity exceeded"; else appended as a new entry
+      (attempts 0, visible now) and removed from the dead letters (a token works once).
+    deadLetters(): copies of the dead-lettered messages.
+
+  Queue(adapter, {now, random}):
+    send(type, payload, {id?, traceId?}) → id: id ?? random UUID v4, createdAt = the clock as
+      toISOString(), traceId only when truthy; validated, then published.
+    workOnce(handler, options): concurrency (4) 1-10, maxAttempts (5) >= 1, baseDelaySeconds (1)
+      and maxDelaySeconds (60) 0-43200, all integers, base <= max, else "Invalid worker limits";
+      then "Worker already receiving" while another workOnce of the same Queue runs; then
+      receive(concurrency). Every delivery runs the handler concurrently. Success → ack. Failure
+      → attempts >= maxAttempts ? deadLetter : retry(delay) with delay = delayedRetry ?
+      floor(random() * (min(max, base * 2^min(attempts - 1, 20)) + 1)) : 0. Settlement errors
+      are collected after all deliveries settle: "Queue settlement failed". Returns the number of
+      deliveries.
+    run(handler, options, signal): idleMs (250) finite and >= 1 else "Invalid poll interval";
+      then workOnce until aborted, sleeping idleMs when nothing was received; errors after an
+      abort are swallowed.
+    Endpoints (owner): GET /queue/status (queue.read) → {supported: capabilities.failedAdmin ===
+      true, capabilities}; POST /queue/failed/inspect (queue.inspect) body {limit = 10}: 501
+      "Failed-message inspection is not configured" when unsupported, 400 "Limit must be between
+      1 and 10", → {items}; POST /queue/failed/retry (queue.retry) body {token}: 501
+      "Failed-message retry is not configured", 400 "Invalid retry token" (not a non-empty
+      string of at most 400000 units), → {queued: true}.
+
+  Facade (subject queue): init {now: ISO, capacity?, leaseSeconds?, random? (fixed jitter),
+  capabilities? (replaces the declared capabilities)}. The facade numbers every delivery it sees
+  (receive, workOnce, run) 0, 1, 2…: receive returns [{delivery, attempts, message}] and
+  ack/retry/extend/deadLetter take that number. workOnce(outcomes, options) and run(outcomes,
+  options, stopAfter) use a handler driven by outcomes[messageId]: "ok" (default), "fail"
+  (throws), "ack" (acks itself, so the worker's ack is stale), "nested" (calls workOnce inside and
+  logs its error); run aborts after stopAfter handled messages (0: before it starts). handled()
+  lists {delivery, id, attempts, nested?} in delivery order. status/inspect/retryFailed call the
+  endpoint handlers (null body = {}). setNow(iso) moves the clock.
+subject: queue
+init: { now: "2026-01-02T03:04:05.678Z", random: 0.999999 }
+cases:
+  # --- construction -----------------------------------------------------------------------
+  - name: the memory adapter declares its capabilities
+    steps:
+      - { call: capabilities, expect: { value: { delayedRetry: true, leaseRenewal: true, durable: false, failedAdmin: true } } }
+      - { call: status, expect: { value: { supported: true, capabilities: { delayedRetry: true, leaseRenewal: true, durable: false, failedAdmin: true } } } }
+
+  - name: capacity must be a positive integer (0)
+    tags: [ validation ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: 0 }
+    create: { error: { status: null, message: Invalid memory queue limits } }
+  - name: capacity must be a positive integer (1.5)
+    tags: [ validation ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: 1.5 }
+    create: { error: { status: null, message: Invalid memory queue limits } }
+  - name: capacity must be a positive integer (string)
+    tags: [ validation ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: "10" }
+    create: { error: { status: null, message: Invalid memory queue limits } }
+  - name: capacity must be a positive integer (boolean)
+    tags: [ validation ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: true }
+    create: { error: { status: null, message: Invalid memory queue limits } }
+  - name: the lease must be a positive integer (0)
+    tags: [ validation ]
+    init: { now: "2026-01-02T03:04:05.678Z", leaseSeconds: 0 }
+    create: { error: { status: null, message: Invalid memory queue limits } }
+  - name: the lease must be a positive integer (-1)
+    tags: [ validation ]
+    init: { now: "2026-01-02T03:04:05.678Z", leaseSeconds: -1 }
+    create: { error: { status: null, message: Invalid memory queue limits } }
+  - name: the lease must be a positive integer (2.5)
+    tags: [ validation ]
+    init: { now: "2026-01-02T03:04:05.678Z", leaseSeconds: 2.5 }
+    create: { error: { status: null, message: Invalid memory queue limits } }
+  - name: integral floats are integers
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: 2.0, leaseSeconds: 1.0 }
+    steps:
+      - { call: capabilities, expect: { value: { $partial: { durable: false } } } }
+
+  # --- validateMessage ----------------------------------------------------------------------
+  - name: a valid message is returned as a normalized copy
+    tags: [ validation, canonical ]
+    steps:
+      - call: validateMessage
+        args: [ { id: m1, type: email, payload: { z: [ 1.0, -0, 1e+21 ], a: { "": "é" } }, createdAt: "2026-01-02T03:04:05.678Z", traceId: t-1 } ]
+        expect: { value: { id: m1, type: email, payload: { a: { "": "é" }, z: [ 1, 0, 1e+21 ] }, createdAt: "2026-01-02T03:04:05.678Z", traceId: t-1 } }
+
+  - name: unknown envelope fields are kept and the payload is optional
+    tags: [ validation ]
+    steps:
+      - call: validateMessage
+        args: [ { id: m1, type: email, createdAt: "2026-01-02T03:04:05.678Z", extra: { b: [ true, null ] } } ]
+        expect: { value: { id: m1, type: email, createdAt: "2026-01-02T03:04:05.678Z", extra: { b: [ true, null ] } } }
+      - call: validateMessage
+        args: [ { id: m1, type: email, createdAt: "2026-01-02T03:04:05.678Z", payload: [ null, "x", 2.5, {} ] } ]
+        expect: { value: { $partial: { payload: [ null, "x", 2.5, {} ] } } }
+
+  - name: messages must be objects
+    tags: [ validation ]
+    steps:
+      - { call: validateMessage, args: [ null ], expect: { error: { status: null, message: Invalid queue message } } }
+      - { call: validateMessage, args: [ "m1" ], expect: { error: { status: null, message: Invalid queue message } } }
+      - { call: validateMessage, args: [ 5 ], expect: { error: { status: null, message: Invalid queue message } } }
+      - { call: validateMessage, args: [ [] ], expect: { error: { status: null, message: Invalid queue message } } }
+      - { call: validateMessage, args: [ {} ], expect: { error: { status: null, message: Invalid queue message } } }
+
+  - name: ids are non-blank strings of at most 200 UTF-16 units
+    tags: [ validation, unicode ]
+    steps:
+      - { call: validateMessage, args: [ { type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: 5, type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: null, type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: "", type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: " \t\n", type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: "\u00a0\u3000\ufeff\u2028", type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } }, note: JavaScript trim() removes NBSP, U+3000, U+FEFF and U+2028 }
+      - { call: validateMessage, args: [ { id: "\u200b", type: t, createdAt: "2026-01-02" } ], expect: { value: { $partial: { id: "\u200b" } } }, note: U+200B is not whitespace }
+      - { call: validateMessage, args: [ { id: "\u0085", type: t, createdAt: "2026-01-02" } ], expect: { value: { $partial: { id: "\u0085" } } }, note: U+0085 is not trimmed }
+      - { call: validateMessage, args: [ { id: "  padded  ", type: t, createdAt: "2026-01-02" } ], expect: { value: { $partial: { id: "  padded  " } } }, note: ids are not trimmed }
+      - { call: validateMessage, args: [ { id: { $text: { repeat: a, count: 200 } }, type: t, createdAt: "2026-01-02" } ], expect: { value: { $partial: { type: t } } } }
+      - { call: validateMessage, args: [ { id: { $text: { repeat: a, count: 201 } }, type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: { $text: { repeat: "😀", count: 100 } }, type: t, createdAt: "2026-01-02" } ], expect: { value: { $partial: { type: t } } }, note: 200 UTF-16 units }
+      - { call: validateMessage, args: [ { id: { $text: { repeat: "😀é", count: 67 } }, type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } }, note: 201 UTF-16 units }
+
+  - name: types are non-blank strings of at most 120 UTF-16 units
+    tags: [ validation, unicode ]
+    steps:
+      - { call: validateMessage, args: [ { id: m, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: true, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: "  ", createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: { $text: { repeat: b, count: 120 } }, createdAt: "2026-01-02" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: { $text: { repeat: b, count: 121 } }, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: { $text: { repeat: "😀", count: 60 } }, createdAt: "2026-01-02" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: { $text: { repeat: "😀é", count: 40 } }, createdAt: "2026-01-02" } ], expect: { value: { $partial: { id: m } } }, note: 120 units }
+      - { call: validateMessage, args: [ { id: m, type: { $text: { repeat: "é😀", count: 41 } }, createdAt: "2026-01-02" } ], expect: { error: { message: Invalid queue message } }, note: 123 units }
+
+  - name: trace ids are optional strings of at most 200 UTF-16 units
+    tags: [ validation ]
+    steps:
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02", traceId: "" } ], expect: { value: { id: m, type: t, createdAt: "2026-01-02", traceId: "" } }, note: an empty trace id is kept }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02", traceId: { $text: { repeat: c, count: 200 } } } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02", traceId: { $text: { repeat: c, count: 201 } } } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02", traceId: null } ], expect: { error: { message: Invalid queue message } }, note: a present null trace id is invalid }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02", traceId: 7 } ], expect: { error: { message: Invalid queue message } } }
+
+  - name: createdAt accepts the ECMAScript date-time formats
+    tags: [ validation, dates ]
+    steps:
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.678Z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05Z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04Z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "+002026-01-02T00:00:00Z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.678+02:00" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05+0200" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05" } ], expect: { value: { $partial: { id: m } } }, note: local time }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.6789Z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02 03:04:05Z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02t03:04:05z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-02-30" } ], expect: { value: { $partial: { id: m } } }, note: days roll over }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T24:00:00Z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01Z" } ], expect: { value: { $partial: { id: m } } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "-271821-04-20T00:00:00Z" } ], expect: { value: { $partial: { id: m } } } }
+
+  - name: createdAt rejects other strings and values
+    tags: [ validation, dates ]
+    steps:
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "not a date" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-13-01" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-00-01" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-32" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-00" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T25:00:00Z" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T24:00:01Z" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:60Z" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:60Z" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03Z" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.Z" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05+24:00" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.678Zjunk" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "20260102" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "-000000-01-01T00:00:00Z" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "+275760-09-13T00:00:00.001Z" } ], expect: { error: { message: Invalid queue message } }, note: out of the Date range }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: "-271821-04-19T23:59:59.999Z" } ], expect: { error: { message: Invalid queue message } } }
+      - { call: validateMessage, args: [ { id: m, type: t, createdAt: 1767323045678 } ], expect: { error: { message: Invalid queue message } }, note: epoch numbers are not accepted }
+      - { call: validateMessage, args: [ { id: m, type: t } ], expect: { error: { message: Invalid queue message } } }
+
+  - name: the canonical message is limited to 240000 UTF-8 bytes
+    tags: [ validation, limits ]
+    steps:
+      - call: validateMessage
+        args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.678Z", payload: { $text: { repeat: x, count: 239927 } } } ]
+        expect: { value: { $partial: { id: m } } }
+        note: 73 bytes of envelope + 239927 = 240000
+      - call: validateMessage
+        args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.678Z", payload: { $text: { repeat: x, count: 239928 } } } ]
+        expect: { error: { status: null, message: Queue message exceeds 240 KB } }
+      - call: validateMessage
+        args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.678Z", payload: { $text: { repeat: "é", count: 119963 } } } ]
+        expect: { value: { $partial: { id: m } } }
+        note: 239999 bytes
+      - call: validateMessage
+        args: [ { id: m, type: t, createdAt: "2026-01-02T03:04:05.678Z", payload: { $text: { repeat: "é", count: 119964 } } } ]
+        expect: { error: { message: Queue message exceeds 240 KB } }
+      - call: validateMessage
+        args: [ { id: "", type: t, createdAt: "2026-01-02T03:04:05.678Z", payload: { $text: { repeat: x, count: 240000 } } } ]
+        expect: { error: { message: Invalid queue message } }
+        note: the envelope is checked first
+
+  # --- publish and receive ------------------------------------------------------------------
+  - name: a published message is delivered once until its lease ends
+    steps:
+      - { call: publish, args: [ { id: m1, type: email, payload: { n: 1 }, createdAt: "2026-01-01T00:00:00Z" } ], expect: { value: null } }
+      - call: receive
+        args: [ 1 ]
+        expect: { value: [ { delivery: 0, attempts: 1, message: { id: m1, type: email, payload: { n: 1 }, createdAt: "2026-01-01T00:00:00Z" } } ] }
+      - { call: receive, args: [ 10 ], expect: { value: [] } }
+      - { call: ack, args: [ 0 ], expect: { value: null } }
+      - { call: setNow, args: [ "2026-01-02T03:05:05.678Z" ], expect: { value: null } }
+      - { call: receive, args: [ 10 ], expect: { value: [] }, note: acknowledged messages are gone }
+
+  - name: receive returns visible messages in publish order up to the limit
+    tags: [ ordering ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m3, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - call: receive
+        args: [ 2 ]
+        expect: { value: [ { delivery: 0, attempts: 1, message: { $partial: { id: m1 } } }, { delivery: 1, attempts: 1, message: { $partial: { id: m2 } } } ] }
+      - call: receive
+        args: [ 2 ]
+        expect: { value: [ { delivery: 2, attempts: 1, message: { $partial: { id: m3 } } } ] }
+
+  - name: at most 10 messages are received at once
+    tags: [ limits ]
+    steps:
+      - { call: publish, args: [ { id: m01, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m02, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m03, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m04, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m05, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m06, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m07, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m08, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m09, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m10, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m11, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 10 ], expect: { value: { $length: 10 } } }
+      - { call: receive, args: [ 10 ], expect: { value: [ { delivery: 10, attempts: 1, message: { $partial: { id: m11 } } } ] } }
+
+  - name: the receive limit is an integer from 1 to 10
+    tags: [ validation ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 0 ], expect: { error: { status: null, message: Invalid receive limit } } }
+      - { call: receive, args: [ 11 ], expect: { error: { message: Invalid receive limit } } }
+      - { call: receive, args: [ 1.5 ], expect: { error: { message: Invalid receive limit } } }
+      - { call: receive, args: [ "1" ], expect: { error: { message: Invalid receive limit } } }
+      - { call: receive, args: [ null ], expect: { error: { message: Invalid receive limit } } }
+      - { call: receive, args: [ -1 ], expect: { error: { message: Invalid receive limit } } }
+      - { call: receive, args: [ 10.0 ], expect: { value: [ { delivery: 0, attempts: 1, message: { $partial: { id: m1 } } } ] }, note: nothing was consumed by the rejected calls }
+
+  - name: there is no deduplication; the same id can be pending twice
+    tags: [ deduplication ]
+    steps:
+      - { call: publish, args: [ { id: same, type: t, payload: 1, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: same, type: t, payload: 2, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - call: receive
+        args: [ 10 ]
+        expect: { value: [ { delivery: 0, attempts: 1, message: { $partial: { id: same, payload: 1 } } }, { delivery: 1, attempts: 1, message: { $partial: { id: same, payload: 2 } } } ] }
+
+  - name: publish validates and normalizes the message
+    tags: [ validation ]
+    steps:
+      - { call: publish, args: [ { id: "", type: t, createdAt: "2026-01-02" } ], expect: { error: { status: null, message: Invalid queue message } } }
+      - { call: publish, args: [ null ], expect: { error: { message: Invalid queue message } } }
+      - { call: publish, args: [ { id: m, type: t, createdAt: "2026-01-02", payload: { b: 1.0, a: -0 }, x: 1 } ], expect: { value: null } }
+      - { call: receive, args: [ 10 ], expect: { value: [ { delivery: 0, attempts: 1, message: { id: m, type: t, createdAt: "2026-01-02", payload: { a: 0, b: 1 }, x: 1 } } ] } }
+
+  - name: capacity counts pending and leased messages and is checked before validation
+    tags: [ limits ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: 2 }
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m3, type: t, createdAt: "2026-01-02" } ], expect: { error: { status: null, message: Queue capacity exceeded } } }
+      - { call: publish, args: [ { id: "", type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Queue capacity exceeded } } }
+      - { call: receive, args: [ 1 ], expect: { value: { $length: 1 } } }
+      - { call: publish, args: [ { id: m3, type: t, createdAt: "2026-01-02" } ], expect: { error: { message: Queue capacity exceeded } }, note: leased messages still count }
+      - { call: ack, args: [ 0 ], expect: { value: null } }
+      - { call: publish, args: [ { id: m3, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+
+  - name: a message becomes visible at its publish time
+    tags: [ time ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: setNow, args: [ "2026-01-02T03:04:05.677Z" ], expect: { value: null } }
+      - { call: receive, args: [ 10 ], expect: { value: [] } }
+      - { call: setNow, args: [ "2026-01-02T03:04:05.678Z" ], expect: { value: null } }
+      - { call: receive, args: [ 10 ], expect: { value: { $length: 1 } } }
+
+  # --- leases (visibility timeouts) ----------------------------------------------------------
+  - name: an expired lease redelivers the message and stales the old delivery
+    tags: [ lease, time ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { $partial: { id: m1 } } } ] } }
+      - { call: setNow, args: [ "2026-01-02T03:04:35.677Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [] }, note: 30 s lease minus 1 ms }
+      - { call: setNow, args: [ "2026-01-02T03:04:35.678Z" ], expect: { value: null } }
+      - { call: ack, args: [ 0 ], expect: { error: { status: null, message: Stale queue receipt } }, note: the lease ends exactly at its expiry }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 2, message: { $partial: { id: m1 } } } ] } }
+      - { call: ack, args: [ 0 ], expect: { error: { message: Stale queue receipt } } }
+      - { call: ack, args: [ 1 ], expect: { value: null } }
+      - { call: ack, args: [ 1 ], expect: { error: { message: Stale queue receipt } }, note: an acknowledged delivery is stale }
+
+  - name: a delivery works until the last millisecond of its lease
+    tags: [ lease, time ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: setNow, args: [ "2026-01-02T03:04:35.677Z" ], expect: { value: null } }
+      - { call: ack, args: [ 0 ], expect: { value: null } }
+
+  - name: the lease length is configurable
+    tags: [ lease, time ]
+    init: { now: "2026-01-02T03:04:05.678Z", leaseSeconds: 5 }
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: setNow, args: [ "2026-01-02T03:04:10.677Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [] } }
+      - { call: setNow, args: [ "2026-01-02T03:04:10.678Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 2, message: { $partial: { id: m1 } } } ] } }
+
+  - name: extend renews the lease from now and can shorten it
+    tags: [ lease, time ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: extend, args: [ 0, 60 ], expect: { value: null } }
+      - { call: setNow, args: [ "2026-01-02T03:05:05.677Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [] } }
+      - { call: extend, args: [ 0, 1 ], expect: { value: null }, note: extend(1) from here }
+      - { call: setNow, args: [ "2026-01-02T03:05:06.677Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: { $length: 1 } } }
+
+  - name: extend(0) ends the lease at once
+    tags: [ lease ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: extend, args: [ 0, 0 ], expect: { value: null } }
+      - { call: ack, args: [ 0 ], expect: { error: { message: Stale queue receipt } } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 2, message: { $partial: { id: m1 } } } ] } }
+
+  - name: visibility delays are integers from 0 to 43200 seconds
+    tags: [ validation, lease ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: extend, args: [ 0, -1 ], expect: { error: { status: null, message: Invalid visibility delay } } }
+      - { call: extend, args: [ 0, 1.5 ], expect: { error: { message: Invalid visibility delay } } }
+      - { call: extend, args: [ 0, 43201 ], expect: { error: { message: Invalid visibility delay } } }
+      - { call: extend, args: [ 0, "5" ], expect: { error: { message: Invalid visibility delay } } }
+      - { call: extend, args: [ 0, null ], expect: { error: { message: Invalid visibility delay } } }
+      - { call: retry, args: [ 0, -1 ], expect: { error: { message: Invalid visibility delay } } }
+      - { call: retry, args: [ 0, 43200.5 ], expect: { error: { message: Invalid visibility delay } } }
+      - { call: extend, args: [ 0, 43200 ], expect: { value: null } }
+      - { call: setNow, args: [ "2026-01-02T15:04:05.677Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [] } }
+      - { call: setNow, args: [ "2026-01-02T15:04:05.678Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: { $length: 1 } } }
+
+  - name: a stale receipt is reported before an invalid delay
+    tags: [ validation, lease ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: ack, args: [ 0 ], expect: { value: null } }
+      - { call: extend, args: [ 0, -1 ], expect: { error: { message: Stale queue receipt } } }
+      - { call: retry, args: [ 0, 1.5 ], expect: { error: { message: Stale queue receipt } } }
+      - { call: deadLetter, args: [ 0 ], expect: { error: { message: Stale queue receipt } } }
+
+  # --- retry -------------------------------------------------------------------------------
+  - name: retry hides the message for the delay and stales the delivery
+    tags: [ retry, time ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: retry, args: [ 0, 5 ], expect: { value: null } }
+      - { call: ack, args: [ 0 ], expect: { error: { message: Stale queue receipt } }, note: retry gives the message back }
+      - { call: retry, args: [ 0, 5 ], expect: { error: { message: Stale queue receipt } } }
+      - { call: setNow, args: [ "2026-01-02T03:04:10.677Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [] } }
+      - { call: setNow, args: [ "2026-01-02T03:04:10.678Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 2, message: { $partial: { id: m1 } } } ] } }
+
+  - name: retry(0) makes the message visible at once
+    tags: [ retry ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: retry, args: [ 0, 0 ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 2, message: { $partial: { id: m1 } } } ] } }
+
+  - name: a retried message keeps its publish position
+    tags: [ retry, ordering ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { $partial: { id: m1 } } } ] } }
+      - { call: retry, args: [ 0, 10 ], expect: { value: null } }
+      - { call: setNow, args: [ "2026-01-02T03:04:15.678Z" ], expect: { value: null } }
+      - call: receive
+        args: [ 10 ]
+        expect: { value: [ { delivery: 1, attempts: 2, message: { $partial: { id: m1 } } }, { delivery: 2, attempts: 1, message: { $partial: { id: m2 } } } ] }
+        note: order is publish order, not the order in which messages became visible
+
+  # --- dead letters ---------------------------------------------------------------------------
+  - name: deadLetter moves the message to the dead letters
+    tags: [ dead-letter ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: email, payload: { n: 1 }, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, payload: { n: 1 }, type: email } } ] } }
+      - { call: deadLetter, args: [ 0 ], expect: { value: null } }
+      - { call: deadLetter, args: [ 0 ], expect: { error: { message: Stale queue receipt } } }
+      - { call: deadLetters, expect: { value: [ { id: m1, type: email, payload: { n: 1 }, createdAt: "2026-01-02" } ] } }
+      - call: inspectFailures
+        args: [ 10 ]
+        expect:
+          value:
+            - token: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+              id: m1
+              message: { id: m1, type: email, payload: { n: 1 }, createdAt: "2026-01-02" }
+              retryable: true
+              expiresAt: null
+      - { call: inspectFailures, args: [ 10 ], expect: { value: { $length: 1 } }, note: inspection removes nothing }
+      - { call: setNow, args: [ "2026-01-03T00:00:00Z" ], expect: { value: null } }
+      - { call: receive, args: [ 10 ], expect: { value: [] } }
+
+  - name: dead letters are bounded by the capacity; the message stays leased
+    tags: [ dead-letter, limits ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: 1 }
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: deadLetter, args: [ 0 ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 1, message: { createdAt: 2026-01-02, id: m2, type: t } } ] } }
+      - { call: deadLetter, args: [ 1 ], expect: { error: { status: null, message: Dead-letter capacity exceeded } } }
+      - { call: ack, args: [ 1 ], expect: { value: null }, note: the delivery is still valid }
+      - { call: deadLetters, expect: { value: [ { $partial: { id: m1 } } ] } }
+
+  - name: inspection lists the oldest dead letters up to the limit
+    tags: [ dead-letter, ordering ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m3, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 3 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } }, { delivery: 1, attempts: 1, message: { createdAt: 2026-01-02, id: m2, type: t } }, { delivery: 2, attempts: 1, message: { createdAt: 2026-01-02, id: m3, type: t } } ] } }
+      - { call: deadLetter, args: [ 2 ], expect: { value: null } }
+      - { call: deadLetter, args: [ 0 ], expect: { value: null } }
+      - { call: deadLetter, args: [ 1 ], expect: { value: null } }
+      - { call: inspectFailures, args: [ 2 ], expect: { value: [ { $partial: { id: m3 } }, { $partial: { id: m1 } } ] } }
+      - { call: deadLetters, expect: { value: [ { $partial: { id: m3 } }, { $partial: { id: m1 } }, { $partial: { id: m2 } } ] } }
+
+  - name: inspection limits are integers from 1 to 10
+    tags: [ validation, dead-letter ]
+    steps:
+      - { call: inspectFailures, args: [ 0 ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: inspectFailures, args: [ 11 ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: inspectFailures, args: [ 2.5 ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: inspectFailures, args: [ "3" ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: inspectFailures, args: [ null ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: inspectFailures, args: [ 1 ], expect: { value: [] } }
+      - { call: validateFailureLimit, args: [ 10 ], expect: { value: null } }
+      - { call: validateFailureLimit, args: [ 10.5 ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: validateFailureLimit, args: [ true ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+
+  - name: retryFailure requeues a dead letter once with fresh attempts at the end
+    tags: [ dead-letter, ordering, idempotency ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: retry, args: [ 0, 0 ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { $partial: { attempts: 2 } } ] } }
+      - { call: deadLetter, args: [ 1 ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: inspectFailures, args: [ 1 ], expect: { value: [ { token: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }, id: m1, message: { $partial: { id: m1 } }, retryable: true } ] } }
+      - { call: retryFailure, args: [ { $ref: "6.value[0].token" } ], expect: { value: null } }
+      - { call: retryFailure, args: [ { $ref: "6.value[0].token" } ], expect: { error: { status: 409, message: "Message is no longer available; refresh the list" } }, note: a token works once }
+      - { call: deadLetters, expect: { value: [] } }
+      - call: receive
+        args: [ 10 ]
+        expect: { value: [ { delivery: 2, attempts: 1, message: { $partial: { id: m2 } } }, { delivery: 3, attempts: 1, message: { $partial: { id: m1 } } } ] }
+
+  - name: unknown tokens are not available
+    tags: [ dead-letter ]
+    steps:
+      - { call: retryFailure, args: [ nope ], expect: { error: { status: 409, message: "Message is no longer available; refresh the list" } } }
+      - { call: retryFailure, args: [ 5 ], expect: { error: { status: 409, message: "Message is no longer available; refresh the list" } } }
+      - { call: retryFailure, args: [ null ], expect: { error: { status: 409, message: "Message is no longer available; refresh the list" } } }
+
+  - name: retryFailure respects the capacity and keeps the dead letter
+    tags: [ dead-letter, limits ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: 1 }
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: deadLetter, args: [ 0 ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: inspectFailures, args: [ 1 ], expect: { value: [ { token: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }, id: m1, message: { $partial: { id: m1 } }, retryable: true } ] } }
+      - { call: retryFailure, args: [ { $ref: "4.value[0].token" } ], expect: { error: { status: 409, message: Queue capacity exceeded } } }
+      - { call: inspectFailures, args: [ 1 ], expect: { value: [ { token: { $ref: "4.value[0].token" }, id: m1, message: { $partial: { id: m1 } }, retryable: true } ] } }
+
+  # --- send ----------------------------------------------------------------------------------
+  - name: send stamps createdAt from the clock and returns the id
+    tags: [ send, time ]
+    steps:
+      - { call: send, args: [ email, { to: a }, { id: job-1, traceId: trace-1 } ], expect: { value: job-1 } }
+      - { call: setNow, args: [ "2026-01-02T03:04:06Z" ], expect: { value: null } }
+      - { call: send, args: [ sms, null, null ], expect: { value: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" } } }
+      - call: receive
+        args: [ 10 ]
+        expect:
+          value:
+            - { delivery: 0, attempts: 1, message: { id: job-1, type: email, payload: { to: a }, createdAt: "2026-01-02T03:04:05.678Z", traceId: trace-1 } }
+            - { delivery: 1, attempts: 1, message: { id: { $ref: "2.value" }, type: sms, payload: null, createdAt: "2026-01-02T03:04:06.000Z" } }
+
+  - name: send drops empty trace ids and defaults a null id
+    tags: [ send ]
+    steps:
+      - { call: send, args: [ t, 1, { id: a, traceId: "" } ], expect: { value: a } }
+      - { call: send, args: [ t, 2, { id: null, traceId: null } ], expect: { value: { $type: string } } }
+      - call: receive
+        args: [ 10 ]
+        expect: { value: [ { delivery: 0, attempts: 1, message: { id: a, type: t, payload: 1, createdAt: "2026-01-02T03:04:05.678Z" } }, { $partial: { message: { $partial: { payload: 2, traceId: null } } } } ] }
+      - { call: validateMessage, args: [ { $ref: "2.value[0].message" } ], expect: { value: { id: a, type: t, payload: 1, createdAt: "2026-01-02T03:04:05.678Z" } } }
+
+  - name: send validates before publishing
+    tags: [ send, validation ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: 1 }
+    steps:
+      - { call: send, args: [ t, 1, { id: "" } ], expect: { error: { status: null, message: Invalid queue message } }, note: an empty id is kept and rejected }
+      - { call: send, args: [ " ", 1, null ], expect: { error: { message: Invalid queue message } } }
+      - { call: send, args: [ t, 1, { traceId: { $text: { repeat: z, count: 201 } } } ], expect: { error: { message: Invalid queue message } } }
+      - { call: send, args: [ t, { $text: { repeat: x, count: 240000 } }, null ], expect: { error: { message: Queue message exceeds 240 KB } } }
+      - { call: send, args: [ t, 1, { id: first } ], expect: { value: first } }
+      - { call: send, args: [ "", 1, null ], expect: { error: { message: Invalid queue message } }, note: validation runs before the capacity check }
+      - { call: send, args: [ t, 1, null ], expect: { error: { message: Queue capacity exceeded } } }
+
+  # --- workOnce ------------------------------------------------------------------------------
+  - name: workOnce acknowledges handled messages
+    tags: [ worker ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ null, null ], expect: { value: 2 } }
+      - { call: handled, expect: { value: [ { delivery: 0, id: m1, attempts: 1 }, { delivery: 1, id: m2, attempts: 1 } ] } }
+      - { call: setNow, args: [ "2026-01-03T00:00:00Z" ], expect: { value: null } }
+      - { call: receive, args: [ 10 ], expect: { value: [] } }
+      - { call: workOnce, args: [ null, {} ], expect: { value: 0 }, note: an empty queue }
+
+  - name: workOnce receives at most `concurrency` messages
+    tags: [ worker, limits ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m3, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m4, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m5, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ null, null ], expect: { value: 4 }, note: the default concurrency is 4 }
+      - { call: workOnce, args: [ null, null ], expect: { value: 1 } }
+      - { call: publish, args: [ { id: m6, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m7, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ null, { concurrency: 1 } ], expect: { value: 1 } }
+      - { call: handled, expect: { value: { $length: 6 } } }
+
+  - name: a failed message is retried with exponential jittered backoff
+    tags: [ worker, retry, time ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, null ], expect: { value: 1 } }
+      - { call: setNow, args: [ "2026-01-02T03:04:06.677Z" ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, null ], expect: { value: 0 }, note: "floor(0.999999 * (min(60, 1 * 2^0) + 1)) = 1 s" }
+      - { call: setNow, args: [ "2026-01-02T03:04:06.678Z" ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, null ], expect: { value: 1 } }
+      - { call: setNow, args: [ "2026-01-02T03:04:08.677Z" ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, null ], expect: { value: 0 }, note: "attempts 2: floor(0.999999 * (2 + 1)) = 2 s" }
+      - { call: setNow, args: [ "2026-01-02T03:04:08.678Z" ], expect: { value: null } }
+      - { call: workOnce, args: [ null, null ], expect: { value: 1 } }
+      - { call: handled, expect: { value: [ { delivery: 0, id: m1, attempts: 1 }, { delivery: 1, id: m1, attempts: 2 }, { delivery: 2, id: m1, attempts: 3 } ] } }
+      - { call: deadLetters, expect: { value: [] } }
+
+  - name: the backoff is capped at maxDelaySeconds
+    tags: [ worker, retry, time ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: retry, args: [ 0, 0 ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 2, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: retry, args: [ 1, 0 ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, { baseDelaySeconds: 10, maxDelaySeconds: 15 } ], expect: { value: 1 }, note: "attempts 3: min(15, 10 * 4) = 15, floor(0.999999 * 16) = 15 s" }
+      - { call: setNow, args: [ "2026-01-02T03:04:20.677Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [] } }
+      - { call: setNow, args: [ "2026-01-02T03:04:20.678Z" ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 3, attempts: 4, message: { $partial: { id: m1 } } } ] } }
+
+  - name: zero jitter retries at once
+    tags: [ worker, retry ]
+    init: { now: "2026-01-02T03:04:05.678Z", random: 0 }
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, { baseDelaySeconds: 60, maxDelaySeconds: 60 } ], expect: { value: 1 } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 2, message: { $partial: { id: m1 } } } ] } }
+
+  - name: adapters without delayed retry retry at once
+    tags: [ worker, retry ]
+    init: { now: "2026-01-02T03:04:05.678Z", random: 0.999999, capabilities: { delayedRetry: false, leaseRenewal: true, durable: false, failedAdmin: true } }
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, { baseDelaySeconds: 60, maxDelaySeconds: 60 } ], expect: { value: 1 } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 2, message: { $partial: { id: m1 } } } ] } }
+
+  - name: messages that reach maxAttempts are dead-lettered
+    tags: [ worker, dead-letter ]
+    init: { now: "2026-01-02T03:04:05.678Z", random: 0 }
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, { maxAttempts: 2 } ], expect: { value: 2 } }
+      - { call: workOnce, args: [ { m1: fail }, { maxAttempts: 2 } ], expect: { value: 1 } }
+      - { call: deadLetters, expect: { value: [ { $partial: { id: m1 } } ] } }
+      - { call: workOnce, args: [ { m1: fail }, { maxAttempts: 2 } ], expect: { value: 0 } }
+      - { call: handled, expect: { value: [ { delivery: 0, id: m1, attempts: 1 }, { delivery: 1, id: m2, attempts: 1 }, { delivery: 2, id: m1, attempts: 2 } ] } }
+
+  - name: maxAttempts 1 dead-letters on the first failure
+    tags: [ worker, dead-letter ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, { maxAttempts: 1 } ], expect: { value: 1 } }
+      - { call: deadLetters, expect: { value: [ { $partial: { id: m1 } } ] } }
+
+  - name: worker limits are validated before anything is received
+    tags: [ worker, validation ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ null, { concurrency: 0 } ], expect: { error: { status: null, message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { concurrency: 11 } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { concurrency: 1.5 } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { concurrency: "4" } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { maxAttempts: 0 } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { maxAttempts: 2.5 } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { maxAttempts: true } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { baseDelaySeconds: -1 } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { baseDelaySeconds: 0.5 } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { maxDelaySeconds: 43201 } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: workOnce, args: [ null, { baseDelaySeconds: 61 } ], expect: { error: { message: Invalid worker limits } }, note: base > the default max 60 }
+      - { call: workOnce, args: [ null, { baseDelaySeconds: 5, maxDelaySeconds: 4 } ], expect: { error: { message: Invalid worker limits } } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { $partial: { id: m1 } } } ] } }
+      - { call: retry, args: [ 0, 0 ], expect: { value: null } }
+      - { call: workOnce, args: [ null, { concurrency: 10, maxAttempts: 1000000000, baseDelaySeconds: 0, maxDelaySeconds: 43200 } ], expect: { value: 1 } }
+      - { call: workOnce, args: [ null, { concurrency: null, maxAttempts: null, baseDelaySeconds: null, maxDelaySeconds: null } ], expect: { value: 0 }, note: null options take the defaults }
+
+  - name: a failed acknowledgement surfaces after every delivery settles
+    tags: [ worker ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: ack }, null ], expect: { error: { status: null, message: Queue settlement failed } } }
+      - { call: setNow, args: [ "2026-01-03T00:00:00Z" ], expect: { value: null } }
+      - { call: receive, args: [ 10 ], expect: { value: [] }, note: m1 was acknowledged by its handler and m2 by the worker }
+      - { call: workOnce, args: [ null, null ], expect: { value: 0 }, note: the worker is free again }
+
+  - name: a failed dead-letter surfaces as a settlement failure
+    tags: [ worker, dead-letter, limits ]
+    init: { now: "2026-01-02T03:04:05.678Z", capacity: 1 }
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: fail }, { maxAttempts: 1 } ], expect: { value: 1 } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m2: fail }, { maxAttempts: 1 } ], expect: { error: { message: Queue settlement failed } } }
+      - { call: deadLetters, expect: { value: [ { $partial: { id: m1 } } ] } }
+
+  - name: one worker receives at a time
+    tags: [ worker ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: workOnce, args: [ { m1: nested }, null ], expect: { value: 1 } }
+      - { call: handled, expect: { value: [ { delivery: 0, id: m1, attempts: 1, nested: { error: Worker already receiving } } ] } }
+      - { call: workOnce, args: [ null, null ], expect: { value: 0 } }
+
+  # --- run ---------------------------------------------------------------------------------
+  - name: run drains the queue until it is aborted
+    tags: [ worker, run ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m2, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: publish, args: [ { id: m3, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: run, args: [ null, { concurrency: 1, idleMs: 1 }, 3 ], expect: { value: null } }
+      - { call: handled, expect: { value: [ { delivery: 0, id: m1, attempts: 1 }, { delivery: 1, id: m2, attempts: 1 }, { delivery: 2, id: m3, attempts: 1 } ] } }
+
+  - name: run applies the worker policy
+    tags: [ worker, run, dead-letter ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: run, args: [ { m1: fail }, { maxAttempts: 1 }, 1 ], expect: { value: null } }
+      - { call: deadLetters, expect: { value: [ { $partial: { id: m1 } } ] } }
+
+  - name: the poll interval must be at least 1 ms
+    tags: [ worker, run, validation ]
+    steps:
+      - { call: run, args: [ null, { idleMs: 0 }, 0 ], expect: { error: { status: null, message: Invalid poll interval } } }
+      - { call: run, args: [ null, { idleMs: 0.5 }, 0 ], expect: { error: { message: Invalid poll interval } } }
+      - { call: run, args: [ null, { idleMs: -5 }, 0 ], expect: { error: { message: Invalid poll interval } } }
+      - { call: run, args: [ null, { idleMs: "10" }, 0 ], expect: { error: { message: Invalid poll interval } } }
+      - { call: run, args: [ null, { idleMs: 1.5 }, 0 ], expect: { value: null } }
+      - { call: run, args: [ null, { idleMs: null }, 0 ], expect: { value: null } }
+
+  - name: an aborted run returns without working; limits fail a live run
+    tags: [ worker, run, validation ]
+    steps:
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: run, args: [ null, { concurrency: 0 }, 0 ], expect: { value: null }, note: already aborted, workOnce never runs }
+      - { call: run, args: [ null, { concurrency: 0 }, 1 ], expect: { error: { message: Invalid worker limits } } }
+      - { call: handled, expect: { value: [] } }
+
+  # --- endpoints -----------------------------------------------------------------------------
+  - name: the module registers three owner endpoints and an owner-only admin page
+    tags: [ endpoints ]
+    steps:
+      - call: endpoints
+        expect:
+          value:
+            - { method: GET, path: /queue/status, resource: queue.read, access: owner }
+            - { method: POST, path: /queue/failed/inspect, resource: queue.inspect, access: owner }
+            - { method: POST, path: /queue/failed/retry, resource: queue.retry, access: owner }
+      - call: admin
+        expect: { value: { id: queue, title: Queue, resource: queue.read, path: /queue/status, component: queue, ownerOnly: true, fields: [], actions: [] } }
+      - { call: migrations, expect: { value: [] } }
+
+  - name: the inspect and retry endpoints manage dead letters
+    tags: [ endpoints, dead-letter ]
+    steps:
+      - { call: inspect, args: [ null ], expect: { value: { items: [] } } }
+      - { call: publish, args: [ { id: m1, type: t, createdAt: "2026-01-02" } ], expect: { value: null } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 0, attempts: 1, message: { createdAt: 2026-01-02, id: m1, type: t } } ] } }
+      - { call: deadLetter, args: [ 0 ], expect: { value: null } }
+      - { call: inspect, args: [ { limit: null } ], expect: { value: { items: [ { token: { $type: string }, id: m1, message: { $partial: { id: m1 } }, retryable: true } ] } } }
+      - { call: retryFailed, args: [ { token: { $ref: "4.value.items[0].token" } } ], expect: { value: { queued: true } } }
+      - { call: retryFailed, args: [ { token: { $ref: "4.value.items[0].token" } } ], expect: { error: { status: 409, message: "Message is no longer available; refresh the list" } } }
+      - { call: inspect, args: [ { limit: 1 } ], expect: { value: { items: [] } } }
+      - { call: receive, args: [ 1 ], expect: { value: [ { delivery: 1, attempts: 1, message: { $partial: { id: m1 } } } ] } }
+
+  - name: endpoint input is validated
+    tags: [ endpoints, validation ]
+    steps:
+      - { call: inspect, args: [ { limit: 0 } ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: inspect, args: [ { limit: 11 } ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: inspect, args: [ { limit: "5" } ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: inspect, args: [ { limit: 1.5 } ], expect: { error: { status: 400, message: Limit must be between 1 and 10 } } }
+      - { call: retryFailed, args: [ {} ], expect: { error: { status: 400, message: Invalid retry token } } }
+      - { call: retryFailed, args: [ null ], expect: { error: { status: 400, message: Invalid retry token } } }
+      - { call: retryFailed, args: [ { token: "" } ], expect: { error: { status: 400, message: Invalid retry token } } }
+      - { call: retryFailed, args: [ { token: 5 } ], expect: { error: { status: 400, message: Invalid retry token } } }
+      - { call: retryFailed, args: [ { token: { $text: { repeat: a, count: 400001 } } } ], expect: { error: { status: 400, message: Invalid retry token } } }
+      - { call: retryFailed, args: [ { token: { $text: { repeat: a, count: 400000 } } } ], expect: { error: { status: 409, message: "Message is no longer available; refresh the list" } } }
+
+  - name: adapters without failed-message admin answer 501
+    tags: [ endpoints ]
+    init: { now: "2026-01-02T03:04:05.678Z", capabilities: { delayedRetry: false, leaseRenewal: false, durable: true, failedAdmin: false } }
+    steps:
+      - { call: status, expect: { value: { supported: false, capabilities: { delayedRetry: false, leaseRenewal: false, durable: true, failedAdmin: false } } } }
+      - { call: inspect, args: [ { limit: 0 } ], expect: { error: { status: 501, message: Failed-message inspection is not configured } }, note: support is checked before the limit }
+      - { call: retryFailed, args: [ {} ], expect: { error: { status: 501, message: Failed-message retry is not configured } } }
