@@ -1,0 +1,532 @@
+contract: 1
+module: mail-local
+subject: mail-local
+title: Local SMTP mailer (development inbox) and its capture
+description: |
+  @gsalgadotoledo/rt-app-mail-local LocalSmtpMailer({port = 1025, capture?}): development-only
+  delivery to an SMTP inbox on 127.0.0.1 (Mailpit, started by `rta mail`), plus the in-memory
+  capture (@gsalgadotoledo/rt-app-auth LocalMailbox) behind GET /__dev/mailbox
+  (mail-local-api.contract.yaml) and mailConfig(env) (runtime.mjs).
+
+  Subject mail-local: init {port?, defaultPort?, capture? (default true), now?, nodeEnv?, sink?}.
+  Every instance starts an SMTP sink on 127.0.0.1 and points the mailer at it, unless init.port
+  (any value, validated as given) or init.defaultPort (no port: 1025) is set; nodeEnv is the
+  NODE_ENV seen by the constructor; now (ISO 8601, default 2026-01-02T03:04:05.678Z) is the
+  capture's clock; sink {starttls, auth, reject: [addresses answered 550]} shapes the sink.
+  Methods: send({to, subject, text, html?}), sendCode(email, code, purpose), delivered() (what the
+  sink received, decoded, see below), commands() (SMTP verbs the sink received: EHLO, HELO,
+  STARTTLS, AUTH, MAIL, RCPT, DATA), mailbox() (the capture's messages, or null without capture),
+  stopSink(), setNow(iso), mailConfig(env).
+
+  Sink decoding (the same in every host): delivered() → [{mailFrom, rcptTo, smtputf8, headers,
+  contentType, text, html}]. mailFrom/rcptTo are the envelope paths (inside <>), smtputf8 tells
+  whether MAIL FROM carried the SMTPUTF8 parameter. headers holds every header except Date,
+  Message-ID, MIME-Version, Content-Type and Content-Transfer-Encoding by lower-case name (a
+  repeated header becomes a list); values are unfolded (a CRLF before whitespace is removed),
+  lose one leading space, and have RFC 2047 encoded words decoded (whitespace between two encoded
+  words is dropped). contentType is the media type; text and html are the decoded bodies (by
+  Content-Transfer-Encoding, UTF-8, CRLF → LF, one final LF removed; the parts of a
+  multipart/alternative body). So only what a mail client shows is pinned, not the MIME bytes.
+
+  Rules (TypeScript delegates to nodemailer 10; ports implement the same rules):
+  - Constructor, in order: NODE_ENV === "production" → Error "Local SMTP is disabled in
+    production"; port not an integer in [1024, 65535] → Error "Invalid local SMTP port". The
+    host is always 127.0.0.1: no TLS (STARTTLS is ignored even when offered), no AUTH.
+  - send: From "RT-App <no-reply@rt-app.test>" (header "\"RT-App\" <no-reply@rt-app.test>",
+    envelope no-reply@rt-app.test). Every failure (inbox down, no recipient, every recipient
+    refused, protocol error) becomes 503 "Local inbox is unavailable. Start it with npm run mail
+    or restart npm run dev."; recipients refused while another one is accepted are dropped.
+  - sendCode(email, code, purpose): subject "RT-App: <purpose>", text "Your code is <code>. It
+    expires in 10 minutes. If you did not request it, ignore this email.", then the capture
+    records {email, code, purpose, at} (newest first, 30 kept; at is toISOString of the clock).
+    Nothing is captured when delivery fails.
+  - Recipients: `to` is an address list parsed like nodemailer's addressparser: "," and ";"
+    separate addresses, "Name <addr>", quoted names, (comments), groups "name: a, b;", a bare
+    address found in free text; CR/LF are whitespace and other control characters are dropped.
+    Each address is normalized: control characters and <> become spaces, the domain is lower-cased
+    and becomes punycode (IDNA) when the local part is ASCII, or Unicode (SMTPUTF8, the envelope
+    then carries the SMTPUTF8 parameter) when it is not; a local part that is neither a dot-atom
+    nor a complete quoted string is quoted. The envelope lists each normalized address once, in
+    order; the To header lists them all ("Name <addr>", names quoted or RFC 2047-encoded when
+    needed, groups kept). An address without "@" (a bare name) is not a recipient.
+  - Subject: CR, LF and CRLF become one space each; other control characters, '"' or non-ASCII
+    characters make the whole subject an encoded word (so a subject never adds a header),
+    otherwise it is sent as is (an ASCII subject that looks like an encoded word is therefore
+    decoded by clients). An empty subject, or one whose header value is blank (JavaScript trim of
+    the encoded value: spaces only, CR/LF only), omits the header; " \u00a0 " is encoded, so kept.
+  - Body: text/plain (charset utf-8 when not empty) with the text; html alone is text/html; both
+    are multipart/alternative (text first). Line breaks are CRLF (a lone CR is kept), lines that
+    start with "." are dot-stuffed, and any transfer encoding may be used.
+  - mailConfig(env): smtpPort = Number(env.RT_APP_MAIL_SMTP_PORT ?? 1025) and uiPort =
+    Number(env.RT_APP_MAIL_UI_PORT ?? 8025) (JavaScript Number: " 2525 ", "0x401" and "2e3" are
+    numbers, "" is 0) must be integers in [1024, 65535] (Error "Local mail ports must be integers
+    between 1024 and 65535") and differ (Error "Local mail SMTP and UI ports must differ");
+    returns {smtpPort, uiPort, url: "http://127.0.0.1:<uiPort>"}.
+init: {}
+cases:
+  # --- construction ---------------------------------------------------------------------------
+
+  - name: the default port is 1025
+    tags: [config]
+    init: { defaultPort: true }
+    call: mailbox
+    expect: { value: [] }
+
+  - name: ports below 1024 are refused
+    tags: [config, security]
+    init: { port: 1023 }
+    create: { error: { status: null, message: Invalid local SMTP port } }
+
+  - name: ports above 65535 are refused
+    tags: [config]
+    init: { port: 65536 }
+    create: { error: { message: Invalid local SMTP port } }
+
+  - name: fractional ports are refused
+    tags: [config, numbers]
+    init: { port: 1025.5 }
+    create: { error: { message: Invalid local SMTP port } }
+
+  - name: string ports are refused
+    tags: [config]
+    init: { port: "2525" }
+    create: { error: { message: Invalid local SMTP port } }
+
+  - name: the port range bounds are accepted
+    tags: [config]
+    steps: []
+    init: { port: 65535 }
+
+  - name: port 1024 is accepted
+    tags: [config]
+    steps: []
+    init: { port: 1024 }
+
+  - name: production refuses the local mailer before checking the port
+    tags: [config, security]
+    init: { nodeEnv: production, port: 1 }
+    create: { error: { status: null, message: Local SMTP is disabled in production } }
+
+  - name: only NODE_ENV "production" counts as production
+    tags: [config]
+    init: { nodeEnv: Production }
+    call: mailbox
+    expect: { value: [] }
+
+  # --- codes ----------------------------------------------------------------------------------
+
+  - name: a code is delivered over SMTP, then captured
+    tags: [codes]
+    steps:
+      - call: sendCode
+        args: [ana@example.com, "123456", Sign in]
+        expect: { value: null }
+      - call: delivered
+        expect:
+          value:
+            - mailFrom: no-reply@rt-app.test
+              rcptTo: [ana@example.com]
+              smtputf8: false
+              headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: "RT-App: Sign in" }
+              contentType: text/plain
+              text: Your code is 123456. It expires in 10 minutes. If you did not request it, ignore this email.
+      - call: mailbox
+        expect: { value: [{ email: ana@example.com, code: "123456", purpose: Sign in, at: "2026-01-02T03:04:05.678Z" }] }
+      - call: commands
+        expect: { value: [EHLO, MAIL, RCPT, DATA] }
+
+  - name: the capture keeps the newest message first with the clock time
+    tags: [codes]
+    steps:
+      - call: sendCode
+        args: [ana@example.com, "111111", login]
+        expect: { value: null }
+      - call: setNow
+        args: ["2026-03-04T05:06:07.089Z"]
+        expect: { value: null }
+      - call: sendCode
+        args: [leo@example.com, "222222", password recovery]
+        expect: { value: null }
+      - call: mailbox
+        expect:
+          value:
+            - { email: leo@example.com, code: "222222", purpose: password recovery, at: "2026-03-04T05:06:07.089Z" }
+            - { email: ana@example.com, code: "111111", purpose: login, at: "2026-01-02T03:04:05.678Z" }
+      - call: delivered
+        expect: { value: [{ $partial: { rcptTo: [ana@example.com] } }, { $partial: { rcptTo: [leo@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: leo@example.com, subject: "RT-App: password recovery" } } }] }
+
+  - name: without a capture the code is only delivered
+    tags: [codes]
+    init: { capture: false }
+    steps:
+      - call: sendCode
+        args: [ana@example.com, "123456", login]
+        expect: { value: null }
+      - call: mailbox
+        expect: { value: null }
+      - call: delivered
+        expect: { value: { $length: 1 } }
+
+  - name: an unreachable inbox is 503 and nothing is captured
+    tags: [codes, errors]
+    steps:
+      - call: stopSink
+        expect: { value: null }
+      - call: sendCode
+        args: [ana@example.com, "123456", login]
+        expect: { error: { status: 503, message: Local inbox is unavailable. Start it with npm run mail or restart npm run dev. } }
+      - call: mailbox
+        expect: { value: [] }
+
+  - name: a refused recipient is 503 and nothing is captured
+    tags: [codes, errors]
+    init: { sink: { reject: [ana@example.com] } }
+    steps:
+      - call: sendCode
+        args: [ana@example.com, "123456", login]
+        expect: { error: { status: 503, message: Local inbox is unavailable. Start it with npm run mail or restart npm run dev. } }
+      - call: mailbox
+        expect: { value: [] }
+      - call: delivered
+        expect: { value: [] }
+      - call: commands
+        expect: { value: [EHLO, MAIL, RCPT] }
+        note: no DATA once every recipient is refused
+
+  - name: the local inbox never uses TLS or authentication, even when offered
+    tags: [security]
+    init: { sink: { starttls: true, auth: true } }
+    steps:
+      - call: sendCode
+        args: [ana@example.com, "123456", login]
+        expect: { value: null }
+      - call: commands
+        expect: { value: [EHLO, MAIL, RCPT, DATA] }
+
+  # --- messages -------------------------------------------------------------------------------
+
+  - name: a text message
+    tags: [send]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: Welcome, text: "Hello Ana,\nwelcome." }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ mailFrom: no-reply@rt-app.test, rcptTo: [ana@example.com], smtputf8: false, headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: Welcome }, contentType: text/plain, text: "Hello Ana,\nwelcome." }] }
+      - call: mailbox
+        expect: { value: [] }
+        note: send does not touch the capture
+
+  - name: text and html make a multipart/alternative message
+    tags: [send, mime]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: "Plain é", html: "<p>Rich é</p>" }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { contentType: multipart/alternative, text: "Plain é", html: "<p>Rich é</p>" } }] }
+
+  - name: html alone is a text/html message
+    tags: [send, mime]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: "", html: "<p>Only</p>" }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { contentType: text/html, text: null, html: "<p>Only</p>" } }] }
+
+  - name: an empty html is ignored
+    tags: [send, mime]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: t, html: "" }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { contentType: text/plain, text: t, html: null } }] }
+
+  - name: a message without text is an empty text/plain body
+    tags: [send, mime]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: s }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: "", html: "" }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { contentType: text/plain, text: "", html: null } }, { $partial: { contentType: text/plain, text: "", html: null } }] }
+
+  - name: line breaks are normalized, a lone CR is kept and dots are stuffed
+    tags: [send, body]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: "a\r\nb\nc\rd\n.\n..\n.end\nlast\n" }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { text: "a\nb\nc\rd\n.\n..\n.end\nlast" } }] }
+        note: the final line break is indistinguishable from the SMTP line end
+
+  - name: long lines, trailing spaces, equals signs and Unicode bodies survive
+    tags: [send, body, unicode]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: { $text: { repeat: "word = ", count: 30 } } }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: "日本語のテキスト 😀\nñ \t\nend" }]
+        expect: { value: null }
+      - call: delivered
+        expect:
+          value:
+            - { $partial: { text: { $text: { repeat: "word = ", count: 30 } } } }
+            - { $partial: { text: "日本語のテキスト 😀\nñ \t\nend" } }
+
+  # --- subjects -------------------------------------------------------------------------------
+
+  - name: CR and LF in a subject cannot add a header
+    tags: [subject, security]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: "Hi\r\nBcc: evil@example.com\nX-Injected: 1\rZ", text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { rcptTo: [ana@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: "Hi Bcc: evil@example.com X-Injected: 1 Z" } } }] }
+
+  - name: an empty or blank subject omits the header
+    tags: [subject]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: "", text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: "   ", text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: "\r\n", text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect:
+          value:
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com } } }
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com } } }
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com } } }
+
+  - name: subjects keep their spaces, quotes, controls and Unicode
+    tags: [subject, unicode]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: "  padded  ", text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: " \u00a0 ", text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: "Say \"hi\" to Café ☕ 😀", text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: "tab\there \u0007bell \u007fdel", text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: { $text: { repeat: "é long ", count: 20 } }, text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: ana@example.com, subject: { $text: { repeat: "word ", count: 30 } }, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect:
+          value:
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: "  padded  " } } }
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: " \u00a0 " } } }
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: "Say \"hi\" to Café ☕ 😀" } } }
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: "tab\there \u0007bell \u007fdel" } } }
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: { $text: { repeat: "é long ", count: 20 } } } } }
+            - { $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: { $text: { repeat: "word ", count: 30 } } } } }
+
+  - name: an ASCII subject that looks like an encoded word is sent as is
+    tags: [subject, edge]
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: "=?utf-8?q?hi?= there", text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: ana@example.com, subject: "hi there" } } }] }
+        note: mail clients decode it; the mailer does not escape ASCII subjects
+
+  # --- recipients -----------------------------------------------------------------------------
+
+  - name: display names, lists and duplicates
+    tags: [address]
+    steps:
+      - call: send
+        args: [{ to: "Ana <ana@example.com>, \"Doe, John\" <john@example.com>; leo@example.com, ana@example.com", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect:
+          value:
+            - $partial:
+                rcptTo: [ana@example.com, john@example.com, leo@example.com]
+                headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "Ana <ana@example.com>, \"Doe, John\" <john@example.com>, leo@example.com, ana@example.com", subject: s }
+
+  - name: domains are lower-cased, local parts are kept
+    tags: [address]
+    steps:
+      - call: send
+        args: [{ to: "User@EXAMPLE.COM, user@example.com", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { rcptTo: [User@example.com, user@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "User@example.com, user@example.com", subject: s } } }] }
+
+  - name: Unicode names are encoded words and IDN domains become punycode
+    tags: [address, unicode]
+    steps:
+      - call: send
+        args: [{ to: "José Ñúñez <jose@EXÄMPLE.com>, \"Ünïcödé, Name\" <u@bücher.example>", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect:
+          value:
+            - $partial:
+                rcptTo: [jose@xn--exmple-cua.com, u@xn--bcher-kva.example]
+                smtputf8: false
+                headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "José Ñúñez <jose@xn--exmple-cua.com>, Ünïcödé, Name <u@xn--bcher-kva.example>", subject: s }
+
+  - name: a Unicode local part needs SMTPUTF8 and keeps a Unicode domain
+    tags: [address, unicode]
+    steps:
+      - call: send
+        args: [{ to: "ñandú@exämple.com", subject: s, text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: "ñandú@XN--EXMPLE-CUA.com", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect:
+          value:
+            - { $partial: { rcptTo: ["ñandú@exämple.com"], smtputf8: true, headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "ñandú@exämple.com", subject: s } } }
+            - { $partial: { rcptTo: ["ñandú@exämple.com"], smtputf8: true, headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "ñandú@exämple.com", subject: s } } }
+
+  - name: groups deliver to their members
+    tags: [address]
+    steps:
+      - call: send
+        args: [{ to: "Team: a@example.com, b@example.com;, c@example.com", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { rcptTo: [a@example.com, b@example.com, c@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "Team:a@example.com, b@example.com;, c@example.com", subject: s } } }] }
+
+  - name: CR and LF in a recipient are whitespace, never SMTP commands
+    tags: [address, security]
+    steps:
+      - call: send
+        args: [{ to: "a@example.com\r\nRCPT TO:<evil@example.com>", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { rcptTo: [evil@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "\"a@example.com RCPT TO\":evil@example.com;", subject: s } } }] }
+        note: addressparser reads "…RCPT TO:" as a group name; the envelope is still one RCPT per parsed address
+      - call: commands
+        expect: { value: [EHLO, MAIL, RCPT, DATA] }
+
+  - name: a quoted local part keeps its quotes
+    tags: [address, security]
+    steps:
+      - call: send
+        args: [{ to: "\"user@evil.example\"@good.example", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { rcptTo: ["\"user@evil.example\"@good.example"], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "<\"user@evil.example\"@good.example>", subject: s } } }] }
+
+  - name: addresses are found in free text and comments
+    tags: [address]
+    steps:
+      - call: send
+        args: [{ to: "Ana ana@example.com", subject: s, text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: "<leo@example.com> (Leo)", subject: s, text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: "a b@example.com", subject: s, text: t }]
+        expect: { value: null }
+      - call: send
+        args: [{ to: "ops@[127.0.0.1]", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect:
+          value:
+            - { $partial: { rcptTo: [ana@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: Ana <ana@example.com>, subject: s } } }
+            - { $partial: { rcptTo: [leo@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: Leo <leo@example.com>, subject: s } } }
+            - { $partial: { rcptTo: [b@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: a <b@example.com>, subject: s } } }
+            - { $partial: { rcptTo: ["ops@[127.0.0.1]"], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "<ops@[127.0.0.1]>", subject: s } } }
+
+  - name: a refused recipient is dropped while another one is accepted
+    tags: [address, errors]
+    init: { sink: { reject: [bad@example.com] } }
+    steps:
+      - call: send
+        args: [{ to: "bad@example.com, ana@example.com", subject: s, text: t }]
+        expect: { value: null }
+      - call: delivered
+        expect: { value: [{ $partial: { rcptTo: [ana@example.com], headers: { from: "\"RT-App\" <no-reply@rt-app.test>", to: "bad@example.com, ana@example.com", subject: s } } }] }
+
+  - name: a message without a recipient is 503
+    tags: [address, errors]
+    steps:
+      - call: send
+        args: [{ to: "", subject: s, text: t }]
+        expect: { error: { status: 503, message: Local inbox is unavailable. Start it with npm run mail or restart npm run dev. } }
+      - call: send
+        args: [{ to: root, subject: s, text: t }]
+        expect: { error: { status: 503 } }
+        note: a bare name is a display name, not an address
+      - call: send
+        args: [{ subject: s, text: t }]
+        expect: { error: { status: 503 } }
+      - call: send
+        args: [{ to: "Team: ;", subject: s, text: t }]
+        expect: { error: { status: 503 } }
+      - call: delivered
+        expect: { value: [] }
+
+  # --- mailConfig -----------------------------------------------------------------------------
+
+  - name: mail ports default to 1025 and 8025
+    tags: [config]
+    call: mailConfig
+    args: [{}]
+    expect: { value: { smtpPort: 1025, uiPort: 8025, url: "http://127.0.0.1:8025" } }
+
+  - name: mail ports are read with JavaScript Number
+    tags: [config, numbers]
+    steps:
+      - call: mailConfig
+        args: [{ RT_APP_MAIL_SMTP_PORT: " 2525 ", RT_APP_MAIL_UI_PORT: "0x2000" }]
+        expect: { value: { smtpPort: 2525, uiPort: 8192, url: "http://127.0.0.1:8192" } }
+      - call: mailConfig
+        args: [{ RT_APP_MAIL_SMTP_PORT: "2e3", RT_APP_MAIL_UI_PORT: "8025.0" }]
+        expect: { value: { smtpPort: 2000, uiPort: 8025, url: "http://127.0.0.1:8025" } }
+
+  - name: invalid mail ports are refused
+    tags: [config]
+    steps:
+      - call: mailConfig
+        args: [{ RT_APP_MAIL_SMTP_PORT: bad }]
+        expect: { error: { status: null, message: Local mail ports must be integers between 1024 and 65535 } }
+      - call: mailConfig
+        args: [{ RT_APP_MAIL_UI_PORT: "" }]
+        expect: { error: { message: Local mail ports must be integers between 1024 and 65535 } }
+        note: Number("") is 0
+      - call: mailConfig
+        args: [{ RT_APP_MAIL_SMTP_PORT: "1023" }]
+        expect: { error: { message: Local mail ports must be integers between 1024 and 65535 } }
+      - call: mailConfig
+        args: [{ RT_APP_MAIL_UI_PORT: "65536" }]
+        expect: { error: { message: Local mail ports must be integers between 1024 and 65535 } }
+      - call: mailConfig
+        args: [{ RT_APP_MAIL_SMTP_PORT: "1025.5" }]
+        expect: { error: { message: Local mail ports must be integers between 1024 and 65535 } }
+
+  - name: the SMTP and UI ports must differ
+    tags: [config]
+    call: mailConfig
+    args: [{ RT_APP_MAIL_UI_PORT: "1025" }]
+    expect: { error: { status: null, message: Local mail SMTP and UI ports must differ } }

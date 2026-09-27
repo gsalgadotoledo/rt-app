@@ -23,15 +23,17 @@ export interface Mailer {
   send?(message:{to:string;subject:string;text:string}):Promise<void>;
   sendCode(email: string, code: string, purpose: string): Promise<void>;
 }
+/** Development mailer: keeps the last 30 messages in memory, newest first. `now` stamps `at` (system clock by default). */
 export class LocalMailbox implements Mailer {
-  async send(message:{to:string;subject:string;text:string}){this.messages.unshift({email:message.to,code:message.text,purpose:message.subject,at:new Date().toISOString()});this.messages=this.messages.slice(0,30);}
+  constructor(private options: { now?: Clock } = {}) {}
+  async send(message:{to:string;subject:string;text:string}){this.messages.unshift({email:message.to,code:message.text,purpose:message.subject,at:new Date(epochMs(this.options.now)).toISOString()});this.messages=this.messages.slice(0,30);}
   messages: { email: string; code: string; purpose: string; at: string }[] = [];
   async sendCode(email: string, code: string, purpose: string) {
     this.messages.unshift({
       email,
       code,
       purpose,
-      at: new Date().toISOString(),
+      at: new Date(epochMs(this.options.now)).toISOString(),
     });
     this.messages = this.messages.slice(0, 30);
   }

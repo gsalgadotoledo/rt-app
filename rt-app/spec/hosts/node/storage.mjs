@@ -1,5 +1,9 @@
-// Subjects: nosql-memory, nosql-postgres, nosql-dynamodb, feature-flags.
+// Subjects: nosql-memory, nosql-json, nosql-postgres, nosql-dynamodb, feature-flags.
 import { randomBytes } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { JsonStore } from "@gsalgadotoledo/rt-app-json";
 import { MemoryStore, DynamoStore } from "@gsalgadotoledo/rt-app-dynamodb";
 import { PostgresStore } from "@gsalgadotoledo/rt-app-postgres";
 import { DynamoDBClient, CreateTableCommand, DeleteTableCommand } from "@aws-sdk/client-dynamodb";
@@ -13,6 +17,13 @@ async function seed(store, rows = []) {
 
 /** A memory store holding the given rows. */
 export const memoryStore = (rows = []) => seed(new MemoryStore(), rows);
+
+/** A JsonStore on a fresh temporary file holding the given rows; the directory is removed on close. */
+async function jsonStore(rows) {
+  const dir = await mkdtemp(join(tmpdir(), "rt-contract-nosql-json-"));
+  const store = await seed(new JsonStore(join(dir, "db.json")), rows);
+  return Object.assign(Object.create(store), { close: () => rm(dir, { recursive: true, force: true }) });
+}
 
 const unique = () => `rt_contract_${Date.now().toString(36)}_${randomBytes(4).toString("hex")}`;
 
@@ -50,6 +61,7 @@ async function dynamoStore(rows) {
 
 export const subjects = {
   "nosql-memory": (init) => memoryStore(init.rows),
+  "nosql-json": (init) => jsonStore(init.rows),
   ...(process.env.RT_APP_TEST_POSTGRES_URL ? { "nosql-postgres": (init) => postgresStore(init.rows) } : {}),
   ...(process.env.RT_APP_TEST_DYNAMODB_ENDPOINT ? { "nosql-dynamodb": (init) => dynamoStore(init.rows) } : {}),
   "feature-flags": async (init) => new FeatureFlags(await memoryStore(init.rows)),

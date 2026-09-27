@@ -4,6 +4,15 @@ import type {
   BillingProvider,
   Plan,
 } from "@gsalgadotoledo/rt-app-subscriptions";
+
+/** Optional collaborators; production code omits them. */
+export interface StripeOptions {
+  /** Stripe SDK HTTP client (tests and contracts inject a recording fake; no network). */
+  httpClient?: Stripe.HttpClient;
+  /** Clock for the webhook timestamp tolerance, epoch milliseconds (default: Date.now). */
+  now?: () => number;
+}
+
 export class StripeBilling implements BillingProvider {
   readonly mode = "stripe" as const;
   private stripe: Stripe;
@@ -11,12 +20,17 @@ export class StripeBilling implements BillingProvider {
     secret: string,
     private webhookSecret: string,
     readonly publishableKey: string,
+    private options: StripeOptions = {},
   ) {
     if (!secret || !webhookSecret || !publishableKey)
       throw new Error(
         "Stripe secret, webhook secret and publishable key are required",
       );
-    this.stripe = new Stripe(secret, { maxNetworkRetries: 1, timeout: 10000 });
+    this.stripe = new Stripe(secret, {
+      maxNetworkRetries: 1,
+      timeout: 10000,
+      ...(options.httpClient ? { httpClient: options.httpClient } : {}),
+    });
   }
   /** Create a Stripe customer using the caller's stable idempotency key; return its provider ID. */
   async customer(user: Actor, key: string) {
@@ -232,6 +246,9 @@ export class StripeBilling implements BillingProvider {
       raw,
       signature,
       this.webhookSecret,
+      undefined,
+      undefined,
+      this.options.now?.(),
     );
     const obj: any = event.data.object;
     return {

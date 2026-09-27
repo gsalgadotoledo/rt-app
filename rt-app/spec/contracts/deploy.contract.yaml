@@ -1,0 +1,660 @@
+contract: 1
+module: deploy
+subject: deploy
+title: Deploy contract (provider registry, target validation, credentials, redaction, plan/apply)
+description: |
+  @gsalgadotoledo/rt-app-deploy: the contract every provider package implements, the provider
+  registry, validation of rt-app.settings.json → deploy, credentials from the environment, secret
+  redaction and the plan/apply orchestration of one environment. The provider API client
+  (createApi) is the deploy-client contract. Node host: spec/hosts/node/deploy.mjs.
+
+  Subject deploy: init {providers?: [spec…], api?} (api: see deploy-client). Providers are FAKES
+  described by data, registered in order (a registration error fails the instance):
+    {id, name? (= id), roles, website? ("https://<id>.example"), credentials? ([]), settings?,
+     notes?, actions? ([{action: create, detail: new}]), state?, urls? {role: url},
+     outputs? {role: {KEY: value}}, statuses? {role: status} ({state: live}),
+     fail? {plan|apply|status: message | {message, status?, roles?}}}
+  plan(context) returns {provider: id, role, environment, actions: [{action, resource, detail}],
+  state?} where resource = resourceName(app, environment, role); apply(context) returns {provider,
+  role, url? (urls[role]), outputs? (outputs[role]), resources: [{kind: service, id: "<id>-<role>",
+  name: resource}]}; status(context) returns statuses[role] or {state: live}. plan and apply first
+  log "<id> plan|apply <role>" through context.log. A fail entry (for every role, or only the
+  listed roles) throws after the log: its message is redacted with secretValues(context); with a
+  status it is ProviderError(id, status, message) ("<id>: <message>"), otherwise Error(message).
+  Every call is recorded: calls() → [{call, provider, app, environment, role, settings,
+  credentials, variables, source}] with the context values the provider received.
+
+  Methods: register(spec) → null, ids(), catalog(), get(id) (catalog entry), validate(input)
+  (validateDeploySettings), resolveCredentials(id, env), settingsFor(id, target),
+  resourceName(app, environment, role, max?), variablesFor(role, variables),
+  publicVariable(name) (PUBLIC_VARIABLE.test), secretValues({credentials, variables}),
+  redact(text, secrets), constants() → {roles, environments, roleLabels, roleOrder},
+  providerError(provider, status, message) → {provider, status, message}, plan(options) /
+  apply(options) (planEnvironment / applyEnvironment), calls(), logs().
+  plan/apply options: {settings ({environments: {}}), app ("shop"), environment, env ({}),
+  variables?, roles?, sources? {role: source}}; the source of a role is sources[role] or
+  {branch: main, directory: "."}; context.log appends to logs().
+
+  Registry: register checks, in order, the id (^[a-z][a-z0-9-]{1,40}$, else Error "Invalid provider
+  id: <id>"), duplicates ("Duplicate provider: <id>"), then roles (non-empty, each a known role,
+  else "Invalid roles for provider <id>"). get(unknown) fails with "Unknown deploy provider: <id>".
+  catalog() lists providers in registration order as {id, name, roles, website, credentials,
+  settings (settings or []), notes (omitted when undefined)} with no functions.
+
+  validateDeploySettings(input, registry) follows JavaScript: input ?? {} must be a non-array
+  object ("deploy must be an object"). Object.entries(value.environments ?? {}) is walked in order
+  (a string gives its index keys "0", "1"…, other primitives give nothing); each key must be an
+  environment ("Unknown environment: <key>"); its targets (?? {}) are walked the same way; each key
+  must be a role ("Unknown role: <key>"), its provider is registry.get(String(target?.provider))
+  (String: undefined → "undefined", null → "null", numbers as JavaScript prints them, arrays joined
+  with ","), which must serve the role ("<provider name> does not support the <role> role"). Each
+  setting key must be declared ("Unknown setting <key> for <id>") and its value must have
+  typeof === spec.type (null is an "object") and, when the spec has options, String(value) must be
+  one of them ("Invalid value for <id>.<key>"). The first failure throws (plain Error, no status).
+  The result is {environments: {<env>: {<role>: {provider: id, settings? (only when non-empty)}}}}
+  in input order; unknown fields are dropped.
+
+  resolveCredentials(provider, env) → {values, missing}: each declared key in order; a truthy value
+  is copied, an empty or missing value is missing unless the spec is optional. settingsFor merges
+  declared defaults under target.settings (defaults first, then the configured keys).
+  resourceName = `${app}-${environment}-${role}` lower-cased (String.prototype.toLowerCase), every
+  run of characters outside [a-z0-9-] replaced by "-", runs of "-" collapsed, leading/trailing "-"
+  removed; when longer than max (default 40) it is sliced to max (JavaScript slice: negative max
+  counts from the end) and one trailing "-" is removed.
+
+  Secrets: secretValues is every credential value then every variable value, in order, with at
+  least 4 UTF-16 code units. redact(text, secrets) replaces, secret by secret in order, every
+  non-overlapping occurrence (left to right) of each secret of 4+ UTF-16 units with "[redacted]".
+  variablesFor(role, variables): api, database and files receive a copy of every variable; ssr and
+  frontend only keys matching ^(RT_APP_[A-Z_]+_URL|RT_APP_ENVIRONMENT|RT_APP_TARGET|NODE_ENV)$.
+
+  Orchestration: the targets of options.environment are taken in ROLE_ORDER (database, files, api,
+  ssr, frontend), filtered by options.roles; for each, registry.get(provider) (an unknown provider
+  throws before any call), credentials resolved from env, settings = settingsFor, variables =
+  variablesFor(role, variables). planEnvironment first fails with "Missing credentials:
+  <id>:<KEY>, …" (role order, one entry per role and key) before calling any provider, then plans
+  each role in order; a provider error propagates unchanged. applyEnvironment checks credentials the
+  same way, then for each role: variables = variablesFor(role, {...variables, ...outputs so far}),
+  plan, apply; a result url becomes outputs["RT_APP_<ROLE>_URL"], then result.outputs are merged
+  (later keys win). The first failure (plan or apply) throws Error("<message> (already applied:
+  <role>:<provider>, …)" or "(already applied: nothing)") and nothing else runs. It returns
+  {results, outputs}.
+init:
+  providers:
+    - &render
+      id: render
+      name: Render
+      roles: [api, ssr, frontend]
+      website: "https://render.com"
+      credentials:
+        - { key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys" }
+        - { key: RENDER_OWNER_ID, label: Workspace id, optional: true }
+      settings:
+        - { key: region, label: Region, type: string, default: oregon, options: [oregon, frankfurt] }
+        - { key: instances, label: Instances, type: number, default: 1 }
+        - { key: autoDeploy, label: Auto deploy, type: boolean }
+        - { key: size, label: Size, type: number, options: ["1", "2", "0.5", "1e+21"] }
+      notes: Free web services sleep after 15 minutes without traffic.
+      urls: { api: "https://shop-api.onrender.com", ssr: "https://shop-ssr.onrender.com" }
+    - &neon
+      id: neon
+      name: Neon
+      roles: [database]
+      website: "https://neon.tech"
+      credentials: [{ key: NEON_API_KEY, label: API key }]
+      outputs: { database: { DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" } }
+    - &vercel
+      id: vercel
+      name: Vercel
+      roles: [ssr, frontend]
+      credentials: [{ key: VERCEL_TOKEN, label: Token }]
+      urls: { ssr: "https://shop.vercel.app", frontend: "https://shop-web.vercel.app" }
+    - &bucket
+      id: bucket
+      roles: [files]
+      urls: { files: "https://files.example" }
+      outputs: { files: { FILES_BUCKET: shop-files, FILES_KEY: files-secret-key } }
+cases:
+  # --- constants and registry -----------------------------------------------------------------
+
+  - name: roles, environments, labels and the deploy order
+    tags: [registry]
+    steps:
+      - call: constants
+        expect:
+          value:
+            roles: [api, ssr, frontend, files, database]
+            environments: [develop, stage, prod]
+            roleLabels:
+              api: API (Node, Python or Go process)
+              ssr: SSR (Next.js)
+              frontend: Frontend (static SPA and admin)
+              files: Files (uploads)
+              database: Database
+            roleOrder: [database, files, api, ssr, frontend]
+
+  - name: the catalog is public data in registration order, with settings defaulting to []
+    tags: [registry]
+    steps:
+      - call: ids
+        expect: { value: [render, neon, vercel, bucket] }
+      - call: catalog
+        expect:
+          value:
+            - id: render
+              name: Render
+              roles: [api, ssr, frontend]
+              website: "https://render.com"
+              credentials:
+                - { key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys" }
+                - { key: RENDER_OWNER_ID, label: Workspace id, optional: true }
+              settings:
+                - { key: region, label: Region, type: string, default: oregon, options: [oregon, frankfurt] }
+                - { key: instances, label: Instances, type: number, default: 1 }
+                - { key: autoDeploy, label: Auto deploy, type: boolean }
+                - { key: size, label: Size, type: number, options: ["1", "2", "0.5", "1e+21"] }
+              notes: Free web services sleep after 15 minutes without traffic.
+            - { id: neon, name: Neon, roles: [database], website: "https://neon.tech", credentials: [{ key: NEON_API_KEY, label: API key }], settings: [] }
+            - { id: vercel, name: Vercel, roles: [ssr, frontend], website: "https://vercel.example", credentials: [{ key: VERCEL_TOKEN, label: Token }], settings: [] }
+            - { id: bucket, name: bucket, roles: [files], website: "https://bucket.example", credentials: [], settings: [] }
+      - call: get
+        args: [neon]
+        expect: { value: { id: neon, name: Neon, roles: [database], website: "https://neon.tech", credentials: [{ key: NEON_API_KEY, label: API key }], settings: [], notes: null } }
+      - call: get
+        args: [heroku]
+        expect: { error: { message: "Unknown deploy provider: heroku" } }
+      - call: get
+        args: [""]
+        expect: { error: { message: "Unknown deploy provider: " } }
+      - call: get
+        args: [Render]
+        expect: { error: { message: "Unknown deploy provider: Render" } }
+        note: ids are case-sensitive
+
+  - name: provider ids are 2 to 41 lowercase characters starting with a letter
+    tags: [registry, validation]
+    init: { providers: [] }
+    steps:
+      - { call: register, args: [{ id: ab, roles: [api] }], expect: { value: null } }
+      - { call: register, args: [{ id: a-, roles: [api] }], expect: { value: null } }
+      - { call: register, args: [{ id: "x0-9", roles: [api] }], expect: { value: null } }
+      - { call: register, args: [{ id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", roles: [api] }], expect: { value: null } }
+      - { call: register, args: [{ id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", roles: [api] }], expect: { error: { message: "Invalid provider id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } } }
+      - { call: register, args: [{ id: a, roles: [api] }], expect: { error: { message: "Invalid provider id: a" } } }
+      - { call: register, args: [{ id: Render, roles: [api] }], expect: { error: { message: "Invalid provider id: Render" } } }
+      - { call: register, args: [{ id: 9lives, roles: [api] }], expect: { error: { message: "Invalid provider id: 9lives" } } }
+      - { call: register, args: [{ id: "my_cloud", roles: [api] }], expect: { error: { message: "Invalid provider id: my_cloud" } } }
+      - { call: register, args: [{ id: "my cloud", roles: [api] }], expect: { error: { message: "Invalid provider id: my cloud" } } }
+      - { call: register, args: [{ id: "réseau", roles: [api] }], expect: { error: { message: "Invalid provider id: réseau" } } }
+      - { call: register, args: [{ id: "ab\n", roles: [api] }], expect: { error: { message: "Invalid provider id: ab\n" } } }
+      - { call: ids, expect: { value: [ab, a-, x0-9, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa] } }
+
+  - name: duplicates and roles are checked after the id, in that order
+    tags: [registry, validation]
+    init: { providers: [{ id: neon, roles: [database] }] }
+    steps:
+      - { call: register, args: [{ id: neon, roles: [api] }], expect: { error: { message: "Duplicate provider: neon" } } }
+      - { call: register, args: [{ id: neon, roles: [] }], expect: { error: { message: "Duplicate provider: neon" } } }
+      - { call: register, args: [{ id: N, roles: [] }], expect: { error: { message: "Invalid provider id: N" } } }
+      - { call: register, args: [{ id: mail, roles: [] }], expect: { error: { message: "Invalid roles for provider mail" } } }
+      - { call: register, args: [{ id: mail, roles: [api, email] }], expect: { error: { message: "Invalid roles for provider mail" } } }
+      - { call: register, args: [{ id: mail, roles: [API] }], expect: { error: { message: "Invalid roles for provider mail" } } }
+      - { call: ids, expect: { value: [neon] }, note: "a rejected provider is not registered" }
+
+  - name: a registration error in init fails the instance
+    tags: [registry]
+    init: { providers: [{ id: neon, roles: [database] }, { id: neon, roles: [database] }] }
+    create: { error: { message: "Duplicate provider: neon" } }
+    steps: []
+
+  # --- validation of rt-app.settings.json → deploy ---------------------------------------------
+
+  - name: a valid deploy section is returned in canonical form
+    tags: [validation]
+    steps:
+      - call: validate
+        args:
+          - environments:
+              stage:
+                database: { provider: neon }
+                api: { provider: render, settings: { region: frankfurt, instances: 2, autoDeploy: false } }
+                ssr: { provider: vercel, settings: {} }
+              prod: {}
+            comment: ignored
+        expect:
+          value:
+            environments:
+              stage:
+                database: { provider: neon }
+                api: { provider: render, settings: { region: frankfurt, instances: 2, autoDeploy: false } }
+                ssr: { provider: vercel }
+              prod: {}
+      - call: validate
+        args: [{ environments: { develop: { api: { provider: render, extra: 1, settings: { size: 0.5 } } } } }]
+        expect: { value: { environments: { develop: { api: { provider: render, settings: { size: 0.5 } } } } } }
+        note: unknown target fields are dropped; empty settings are omitted
+
+  - name: an absent section, environments or roles mean nothing configured
+    tags: [validation]
+    steps:
+      - { call: validate, args: [null], expect: { value: { environments: {} } } }
+      - { call: validate, args: [{}], expect: { value: { environments: {} } } }
+      - { call: validate, args: [{ environments: null }], expect: { value: { environments: {} } } }
+      - { call: validate, args: [{ environments: { stage: null } }], expect: { value: { environments: { stage: {} } } } }
+      - { call: validate, args: [{ environments: 5 }], expect: { value: { environments: {} } } }
+      - { call: validate, args: [{ environments: true }], expect: { value: { environments: {} } } }
+      - { call: validate, args: [{ environments: "" }], expect: { value: { environments: {} } } }
+      - { call: validate, args: [{ environments: { stage: 7 } }], expect: { value: { environments: { stage: {} } } }, note: "JavaScript Object.entries of a number, a boolean or \"\" is empty" }
+
+  - name: the section must be an object
+    tags: [validation]
+    steps:
+      - { call: validate, args: [[]], expect: { error: { message: deploy must be an object } } }
+      - { call: validate, args: [[{ environments: {} }]], expect: { error: { message: deploy must be an object } } }
+      - { call: validate, args: ["stage"], expect: { error: { message: deploy must be an object } } }
+      - { call: validate, args: [0], expect: { error: { message: deploy must be an object } } }
+      - { call: validate, args: [true], expect: { error: { message: deploy must be an object } } }
+      - { call: validate, args: [false], expect: { error: { message: deploy must be an object } } }
+
+  - name: environments and roles must be known
+    tags: [validation]
+    steps:
+      - { call: validate, args: [{ environments: { qa: {} } }], expect: { error: { message: "Unknown environment: qa" } } }
+      - { call: validate, args: [{ environments: { Stage: {} } }], expect: { error: { message: "Unknown environment: Stage" } } }
+      - { call: validate, args: [{ environments: { production: {} } }], expect: { error: { message: "Unknown environment: production" } } }
+      - { call: validate, args: [{ environments: { stage: { email: { provider: render } } } }], expect: { error: { message: "Unknown role: email" } } }
+      - { call: validate, args: [{ environments: { stage: { API: { provider: render } } } }], expect: { error: { message: "Unknown role: API" } } }
+      - { call: validate, args: [{ environments: [stage] }], expect: { error: { message: "Unknown environment: 0" } } }
+      - { call: validate, args: [{ environments: stage }], expect: { error: { message: "Unknown environment: 0" } } }
+      - { call: validate, args: [{ environments: { stage: api } }], expect: { error: { message: "Unknown role: 0" } } }
+      - { call: validate, args: [{ environments: { stage: [{ provider: render }] } }], expect: { error: { message: "Unknown role: 0" } }, note: "JavaScript Object.entries of a string or an array gives its index keys" }
+
+  - name: the first failure wins, in input order
+    tags: [validation]
+    steps:
+      - { call: validate, args: [{ environments: { qa: {}, stage: { email: {} } } }], expect: { error: { message: "Unknown environment: qa" } } }
+      - { call: validate, args: [{ environments: { stage: { email: {} }, qa: {} } }], expect: { error: { message: "Unknown role: email" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: nope }, email: {} } } }], expect: { error: { message: "Unknown deploy provider: nope" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { color: red, region: mars } } } } }], expect: { error: { message: "Unknown setting color for render" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { region: mars, color: red } } } } }], expect: { error: { message: "Invalid value for render.region" } } }
+
+  - name: the provider is looked up with JavaScript String()
+    tags: [validation, js]
+    steps:
+      - { call: validate, args: [{ environments: { stage: { api: {} } } }], expect: { error: { message: "Unknown deploy provider: undefined" } } }
+      - { call: validate, args: [{ environments: { stage: { api: null } } }], expect: { error: { message: "Unknown deploy provider: undefined" } } }
+      - { call: validate, args: [{ environments: { stage: { api: render } } }], expect: { error: { message: "Unknown deploy provider: undefined" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: null } } } }], expect: { error: { message: "Unknown deploy provider: null" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: 42 } } } }], expect: { error: { message: "Unknown deploy provider: 42" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: 1.5 } } } }], expect: { error: { message: "Unknown deploy provider: 1.5" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: true } } } }], expect: { error: { message: "Unknown deploy provider: true" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: { id: render } } } } }], expect: { error: { message: "Unknown deploy provider: [object Object]" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: [render, vercel] } } } }], expect: { error: { message: "Unknown deploy provider: render,vercel" } } }
+      - call: validate
+        args: [{ environments: { stage: { api: { provider: [render] } } } }]
+        expect: { value: { environments: { stage: { api: { provider: render } } } } }
+        note: String(["render"]) is "render"; the canonical form stores the id
+
+  - name: the provider must serve the role (message uses the provider name)
+    tags: [validation]
+    steps:
+      - { call: validate, args: [{ environments: { stage: { database: { provider: render } } } }], expect: { error: { message: Render does not support the database role } } }
+      - { call: validate, args: [{ environments: { prod: { api: { provider: bucket } } } }], expect: { error: { message: bucket does not support the api role } } }
+
+  - name: settings must be declared, of the declared type and among the options
+    tags: [validation]
+    steps:
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { color: red } } } } }], expect: { error: { message: "Unknown setting color for render" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { Region: oregon } } } } }], expect: { error: { message: "Unknown setting Region for render" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: oregon } } } }], expect: { error: { message: "Unknown setting 0 for render" } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { region: mars } } } } }], expect: { error: { message: Invalid value for render.region } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { region: 5 } } } } }], expect: { error: { message: Invalid value for render.region } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { instances: "2" } } } } }], expect: { error: { message: Invalid value for render.instances } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { instances: null } } } } }], expect: { error: { message: Invalid value for render.instances } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { instances: true } } } } }], expect: { error: { message: Invalid value for render.instances } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { autoDeploy: "true" } } } } }], expect: { error: { message: Invalid value for render.autoDeploy } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { autoDeploy: 1 } } } } }], expect: { error: { message: Invalid value for render.autoDeploy } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { size: 3 } } } } }], expect: { error: { message: Invalid value for render.size } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { size: "2" } } } } }], expect: { error: { message: Invalid value for render.size } } }
+
+  - name: number options compare JavaScript String(value)
+    tags: [validation, js]
+    steps:
+      - call: validate
+        args: [{ environments: { stage: { api: { provider: render, settings: { size: 2, instances: -1.5, region: oregon } } } } }]
+        expect: { value: { environments: { stage: { api: { provider: render, settings: { size: 2, instances: -1.5, region: oregon } } } } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { size: 2.0 } } } } }], expect: { value: { environments: { stage: { api: { provider: render, settings: { size: 2 } } } } } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { size: 0.5 } } } } }], expect: { value: { environments: { stage: { api: { provider: render, settings: { size: 0.5 } } } } } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { size: 1e21 } } } } }], expect: { value: { environments: { stage: { api: { provider: render, settings: { size: 1e21 } } } } } } }
+      - { call: validate, args: [{ environments: { stage: { api: { provider: render, settings: { size: 0.50001 } } } } }], expect: { error: { message: Invalid value for render.size } } }
+
+  # --- credentials, settings and names --------------------------------------------------------
+
+  - name: credentials come from the environment and optional ones may be absent
+    tags: [credentials]
+    steps:
+      - call: resolveCredentials
+        args: [render, { RENDER_API_KEY: rnd_key_1, OTHER: x }]
+        expect: { value: { values: { RENDER_API_KEY: rnd_key_1 }, missing: [] } }
+      - call: resolveCredentials
+        args: [render, { RENDER_OWNER_ID: own-1 }]
+        expect: { value: { values: { RENDER_OWNER_ID: own-1 }, missing: [RENDER_API_KEY] } }
+      - call: resolveCredentials
+        args: [render, { RENDER_API_KEY: "", RENDER_OWNER_ID: "" }]
+        expect: { value: { values: {}, missing: [RENDER_API_KEY] } }
+        note: an empty value is missing
+      - call: resolveCredentials
+        args: [render, { RENDER_API_KEY: null }]
+        expect: { value: { values: {}, missing: [RENDER_API_KEY] } }
+      - call: resolveCredentials
+        args: [render, { render_api_key: x }]
+        expect: { value: { values: {}, missing: [RENDER_API_KEY] } }
+        note: names are case-sensitive
+      - call: resolveCredentials
+        args: [bucket, {}]
+        expect: { value: { values: {}, missing: [] } }
+      - call: resolveCredentials
+        args: [heroku, {}]
+        expect: { error: { message: "Unknown deploy provider: heroku" } }
+
+  - name: declared defaults are merged under the configured settings
+    tags: [settings]
+    steps:
+      - { call: settingsFor, args: [render, { provider: render }], expect: { value: { region: oregon, instances: 1 } } }
+      - { call: settingsFor, args: [render, { provider: render, settings: { region: frankfurt } }], expect: { value: { region: frankfurt, instances: 1 } } }
+      - { call: settingsFor, args: [render, { provider: render, settings: { autoDeploy: true, other: x } }], expect: { value: { region: oregon, instances: 1, autoDeploy: true, other: x } } }
+      - { call: settingsFor, args: [neon, { provider: neon, settings: { a: 1 } }], expect: { value: { a: 1 } } }
+      - { call: settingsFor, args: [neon, { provider: neon }], expect: { value: {} } }
+
+  - name: resource names are lowercase, provider-safe and bounded
+    tags: [names]
+    steps:
+      - { call: resourceName, args: [My_Shop, stage, api], expect: { value: my-shop-stage-api } }
+      - { call: resourceName, args: ["--Shop!!", prod, database], expect: { value: shop-prod-database } }
+      - { call: resourceName, args: ["café été", stage, api], expect: { value: caf-t-stage-api } }
+      - { call: resourceName, args: ["İstanbul", stage, api], expect: { value: i-stanbul-stage-api } }
+      - { call: resourceName, args: ["KELVINK", stage, api], expect: { value: kelvink-stage-api } }
+      - { call: resourceName, args: ["shop😀", stage, api], expect: { value: shop-stage-api } }
+      - { call: resourceName, args: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", prod, database], expect: { value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa } }
+      - { call: resourceName, args: ["shop--x", stage, api, 12], expect: { value: shop-x-stage } }
+      - { call: resourceName, args: [abcdefghi, stage, api, 10], expect: { value: abcdefghi } }
+      - { call: resourceName, args: [shop, stage, api, 14], expect: { value: shop-stage-api } }
+      - { call: resourceName, args: [shop, stage, api, 13], expect: { value: shop-stage-ap } }
+      - { call: resourceName, args: [shop, stage, api, 0], expect: { value: "" } }
+      - { call: resourceName, args: [shop, stage, api, -2], expect: { value: shop-stage-a } }
+      - { call: resourceName, args: [shop, stage, api, -20], expect: { value: "" } }
+      - { call: resourceName, args: ["", "", ""], expect: { value: "" } }
+      - { call: resourceName, args: [shop, stage, api, null], expect: { value: shop-stage-api } }
+
+  # --- secrets --------------------------------------------------------------------------------
+
+  - name: only the API, database and files roles receive secrets
+    tags: [secrets]
+    steps:
+      - call: variablesFor
+        args: [api, { DATABASE_URL: "postgres://x", JWT_SECRET: j, RT_APP_API_URL: "https://api", NODE_ENV: production }]
+        expect: { value: { DATABASE_URL: "postgres://x", JWT_SECRET: j, RT_APP_API_URL: "https://api", NODE_ENV: production } }
+      - call: variablesFor
+        args: [database, { DATABASE_URL: "postgres://x", JWT_SECRET: j }]
+        expect: { value: { DATABASE_URL: "postgres://x", JWT_SECRET: j } }
+      - call: variablesFor
+        args: [files, { JWT_SECRET: j }]
+        expect: { value: { JWT_SECRET: j } }
+      - call: variablesFor
+        args: [ssr, { DATABASE_URL: "postgres://x", JWT_SECRET: j, RT_APP_API_URL: "https://api", RT_APP_ENVIRONMENT: stage, RT_APP_TARGET: portable, NODE_ENV: production, MAIL_FROM: a@b }]
+        expect: { value: { RT_APP_API_URL: "https://api", RT_APP_ENVIRONMENT: stage, RT_APP_TARGET: portable, NODE_ENV: production } }
+      - call: variablesFor
+        args: [frontend, { RT_APP_DATABASE_URL: "https://db", FILES_BUCKET: b }]
+        expect: { value: { RT_APP_DATABASE_URL: "https://db" } }
+
+  - name: public variable names
+    tags: [secrets]
+    steps:
+      - { call: publicVariable, args: [RT_APP_API_URL], expect: { value: true } }
+      - { call: publicVariable, args: [RT_APP_SSR_URL], expect: { value: true } }
+      - { call: publicVariable, args: [RT_APP_A_B_URL], expect: { value: true } }
+      - { call: publicVariable, args: [RT_APP___URL], expect: { value: true } }
+      - { call: publicVariable, args: [RT_APP_ENVIRONMENT], expect: { value: true } }
+      - { call: publicVariable, args: [RT_APP_TARGET], expect: { value: true } }
+      - { call: publicVariable, args: [NODE_ENV], expect: { value: true } }
+      - { call: publicVariable, args: [RT_APP__URL], expect: { value: false } }
+      - { call: publicVariable, args: [RT_APP_URL], expect: { value: false } }
+      - { call: publicVariable, args: [RT_APP_A1_URL], expect: { value: false } }
+      - { call: publicVariable, args: [RT_APP_API_URL_2], expect: { value: false } }
+      - { call: publicVariable, args: [rt_app_api_url], expect: { value: false } }
+      - { call: publicVariable, args: [NODE_ENV2], expect: { value: false } }
+      - { call: publicVariable, args: ["NODE_ENV\n"], expect: { value: false } }
+      - { call: publicVariable, args: [DATABASE_URL], expect: { value: false } }
+      - { call: publicVariable, args: [JWT_SECRET], expect: { value: false } }
+
+  - name: secret values are credentials then variables with 4 or more UTF-16 units
+    tags: [secrets, unicode]
+    steps:
+      - call: secretValues
+        args: [{ credentials: { B: token-1234, A: abc }, variables: { DATABASE_URL: "postgres://u:p@h/db", SHORT: "no", SAME: token-1234 } }]
+        expect: { value: [token-1234, "postgres://u:p@h/db", token-1234] }
+      - call: secretValues
+        args: [{ credentials: { A: "😀😀", B: "😀ab", C: "😀a", D: "éééé" }, variables: {} }]
+        expect: { value: ["😀😀", "😀ab", "éééé"] }
+        note: '"😀" counts 2 units, "é" one'
+      - { call: secretValues, args: [{}], expect: { value: [] } }
+
+  - name: redaction replaces every occurrence of secrets of 4+ units
+    tags: [secrets]
+    steps:
+      - { call: redact, args: ["token sk_live_123456 invalid, again sk_live_123456", [sk_live_123456]], expect: { value: "token [redacted] invalid, again [redacted]" } }
+      - { call: redact, args: [abc abc, [abc]], expect: { value: abc abc } }
+      - { call: redact, args: [abc, ["", abc]], expect: { value: abc } }
+      - { call: redact, args: [aaaaaa, [aaaa]], expect: { value: "[redacted]aa" } }
+      - { call: redact, args: [abcdef abcd, [abcd, abcdef]], expect: { value: "[redacted]ef [redacted]" } }
+      - { call: redact, args: [abcdef abcd, [abcdef, abcd]], expect: { value: "[redacted] [redacted]" } }
+      - { call: redact, args: ["x😀😀y", ["😀😀"]], expect: { value: "x[redacted]y" } }
+      - { call: redact, args: ["a.b*c a.b*c", ["a.b*c"]], expect: { value: "[redacted] [redacted]" }, note: "secrets are literal text, never patterns" }
+      - { call: redact, args: [nothing here, []], expect: { value: nothing here } }
+
+  - name: provider errors are prefixed with the provider
+    tags: [secrets]
+    steps:
+      - { call: providerError, args: [Render, 502, "GET /services → 502 busy"], expect: { value: { provider: Render, status: 502, message: "Render: GET /services → 502 busy" } } }
+      - { call: providerError, args: [Neon, 0, "GET /x failed: timeout"], expect: { value: { provider: Neon, status: 0, message: "Neon: GET /x failed: timeout" } } }
+
+  # --- plan -----------------------------------------------------------------------------------
+
+  - name: plan runs every configured role in deploy order with its own context
+    tags: [plan]
+    steps:
+      - call: plan
+        args:
+          - environment: stage
+            settings:
+              environments:
+                stage:
+                  frontend: { provider: vercel }
+                  api: { provider: render, settings: { region: frankfurt } }
+                  database: { provider: neon }
+                prod: { api: { provider: render } }
+            env: { NEON_API_KEY: neon-key-1, RENDER_API_KEY: rnd-key-1, VERCEL_TOKEN: vcl-token-1, UNUSED_KEY: unused }
+            variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: stage }
+            sources: { api: { branch: stage, directory: ".", runtime: node }, frontend: { branch: stage, directory: apps/spa, runtime: static, outputDirectory: dist } }
+        expect:
+          value:
+            - { provider: neon, role: database, environment: stage, actions: [{ action: create, resource: shop-stage-database, detail: new }] }
+            - { provider: render, role: api, environment: stage, actions: [{ action: create, resource: shop-stage-api, detail: new }] }
+            - { provider: vercel, role: frontend, environment: stage, actions: [{ action: create, resource: shop-stage-frontend, detail: new }] }
+      - call: calls
+        expect:
+          value:
+            - { call: plan, provider: neon, app: shop, environment: stage, role: database, settings: {}, credentials: { NEON_API_KEY: neon-key-1 }, variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: stage }, source: { branch: main, directory: "." } }
+            - { call: plan, provider: render, app: shop, environment: stage, role: api, settings: { region: frankfurt, instances: 1 }, credentials: { RENDER_API_KEY: rnd-key-1 }, variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: stage }, source: { branch: stage, directory: ".", runtime: node } }
+            - { call: plan, provider: vercel, app: shop, environment: stage, role: frontend, settings: {}, credentials: { VERCEL_TOKEN: vcl-token-1 }, variables: { RT_APP_ENVIRONMENT: stage }, source: { branch: stage, directory: apps/spa, runtime: static, outputDirectory: dist } }
+        note: only declared credentials reach a provider; the frontend never sees JWT_SECRET
+      - call: logs
+        expect: { value: [neon plan database, render plan api, vercel plan frontend] }
+
+  - name: plan keeps provider actions and state, and filters roles
+    tags: [plan]
+    init:
+      providers:
+        - { id: render, roles: [api, ssr], credentials: [{ key: RENDER_API_KEY, label: Key }, { key: RENDER_TEAM, label: Team, optional: true }], actions: [{ action: update, detail: env vars changed }, { action: deploy, detail: from stage }], state: { serviceId: srv-1 } }
+        - *neon
+    steps:
+      - call: plan
+        args: [{ app: My Shop, environment: prod, roles: [api, frontend], settings: { environments: { prod: { api: { provider: render }, ssr: { provider: render }, database: { provider: neon } } } }, env: { RENDER_API_KEY: k-render, RENDER_TEAM: team-1 } }]
+        expect:
+          value:
+            - provider: render
+              role: api
+              environment: prod
+              actions: [{ action: update, resource: my-shop-prod-api, detail: env vars changed }, { action: deploy, resource: my-shop-prod-api, detail: from stage }]
+              state: { serviceId: srv-1 }
+        note: roles outside the filter (and filtered roles without a target) are skipped, so the neon key is not needed
+      - call: calls
+        expect: { value: [{ call: plan, provider: render, app: My Shop, environment: prod, role: api, settings: {}, credentials: { RENDER_API_KEY: k-render, RENDER_TEAM: team-1 }, variables: {}, source: { branch: main, directory: "." } }] }
+      - { call: plan, args: [{ environment: develop, settings: { environments: { prod: { api: { provider: render } } } } }], expect: { value: [] } }
+      - { call: plan, args: [{ environment: prod, roles: [], settings: { environments: { prod: { api: { provider: render } } } } }], expect: { value: [] } }
+
+  - name: missing credentials stop the plan before any provider call
+    tags: [plan, credentials]
+    steps:
+      - call: plan
+        args: [{ environment: stage, settings: { environments: { stage: { ssr: { provider: render }, api: { provider: render }, database: { provider: neon }, files: { provider: bucket } } } }, env: { RENDER_OWNER_ID: o } }]
+        expect: { error: { message: "Missing credentials: neon:NEON_API_KEY, render:RENDER_API_KEY, render:RENDER_API_KEY" } }
+        note: one entry per role, in deploy order
+      - { call: calls, expect: { value: [] } }
+      - call: plan
+        args: [{ environment: stage, settings: { environments: { stage: { api: { provider: heroku } } } } }]
+        expect: { error: { message: "Unknown deploy provider: heroku" } }
+        note: settings given to the orchestrator are not validated again
+
+  - name: a plan failure propagates unchanged with secrets redacted
+    tags: [plan, secrets]
+    init:
+      providers:
+        - { id: render, roles: [api], credentials: [{ key: RENDER_API_KEY, label: Key }], fail: { plan: { message: "GET /services?key=rnd-secret-key → 401 bad key rnd-secret-key for postgres://u:pw@db/x", status: 401 } } }
+        - { id: flaky, roles: [ssr], fail: { plan: "timeout while reading token jwt-secret-value" } }
+        - *neon
+    steps:
+      - call: plan
+        args: [{ environment: stage, settings: { environments: { stage: { api: { provider: render }, database: { provider: neon } } } }, env: { RENDER_API_KEY: rnd-secret-key, NEON_API_KEY: neon-key }, variables: { DATABASE_URL: "postgres://u:pw@db/x" } }]
+        expect: { error: { status: 401, message: "render: GET /services?key=[redacted] → 401 bad key [redacted] for [redacted]" } }
+      - { call: logs, expect: { value: [neon plan database, render plan api] } }
+      - call: plan
+        args: [{ environment: stage, settings: { environments: { stage: { ssr: { provider: flaky } } } }, variables: { JWT_SECRET: jwt-secret-value } }]
+        expect: { error: { message: "timeout while reading token jwt-secret-value" } }
+        note: the SSR never receives JWT_SECRET, so it cannot redact (or leak) it
+      - call: plan
+        args: [{ environment: stage, settings: { environments: { stage: { ssr: { provider: flaky } } } }, variables: { RT_APP_TARGET: jwt-secret-value } }]
+        expect: { error: { message: "timeout while reading token [redacted]" } }
+
+  # --- apply ----------------------------------------------------------------------------------
+
+  - name: apply feeds outputs to later roles and never gives secrets to the SSR or frontend
+    tags: [apply, secrets]
+    steps:
+      - call: apply
+        args:
+          - environment: prod
+            settings: { environments: { prod: { frontend: { provider: vercel }, ssr: { provider: render }, api: { provider: render }, files: { provider: bucket }, database: { provider: neon } } } }
+            env: { NEON_API_KEY: neon-key-1, RENDER_API_KEY: rnd-key-1, VERCEL_TOKEN: vcl-token-1 }
+            variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: prod }
+        expect:
+          value:
+            results:
+              - { provider: neon, role: database, outputs: { DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" }, resources: [{ kind: service, id: neon-database, name: shop-prod-database }] }
+              - { provider: bucket, role: files, url: "https://files.example", outputs: { FILES_BUCKET: shop-files, FILES_KEY: files-secret-key }, resources: [{ kind: service, id: bucket-files, name: shop-prod-files }] }
+              - { provider: render, role: api, url: "https://shop-api.onrender.com", resources: [{ kind: service, id: render-api, name: shop-prod-api }] }
+              - { provider: render, role: ssr, url: "https://shop-ssr.onrender.com", resources: [{ kind: service, id: render-ssr, name: shop-prod-ssr }] }
+              - { provider: vercel, role: frontend, url: "https://shop-web.vercel.app", resources: [{ kind: service, id: vercel-frontend, name: shop-prod-frontend }] }
+            outputs:
+              DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop"
+              RT_APP_FILES_URL: "https://files.example"
+              FILES_BUCKET: shop-files
+              FILES_KEY: files-secret-key
+              RT_APP_API_URL: "https://shop-api.onrender.com"
+              RT_APP_SSR_URL: "https://shop-ssr.onrender.com"
+              RT_APP_FRONTEND_URL: "https://shop-web.vercel.app"
+      - call: calls
+        expect:
+          value:
+            - { call: plan, provider: neon, role: database, variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: prod }, app: shop, environment: prod, settings: {}, credentials: { NEON_API_KEY: neon-key-1 }, source: { branch: main, directory: "." } }
+            - { call: apply, provider: neon, role: database, variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: prod }, app: shop, environment: prod, settings: {}, credentials: { NEON_API_KEY: neon-key-1 }, source: { branch: main, directory: "." } }
+            - { call: plan, provider: bucket, role: files, variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: prod, DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" }, app: shop, environment: prod, settings: {}, credentials: {}, source: { branch: main, directory: "." } }
+            - { call: apply, provider: bucket, role: files, variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: prod, DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" }, app: shop, environment: prod, settings: {}, credentials: {}, source: { branch: main, directory: "." } }
+            - { call: plan, provider: render, role: api, variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: prod, DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop", RT_APP_FILES_URL: "https://files.example", FILES_BUCKET: shop-files, FILES_KEY: files-secret-key }, app: shop, environment: prod, settings: { region: oregon, instances: 1 }, credentials: { RENDER_API_KEY: rnd-key-1 }, source: { branch: main, directory: "." } }
+            - { call: apply, provider: render, role: api, variables: { JWT_SECRET: jwt-secret-1, RT_APP_ENVIRONMENT: prod, DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop", RT_APP_FILES_URL: "https://files.example", FILES_BUCKET: shop-files, FILES_KEY: files-secret-key }, app: shop, environment: prod, settings: { region: oregon, instances: 1 }, credentials: { RENDER_API_KEY: rnd-key-1 }, source: { branch: main, directory: "." } }
+            - { call: plan, provider: render, role: ssr, variables: { RT_APP_ENVIRONMENT: prod, RT_APP_FILES_URL: "https://files.example", RT_APP_API_URL: "https://shop-api.onrender.com" }, app: shop, environment: prod, settings: { region: oregon, instances: 1 }, credentials: { RENDER_API_KEY: rnd-key-1 }, source: { branch: main, directory: "." } }
+            - { call: apply, provider: render, role: ssr, variables: { RT_APP_ENVIRONMENT: prod, RT_APP_FILES_URL: "https://files.example", RT_APP_API_URL: "https://shop-api.onrender.com" }, app: shop, environment: prod, settings: { region: oregon, instances: 1 }, credentials: { RENDER_API_KEY: rnd-key-1 }, source: { branch: main, directory: "." } }
+            - { call: plan, provider: vercel, role: frontend, variables: { RT_APP_ENVIRONMENT: prod, RT_APP_FILES_URL: "https://files.example", RT_APP_API_URL: "https://shop-api.onrender.com", RT_APP_SSR_URL: "https://shop-ssr.onrender.com" }, app: shop, environment: prod, settings: {}, credentials: { VERCEL_TOKEN: vcl-token-1 }, source: { branch: main, directory: "." } }
+            - { call: apply, provider: vercel, role: frontend, variables: { RT_APP_ENVIRONMENT: prod, RT_APP_FILES_URL: "https://files.example", RT_APP_API_URL: "https://shop-api.onrender.com", RT_APP_SSR_URL: "https://shop-ssr.onrender.com" }, app: shop, environment: prod, settings: {}, credentials: { VERCEL_TOKEN: vcl-token-1 }, source: { branch: main, directory: "." } }
+        note: DATABASE_URL, FILES_KEY and JWT_SECRET reach the API, never the SSR or the frontend
+      - call: logs
+        expect: { value: [neon plan database, neon apply database, bucket plan files, bucket apply files, render plan api, render apply api, render plan ssr, render apply ssr, vercel plan frontend, vercel apply frontend] }
+
+  - name: later outputs override earlier ones and a URL output is public
+    tags: [apply]
+    init:
+      providers:
+        - { id: neon, roles: [database], urls: { database: "https://console.neon.example" }, outputs: { database: { DATABASE_URL: "postgres://first", RT_APP_API_URL: "https://placeholder" } } }
+        - { id: render, roles: [api, ssr], urls: { api: "https://api.example" }, outputs: { api: { DATABASE_URL: "postgres://second" } } }
+    steps:
+      - call: apply
+        args: [{ environment: stage, settings: { environments: { stage: { database: { provider: neon }, api: { provider: render }, ssr: { provider: render } } } } }]
+        expect:
+          value:
+            results:
+              - { provider: neon, role: database, url: "https://console.neon.example", outputs: { DATABASE_URL: "postgres://first", RT_APP_API_URL: "https://placeholder" }, resources: [{ kind: service, id: neon-database, name: shop-stage-database }] }
+              - { provider: render, role: api, url: "https://api.example", outputs: { DATABASE_URL: "postgres://second" }, resources: [{ kind: service, id: render-api, name: shop-stage-api }] }
+              - { provider: render, role: ssr, resources: [{ kind: service, id: render-ssr, name: shop-stage-ssr }] }
+            outputs: { RT_APP_DATABASE_URL: "https://console.neon.example", DATABASE_URL: "postgres://second", RT_APP_API_URL: "https://api.example" }
+      - call: calls
+        expect:
+          value:
+            - { $partial: { call: plan, role: database, variables: {} } }
+            - { $partial: { call: apply, role: database, variables: {} } }
+            - { $partial: { call: plan, role: api, variables: { RT_APP_DATABASE_URL: "https://console.neon.example", DATABASE_URL: "postgres://first", RT_APP_API_URL: "https://placeholder" } } }
+            - { $partial: { call: apply, role: api } }
+            - { $partial: { call: plan, role: ssr, variables: { RT_APP_DATABASE_URL: "https://console.neon.example", RT_APP_API_URL: "https://api.example" } } }
+            - { $partial: { call: apply, role: ssr }, note: "RT_APP_<ROLE>_URL matches the public pattern, so the SSR sees the database console URL" }
+
+  - name: apply stops at the first failure and reports what was applied
+    tags: [apply]
+    init:
+      providers:
+        - *neon
+        - { id: render, roles: [api, ssr], credentials: [{ key: RENDER_API_KEY, label: Key }], fail: { apply: { message: "quota exceeded for rnd-key-1", status: 402, roles: [ssr] } } }
+        - { id: vercel, roles: [frontend] }
+    steps:
+      - call: apply
+        args: [{ environment: stage, settings: { environments: { stage: { database: { provider: neon }, api: { provider: render }, ssr: { provider: render }, frontend: { provider: vercel } } } }, env: { NEON_API_KEY: n, RENDER_API_KEY: rnd-key-1 } }]
+        expect: { error: { status: null, message: "render: quota exceeded for [redacted] (already applied: database:neon, api:render)" } }
+        note: the provider error is wrapped in a plain Error (no status)
+      - { call: logs, expect: { value: [neon plan database, neon apply database, render plan api, render apply api, render plan ssr, render apply ssr] } }
+      - call: calls
+        expect: { value: [{ $partial: { call: plan, role: database } }, { $partial: { call: apply, role: database } }, { $partial: { call: plan, role: api } }, { $partial: { call: apply, role: api } }, { $partial: { call: plan, role: ssr } }, { $partial: { call: apply, role: ssr } }] }
+        note: the frontend is never planned
+
+  - name: a failure on the first role reports nothing applied; plan failures are wrapped too
+    tags: [apply]
+    init:
+      providers:
+        - { id: render, roles: [api], fail: { plan: boom } }
+        - { id: neon, roles: [database], fail: { apply: { message: disk full, status: 507 } } }
+    steps:
+      - call: apply
+        args: [{ environment: stage, settings: { environments: { stage: { api: { provider: render } } } } }]
+        expect: { error: { message: "boom (already applied: nothing)" } }
+      - call: apply
+        args: [{ environment: stage, settings: { environments: { stage: { api: { provider: render }, database: { provider: neon } } } } }]
+        expect: { error: { message: "neon: disk full (already applied: nothing)" } }
+      - { call: logs, expect: { value: [render plan api, neon plan database, neon apply database] } }
+
+  - name: apply checks every credential first and deploys nothing for an empty environment
+    tags: [apply, credentials]
+    steps:
+      - call: apply
+        args: [{ environment: stage, settings: { environments: { stage: { database: { provider: neon }, api: { provider: render } } } }, env: { NEON_API_KEY: n } }]
+        expect: { error: { message: "Missing credentials: render:RENDER_API_KEY" } }
+      - { call: calls, expect: { value: [] } }
+      - call: apply
+        args: [{ environment: develop, settings: { environments: { stage: { api: { provider: render } } } } }]
+        expect: { value: { results: [], outputs: {} } }

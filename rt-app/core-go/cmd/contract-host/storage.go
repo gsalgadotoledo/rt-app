@@ -1,6 +1,6 @@
 package main
 
-// Subjects: nosql-memory, feature-flags.
+// Subjects: nosql-memory, nosql-json (jsonstore.go), feature-flags.
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 
 func init() {
 	register("nosql-memory", memoryStoreSubject)
+	register("nosql-json", nosqlJSONSubject)
 	register("feature-flags", featureFlagsSubject)
 }
 

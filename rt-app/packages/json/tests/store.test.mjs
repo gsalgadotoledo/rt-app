@@ -36,3 +36,20 @@ test('separate processes cannot both claim the same key',async t=>{
  })));
  assert.deepEqual(results.sort(),[0,2]);assert.equal((await new JsonStore(file).list('p')).items.length,1);
 });
+test('list orders sort keys by Unicode code point, like the other stores, and cursors follow that order',async t=>{
+ const s=new JsonStore(await fixture(t));
+ await s.transact(['😀','�','é','z'].map(sk=>({row:row(sk),expected:null})));
+ assert.deepEqual((await s.list('p')).items.map(r=>r.sk),['z','é','�','😀']);
+ const cursor=Buffer.from(JSON.stringify({pk:'p',sk:'�'})).toString('base64url');
+ assert.deepEqual((await s.list('p',cursor)).items.map(r=>r.sk),['😀']);
+});
+test('TTL retention reads the injected clock (epoch ms or Date)',async t=>{
+ const file=await fixture(t);let now=10_000;
+ const s=new JsonStore(file,5000,{now:()=>now});
+ await s.transact([{row:{pk:'CACHE#a',sk:'x',version:1,data:{},ttl:10},expected:null},{row:{pk:'CACHE#a',sk:'y',version:1,data:{},ttl:11},expected:null}]);
+ assert.deepEqual((await s.list('CACHE#a')).items.map(r=>r.sk),['y']);
+ now=11_000;await s.transact([]);assert.deepEqual((await s.list('CACHE#a')).items,[]);
+ const d=new JsonStore(file,5000,{now:()=>new Date(0)});
+ await d.transact([{row:{pk:'CACHE#a',sk:'z',version:1,data:{},ttl:1},expected:null}]);
+ assert.equal((await d.get('CACHE#a','z')).ttl,1);
+});

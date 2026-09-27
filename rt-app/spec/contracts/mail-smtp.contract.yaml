@@ -1,0 +1,365 @@
+contract: 1
+module: mail-smtp
+subject: mail-smtp
+title: Production SMTP mailer (TLS required)
+description: |
+  @gsalgadotoledo/rt-app-mail-smtp: smtpOptions(SMTP_URL) and SmtpMailer({url, from, transport?})
+  for deployments outside AWS (Resend, Postmark, SendGrid, Mailgun SMTP…).
+
+  Subject mail-smtp: init {url, from, transport, sink?}. transport "fake" records what the mailer
+  hands its transport (sent()), "failing" throws "535 auth failed for <init.url>", "real" builds
+  the real transport from url (the constructor never connects), "sink" sends with the real
+  transport to an SMTP sink on 127.0.0.1 ("{port}" in url is the sink's port; sink {starttls,
+  auth} shapes it, see mail-local.contract.yaml for delivered() and commands()). Methods:
+  send({to, subject, text, html?}), sendCode(email, code, purpose), sent(), delivered(),
+  commands(), smtpOptions(url).
+
+  smtpOptions(url) parses url with the WHATWG URL parser (smtp and smtps are not special schemes):
+  leading/trailing C0 controls and spaces are trimmed and tabs/newlines removed; an unparsable
+  URL → Error "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465"; a scheme
+  other than smtp/smtps (case-insensitive) → Error "SMTP_URL must use smtp:// or smtps://".
+  Returns {host, port, secure, requireTLS, auth?, connectionTimeout: 10000, greetingTimeout:
+  10000, socketTimeout: 20000, disableFileAccess: true, disableUrlAccess: true}:
+  - host is the URL hostname as parsed: case kept, non-ASCII percent-encoded (opaque host), IPv6
+    in brackets and compressed, "" when the URL has no authority;
+  - port is Number(url port || (smtps ? 465 : 587)) — the URL port is digits in [0, 65535]
+    (leading zeros allowed), so "0" stays 0;
+  - secure = smtps (implicit TLS), requireTLS = !secure (STARTTLS required: plain-text SMTP is
+    refused so credentials never cross the network in clear);
+  - auth = {user: decodeURIComponent(username), pass: decodeURIComponent(password)} when the
+    username is not empty (the last "@" ends the credentials, the first ":" splits them); a
+    malformed percent escape throws URIError "URI malformed".
+
+  SmtpMailer: from is required first (Error "MAIL_FROM is required" when empty or missing); without
+  an injected transport the URL is parsed by the constructor (its errors above). send(message)
+  hands the transport {from, ...message}; any transport failure becomes 503 "Email delivery is
+  temporarily unavailable", never echoing the provider's reply or credentials. sendCode(email,
+  code, purpose) sends subject "RT-App: <purpose>" and text "Your code is <code>. It expires in 10
+  minutes. If you did not request it, ignore this email.". The real transport never sends AUTH,
+  MAIL or data before TLS: with smtps it starts with a TLS handshake, with smtp it sends EHLO then
+  STARTTLS (even when the server does not offer it) and fails when STARTTLS is refused. Message
+  building (addresses, headers, bodies) is the one of mail-local.contract.yaml.
+init: { url: "smtps://user:password@smtp.example.com", from: "App <no-reply@example.com>", transport: fake }
+cases:
+  # --- smtpOptions ----------------------------------------------------------------------------
+
+  - name: smtps URLs use implicit TLS and decode credentials
+    tags: [options]
+    call: smtpOptions
+    args: ["smtps://re%40send:p%3Ass@smtp.resend.com"]
+    expect:
+      value:
+        host: smtp.resend.com
+        port: 465
+        secure: true
+        requireTLS: false
+        auth: { user: re@send, pass: "p:ss" }
+        connectionTimeout: 10000
+        greetingTimeout: 10000
+        socketTimeout: 20000
+        disableFileAccess: true
+        disableUrlAccess: true
+
+  - name: smtp URLs require STARTTLS and keep an explicit port
+    tags: [options]
+    call: smtpOptions
+    args: ["smtp://u:p@smtp.example.com:2525"]
+    expect: { value: { host: smtp.example.com, port: 2525, secure: false, requireTLS: true, auth: { user: u, pass: p }, connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 20000, disableFileAccess: true, disableUrlAccess: true } }
+
+  - name: without credentials there is no auth and the STARTTLS port is 587
+    tags: [options]
+    call: smtpOptions
+    args: ["smtp://relay.internal"]
+    expect: { value: { $partial: { host: relay.internal, port: 587, secure: false, requireTLS: true, auth: null } } }
+
+  - name: the scheme is case-insensitive and the host keeps its case
+    tags: [options]
+    call: smtpOptions
+    args: ["SMTPS://SMTP.Example.COM"]
+    expect: { value: { $partial: { host: SMTP.Example.COM, port: 465, secure: true, requireTLS: false, auth: null } } }
+
+  - name: port 465 with smtp still means STARTTLS
+    tags: [options, security]
+    call: smtpOptions
+    args: ["smtp://h:465"]
+    expect: { value: { $partial: { host: h, port: 465, secure: false, requireTLS: true } } }
+
+  - name: URL ports are digits in [0, 65535]
+    tags: [options, numbers]
+    steps:
+      - call: smtpOptions
+        args: ["smtp://h:65535"]
+        expect: { value: { $partial: { port: 65535 } } }
+      - call: smtpOptions
+        args: ["smtp://h:0025"]
+        expect: { value: { $partial: { port: 25 } } }
+      - call: smtpOptions
+        args: ["smtp://h:0"]
+        expect: { value: { $partial: { port: 0 } } }
+        note: '"0" is a non-empty port, so it is kept'
+      - call: smtpOptions
+        args: ["smtp://h:"]
+        expect: { value: { $partial: { port: 587 } } }
+      - call: smtpOptions
+        args: ["smtp://h:99999"]
+        expect: { error: { status: null, message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: ["smtp://h:abc"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: ["smtp://h:+1"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+
+  - name: IPv6 hosts stay in brackets, compressed
+    tags: [options]
+    steps:
+      - call: smtpOptions
+        args: ["smtp://[::1]:25"]
+        expect: { value: { $partial: { host: "[::1]", port: 25 } } }
+      - call: smtpOptions
+        args: ["smtp://[0:0:0:0:0:0:0:1]"]
+        expect: { value: { $partial: { host: "[::1]" } } }
+      - call: smtpOptions
+        args: ["smtp://[2001:DB8:0:0:1:0:0:1]"]
+        expect: { value: { $partial: { host: "[2001:db8::1:0:0:1]" } } }
+      - call: smtpOptions
+        args: ["smtp://[::ffff:1.2.3.4]"]
+        expect: { value: { $partial: { host: "[::ffff:102:304]" } } }
+      - call: smtpOptions
+        args: ["smtp://[::1"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: ["smtp://[1::2::3]"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+
+  - name: credentials split at the last @ and the first colon
+    tags: [options, security]
+    steps:
+      - call: smtpOptions
+        args: ["smtp://a@b@h"]
+        expect: { value: { $partial: { host: h, auth: { user: a@b, pass: "" } } } }
+      - call: smtpOptions
+        args: ["smtp://u:p:q@h"]
+        expect: { value: { $partial: { host: h, auth: { user: u, pass: "p:q" } } } }
+      - call: smtpOptions
+        args: ["smtp://u@h"]
+        expect: { value: { $partial: { auth: { user: u, pass: "" } } } }
+      - call: smtpOptions
+        args: ["smtp://:p@h"]
+        expect: { value: { $partial: { host: h, auth: null } } }
+        note: an empty username means no auth, even with a password
+      - call: smtpOptions
+        args: ["smtp://user%3Aname:pa%40ss%20w@h"]
+        expect: { value: { $partial: { auth: { user: "user:name", pass: pa@ss w } } } }
+      - call: smtpOptions
+        args: ["smtp://ü:ö%F0%9F%98%80@h"]
+        expect: { value: { $partial: { auth: { user: ü, pass: ö😀 } } } }
+      - call: smtpOptions
+        args: ["smtp://u:p@"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+        note: credentials need a host
+
+  - name: malformed percent escapes in credentials throw URIError
+    tags: [options, errors]
+    steps:
+      - call: smtpOptions
+        args: ["smtp://u:%zz@h"]
+        expect: { error: { status: null, message: URI malformed } }
+      - call: smtpOptions
+        args: ["smtp://%E0%A4%A@h"]
+        expect: { error: { message: URI malformed } }
+      - call: smtpOptions
+        args: ["smtp://u:%ED%A0%80@h"]
+        expect: { error: { message: URI malformed } }
+        note: an encoded surrogate is not UTF-8
+
+  - name: hosts are opaque (non-ASCII is percent-encoded, case and escapes are kept)
+    tags: [options, unicode]
+    steps:
+      - call: smtpOptions
+        args: ["smtp://bücher.example"]
+        expect: { value: { $partial: { host: b%C3%BCcher.example } } }
+      - call: smtpOptions
+        args: ["smtp://b%C3%BCcher.example"]
+        expect: { value: { $partial: { host: b%C3%BCcher.example } } }
+      - call: smtpOptions
+        args: ["smtp://h%2Fx"]
+        expect: { value: { $partial: { host: h%2Fx } } }
+      - call: smtpOptions
+        args: ["smtp://0x7f.1"]
+        expect: { value: { $partial: { host: 0x7f.1 } } }
+        note: no IPv4 rewriting for a non-special scheme
+
+  - name: forbidden host characters make the URL invalid
+    tags: [options, security]
+    steps:
+      - call: smtpOptions
+        args: ["smtp://ex ample.com"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: ["smtp://h\\x"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: ["smtp://h|x"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: ["smtp://h^x"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: ["smtp://h<x"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+
+  - name: paths, queries and fragments are ignored
+    tags: [options]
+    call: smtpOptions
+    args: ["smtp://h/path?x=1#f"]
+    expect: { value: { $partial: { host: h, port: 587 } } }
+
+  - name: surrounding spaces are trimmed and tabs and newlines removed
+    tags: [options, security]
+    steps:
+      - call: smtpOptions
+        args: ["  smtp://h  "]
+        expect: { value: { $partial: { host: h } } }
+      - call: smtpOptions
+        args: ["smtp://smtp\n.example\t.com\r"]
+        expect: { value: { $partial: { host: smtp.example.com } } }
+
+  - name: a URL without an authority has an empty host
+    tags: [options, edge]
+    steps:
+      - call: smtpOptions
+        args: ["smtp:relay"]
+        expect: { value: { $partial: { host: "", port: 587, auth: null } } }
+      - call: smtpOptions
+        args: ["smtp://"]
+        expect: { value: { $partial: { host: "", port: 587 } } }
+
+  - name: other schemes are refused
+    tags: [options, security]
+    steps:
+      - call: smtpOptions
+        args: ["http://smtp.example.com"]
+        expect: { error: { status: null, message: "SMTP_URL must use smtp:// or smtps://" } }
+      - call: smtpOptions
+        args: ["mailto:a@b"]
+        expect: { error: { message: "SMTP_URL must use smtp:// or smtps://" } }
+      - call: smtpOptions
+        args: ["smtp+tls://h"]
+        expect: { error: { message: "SMTP_URL must use smtp:// or smtps://" } }
+
+  - name: unparsable URLs are refused
+    tags: [options]
+    steps:
+      - call: smtpOptions
+        args: ["not a url"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: [""]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+      - call: smtpOptions
+        args: ["http://"]
+        expect: { error: { message: "SMTP_URL must be a URL like smtps://user:password@smtp.example.com:465" } }
+        note: URL validity is checked before the scheme
+      - call: smtpOptions
+        args: ["smtp.example.com:465"]
+        expect: { error: { message: "SMTP_URL must use smtp:// or smtps://" } }
+        note: '"smtp.example.com:" parses as a scheme'
+
+  # --- SmtpMailer -----------------------------------------------------------------------------
+
+  - name: codes are sent from MAIL_FROM
+    tags: [mailer]
+    steps:
+      - call: sendCode
+        args: [ana@example.com, "123456", Sign in]
+        expect: { value: null }
+      - call: sent
+        expect: { value: [{ from: "App <no-reply@example.com>", to: ana@example.com, subject: "RT-App: Sign in", text: "Your code is 123456. It expires in 10 minutes. If you did not request it, ignore this email." }] }
+
+  - name: messages are handed to the transport with MAIL_FROM
+    tags: [mailer]
+    steps:
+      - call: send
+        args: [{ to: "Ana <ana@example.com>", subject: "Receipt é", text: "Thanks", html: "<p>Thanks</p>" }]
+        expect: { value: null }
+      - call: sent
+        expect: { value: [{ from: "App <no-reply@example.com>", to: "Ana <ana@example.com>", subject: "Receipt é", text: Thanks, html: "<p>Thanks</p>" }] }
+
+  - name: provider errors become 503 without the provider reply
+    tags: [mailer, errors, security]
+    init: { url: "smtps://user:secretpass@smtp.example.com", from: a@example.com, transport: failing }
+    steps:
+      - call: send
+        args: [{ to: x@example.com, subject: s, text: t }]
+        expect: { error: { status: 503, message: Email delivery is temporarily unavailable } }
+      - call: sendCode
+        args: [x@example.com, "123456", login]
+        expect: { error: { status: 503, message: Email delivery is temporarily unavailable } }
+
+  - name: MAIL_FROM is required
+    tags: [mailer, config]
+    init: { url: "smtps://h", from: "", transport: fake }
+    create: { error: { status: null, message: MAIL_FROM is required } }
+
+  - name: a missing MAIL_FROM is refused before the URL is read
+    tags: [mailer, config]
+    init: { url: "not a url", from: null, transport: real }
+    create: { error: { message: MAIL_FROM is required } }
+
+  - name: the real transport parses the URL when the mailer is built
+    tags: [mailer, config]
+    init: { url: "http://smtp.example.com", from: a@example.com, transport: real }
+    create: { error: { status: null, message: "SMTP_URL must use smtp:// or smtps://" } }
+
+  - name: the real transport does not connect when the mailer is built
+    tags: [mailer]
+    init: { url: "smtps://u:p@smtp.example.com", from: a@example.com, transport: real }
+    call: sent
+    expect: { value: [] }
+
+  - name: an injected transport skips URL parsing
+    tags: [mailer]
+    init: { url: "not a url", from: a@example.com, transport: fake }
+    steps:
+      - call: sendCode
+        args: [ana@example.com, "1", x]
+        expect: { value: null }
+      - call: sent
+        expect: { value: { $length: 1 } }
+
+  # --- the real transport ---------------------------------------------------------------------
+
+  - name: STARTTLS is required before anything else is sent
+    tags: [transport, security]
+    init: { url: "smtp://user:secretpass@127.0.0.1:{port}", from: "App <no-reply@example.com>", transport: sink }
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: t }]
+        expect: { error: { status: 503, message: Email delivery is temporarily unavailable } }
+      - call: commands
+        expect: { value: [EHLO, STARTTLS] }
+        note: no AUTH, MAIL or DATA in clear text
+      - call: delivered
+        expect: { value: [] }
+
+  - name: STARTTLS refused by a server that offers it still stops the delivery
+    tags: [transport, security]
+    init: { url: "smtp://user:secretpass@127.0.0.1:{port}", from: "App <no-reply@example.com>", transport: sink, sink: { starttls: true, auth: true } }
+    steps:
+      - call: sendCode
+        args: [ana@example.com, "123456", login]
+        expect: { error: { status: 503, message: Email delivery is temporarily unavailable } }
+      - call: commands
+        expect: { value: [EHLO, STARTTLS] }
+
+  - name: smtps starts with a TLS handshake
+    tags: [transport, security]
+    init: { url: "smtps://user:secretpass@127.0.0.1:{port}", from: "App <no-reply@example.com>", transport: sink, sink: { auth: true } }
+    steps:
+      - call: send
+        args: [{ to: ana@example.com, subject: s, text: t }]
+        expect: { error: { status: 503, message: Email delivery is temporarily unavailable } }
+      - call: commands
+        expect: { value: [] }
+        note: a plain-text server never sees a command

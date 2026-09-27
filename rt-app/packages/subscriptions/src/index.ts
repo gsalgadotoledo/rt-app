@@ -680,11 +680,12 @@ export class Subscriptions {
   }
 
   /** Daily subscription statistics for the overview (new and canceled subscriptions). */
-  private async statsWrite(event: "new" | "canceled"): Promise<Write> {
+  /** One write of today's SUB_STATS row counting every event (a transaction writes a key once). */
+  private async statsWrite(...events: ("new" | "canceled")[]): Promise<Write> {
     const key = "day:" + dayKey(this.now());
     const row = await this.store.get("SUB_STATS", key);
     const data = { new: 0, canceled: 0, ...row?.data };
-    data[event] += 1;
+    for (const event of events) data[event] += 1;
     return write(row, "SUB_STATS", key, data);
   }
 
@@ -1056,7 +1057,9 @@ export class Subscriptions {
           "billing:" + plan.id + ":" + data.periodStart + ":" + randomUUID(),
         ),
       );
-    if (isActive && !wasSubscribed) writes.push(await this.statsWrite("new"));
+    // One sync can both start and cancel (canceled before its first webhook): count both in one write.
+    const stats: ("new" | "canceled")[] = [];
+    if (isActive && !wasSubscribed) stats.push("new");
     const canceled =
       (data.cancelAtPeriodEnd && !old.data.cancelAtPeriodEnd) ||
       (data.status === "canceled" && old.data.status !== "canceled" && !old.data.cancelAtPeriodEnd);
@@ -1069,8 +1072,9 @@ export class Subscriptions {
           "billing-cancel:" + plan.id + ":" + randomUUID(),
         ),
       );
-      writes.push(await this.statsWrite("canceled"));
+      stats.push("canceled");
     }
+    if (stats.length) writes.push(await this.statsWrite(...stats));
     await this.store.transact([write(old, "SUB_ACCOUNTS", userId, data), ...writes]);
   }
 

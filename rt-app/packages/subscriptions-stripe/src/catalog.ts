@@ -6,9 +6,9 @@ import {HttpError} from '@gsalgadotoledo/rt-app-contracts';
 /** Versioned catalog publisher. Uses stable remote IDs to resume partial work. */
 export class StripeCatalog implements CatalogPublisher {
   private stripe: Stripe;
-  constructor(secret: string) {
+  constructor(secret: string, options: {httpClient?: Stripe.HttpClient} = {}) {
     if (!/^(sk|rk)_(test|live)_/.test(secret)) throw new HttpError(400, 'Configure STRIPE_SECRET_KEY or enter a Stripe secret/restricted key');
-    this.stripe = new Stripe(secret, {maxNetworkRetries: 1, timeout: 10000});
+    this.stripe = new Stripe(secret, {maxNetworkRetries: 1, timeout: 10000, ...(options.httpClient ? {httpClient: options.httpClient} : {})});
   }
   async publish(plan: Plan, namespace: string, previous?: Plan) {
     const token = createHash('sha256').update(`${namespace}:${plan.id}:${plan.version ?? '0.0.1'}`).digest('hex').slice(0,40);

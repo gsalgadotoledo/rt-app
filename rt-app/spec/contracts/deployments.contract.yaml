@@ -1,0 +1,618 @@
+contract: 1
+module: deployments
+subject: deployments
+title: Deployments workbench (project files, local credentials, GitHub, plan/apply/status)
+description: |
+  @gsalgadotoledo/rt-app-deployments: what rta deploy / rta github, the local admin page and the
+  Service Manager share. The /__dev/deploy handler is the deployments-server contract and the
+  commands the deployments-cli contract. Node host: spec/hosts/node/deploy.mjs.
+
+  Subject deployments: every instance owns a fresh temporary project directory.
+  init {settings? (written as rt-app.settings.json with JSON.stringify(v, null, 2) + "\n"; default
+  {version: 1, project: {name: shop}}), settingsText? (written as is), noSettings? (no file),
+  credentials? / credentialsText? (.rt-app/credentials.json, mode 0600), providers? (fake providers
+  of the deploy contract, registered after the aws provider), origin? (git remote of the fake
+  runner, default "git@github.com:acme/shop.git"; "" means no remote), ghAuthenticated? (true),
+  failOn? (a runner call whose "command args…" text contains it fails with stderr "boom\n"),
+  env? (process environment, {}), passwordVerifier? (false: none; else the fake
+  password → "fake-verifier:<UTF-16 length>")}.
+  Fake runner: `git remote get-url origin` prints origin + "\n" (status 2 without origin),
+  `gh auth status` exits 0 or 1, `gh repo create [name] …` sets origin to
+  "https://github.com/<name or acme/shop>.git", anything else exits 0. runs() → [{command, args,
+  input (stdin or null), cwd ("." for the project directory)}].
+  Methods: sourceFor(role, repository, branch), runtimeVariables(environment, env), constants() →
+  {branches, runtimeSecrets}, aws(call, context) (the aws provider: plan | apply | status),
+  readDeploySettings() → {settings, deploy}, saveDeploySettings(deploy), readCredentials(),
+  saveCredential(environment, key, value) → null, credentialStatus(env?) (for the deploy section
+  read from the file), githubRepository() (null when none), syncGithub({environments?,
+  secrets?}), connectGithub({visibility?, name?}), planDeployment / applyDeployment /
+  deploymentStatus({environment, roles?, env? (init.env)}); files: text(name?) (default
+  rt-app.settings.json; null when missing), writeText(name, text), remove(name), mode(name) (octal
+  permission bits, e.g. "600"), chmod(name, mode), files(dir?) (sorted names); helpers runs(),
+  calls() (provider calls, see deploy), logs() (context.log lines), setOrigin(origin).
+
+  Files (shared by every language on the machine, pinned byte for byte):
+  - rt-app.settings.json is read with JSON.parse; a missing file fails with Error "ENOENT: no such
+    file or directory, open '<absolute path>'" (the ports copy Node's message). saveDeploySettings
+    validates (deploy contract), then writes {...settings, deploy: validated}: every other key is
+    kept in place (deploy keeps its position, or is appended), as JSON.stringify(value, null, 2) +
+    "\n" — JavaScript property order (array-index keys first in numeric order, then insertion
+    order; a repeated key keeps its first position and last value), JavaScript numbers (1.0 → 1,
+    1E21 → 1e+21, -0 → 0, 1E400 → null, integers beyond 2^53 rounded to float64), only '"', '\' and
+    U+0000–U+001F escaped, "{}" and "[]" for empty containers. The file is written to
+    "<file>.<pid>.tmp", renamed over the file and chmod 0644. A failed validation or a missing file
+    leaves the directory unchanged.
+  - .rt-app/credentials.json: {environment: {KEY: value}}, same JSON format, mode 0600 (chmod after
+    every write), directory created when missing. A missing file reads as {}. saveCredential checks
+    the environment ("Unknown environment: <env>"), the key (^[A-Z][A-Z0-9_]{1,80}$, else "Invalid
+    credential name: <key>"), then the value (a string of at most 10000 UTF-16 units, else "Invalid
+    credential value"); a non-empty value is set (an existing key keeps its position), an empty one
+    deletes the key; the environment keeps its position (or is appended) even when it becomes {}.
+    Other top-level keys are kept.
+
+  sourceFor(role, repository, branch): api {repository, branch, directory: ".", runtime: node,
+  buildCommand: "npm ci --include=dev && npm run build", startCommand: "node
+  apps/server/dist/migrate.js up && node apps/server/dist/index.js"}; ssr {…, directory: apps/ssr,
+  runtime: node, buildCommand: "npm run build", startCommand: "npm start"}; frontend {…, directory:
+  apps/spa, runtime: static, buildCommand: "npm run build", outputDirectory: dist}; files and
+  database {…, directory: ".", runtime: node}. runtimeVariables: {RT_APP_TARGET: portable,
+  RT_APP_ENVIRONMENT, NODE_ENV: production} plus every truthy RUNTIME_SECRETS value, in that order.
+
+  credentialStatus(root, registry, deploy, env) → {develop, stage, prod}: for each environment the
+  distinct providers of its targets (first appearance, in the file's role order), each
+  {provider, credentials: [{...spec, present: Boolean(value)}], missing} where values are
+  {...env, ...local[environment]}. Never values.
+
+  GitHub: githubRepository runs `git remote get-url origin` in the project and matches the trimmed
+  output with /github\.com[:/]([^/]+\/[^/.]+?)(\.git)?$/ (JavaScript $: end of input). syncGithub
+  needs a repository ("No GitHub origin. Run: rta github connect") and `gh auth status` ("GitHub CLI
+  is not authenticated. Run: gh auth login"); for each environment (all three by default) it runs
+  `gh api --method PUT repos/<repo>/environments/<env> --silent` ("Could not create environment
+  <env>: <trimmed stderr>"), then, for {...truthy secrets, ...local[env]} in that order, skips keys
+  that are not credential names and runs `gh secret set KEY --env <env> --repo <repo>` with the
+  value on stdin, never in argv ("Could not set KEY in <env>: <trimmed stderr>"). It returns
+  {repository, secrets: {env: [keys…]}}. connectGithub returns {repository, created: false} for an
+  existing origin, else needs gh auth, runs `gh repo create [name] --private|--public --source .
+  --push` ("gh repo create failed: <trimmed stderr>") and returns the new origin's repository with
+  created: true.
+
+  Plan/apply/status of an environment: settings and deploy are read (and validated) from the
+  file, env = {...options.env, ...local[environment]} (local credentials win), app =
+  String(settings.project?.name ?? "app"), sources = sourceFor(role, githubRepository(), BRANCHES[env])
+  (develop → develop, stage → stage, prod → main), variables = runtimeVariables(environment, env).
+  Roles served by aws (Terraform) are left out of plan and apply; with no provider role left, plan
+  returns [] and apply {results: [], outputs: {}} without calling anything. deploymentStatus walks
+  ROLES order (api, ssr, frontend, files, database) over every configured role, aws included, and
+  never throws for one role: missing credentials give {role, provider, state: unknown, detail:
+  "Missing K1, K2"}, a provider error {role, provider, state: unknown, detail: message}, otherwise
+  {role, provider, ...status}. Status calls receive empty variables.
+init:
+  providers:
+    - &render
+      id: render
+      name: Render
+      roles: [api, ssr, frontend]
+      credentials:
+        - { key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys" }
+        - { key: RENDER_OWNER_ID, label: Workspace id, optional: true }
+      settings:
+        - { key: region, label: Region, type: string, default: oregon, options: [oregon, frankfurt] }
+      urls: { api: "https://shop-api.onrender.com" }
+      statuses: { api: { state: live, url: "https://shop-api.onrender.com" }, ssr: { state: deploying, detail: build 42 } }
+    - &neon
+      id: neon
+      name: Neon
+      roles: [database]
+      credentials: [{ key: NEON_API_KEY, label: API key }]
+      outputs: { database: { DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" } }
+  settings: &settings
+    version: 1
+    project: { name: shop }
+    deploy:
+      environments:
+        stage:
+          database: { provider: neon }
+          api: { provider: render, settings: { region: frankfurt } }
+          frontend: { provider: aws }
+        prod:
+          api: { provider: aws }
+cases:
+  # --- layout, runtime variables and the aws provider -----------------------------------------
+
+  - name: branches and runtime secrets
+    tags: [layout]
+    steps:
+      - call: constants
+        expect: { value: { branches: { develop: develop, stage: stage, prod: main }, runtimeSecrets: [JWT_SECRET, ADMIN_PASSWORD_VERIFIER, MAIL_FROM, SMTP_URL, DATABASE_URL] } }
+
+  - name: sources follow the starter layout
+    tags: [layout]
+    steps:
+      - call: sourceFor
+        args: [api, acme/shop, main]
+        expect: { value: { repository: acme/shop, branch: main, directory: ".", runtime: node, buildCommand: "npm ci --include=dev && npm run build", startCommand: "node apps/server/dist/migrate.js up && node apps/server/dist/index.js" } }
+      - call: sourceFor
+        args: [ssr, acme/shop, stage]
+        expect: { value: { repository: acme/shop, branch: stage, directory: apps/ssr, runtime: node, buildCommand: npm run build, startCommand: npm start } }
+      - call: sourceFor
+        args: [frontend, null, develop]
+        expect: { value: { branch: develop, directory: apps/spa, runtime: static, buildCommand: npm run build, outputDirectory: dist } }
+      - { call: sourceFor, args: [files, a/b, x], expect: { value: { repository: a/b, branch: x, directory: ".", runtime: node } } }
+      - { call: sourceFor, args: [database, a/b, x], expect: { value: { repository: a/b, branch: x, directory: ".", runtime: node } } }
+
+  - name: runtime variables are the portable target plus the runtime secrets that are set
+    tags: [layout, secrets]
+    steps:
+      - call: runtimeVariables
+        args: [stage, { SMTP_URL: "smtps://mail.example", JWT_SECRET: j, UNRELATED: x, MAIL_FROM: "", RENDER_API_KEY: r }]
+        expect: { value: { RT_APP_TARGET: portable, RT_APP_ENVIRONMENT: stage, NODE_ENV: production, JWT_SECRET: j, SMTP_URL: "smtps://mail.example" } }
+      - { call: runtimeVariables, args: [prod, {}], expect: { value: { RT_APP_TARGET: portable, RT_APP_ENVIRONMENT: prod, NODE_ENV: production } } }
+
+  - name: AWS is plannable but deployed by Terraform
+    tags: [aws]
+    steps:
+      - call: aws
+        args: [plan, { app: shop, environment: prod, role: api }]
+        expect: { value: { provider: aws, role: api, environment: prod, actions: [{ action: noop, resource: api, detail: "Managed by the Terraform pipeline (rta install / GitHub workflow)" }] } }
+      - call: aws
+        args: [apply, { app: shop, environment: prod, role: frontend }]
+        expect: { error: { message: "AWS frontend is deployed by the Terraform pipeline: run rta install or merge to the environment branch" } }
+      - { call: aws, args: [status, { app: shop, environment: prod, role: api }], expect: { value: { state: unknown, detail: See the GitHub deploy workflow or rta urls } } }
+
+  # --- rt-app.settings.json -------------------------------------------------------------------
+
+  - name: the deploy section is read and validated from rt-app.settings.json
+    tags: [settings]
+    steps:
+      - call: readDeploySettings
+        expect:
+          value:
+            settings: *settings
+            deploy: { environments: { stage: { database: { provider: neon }, api: { provider: render, settings: { region: frankfurt } }, frontend: { provider: aws } }, prod: { api: { provider: aws } } } }
+
+  - name: a settings file without deploy has nothing configured
+    tags: [settings]
+    init: { settings: { version: 1 } }
+    steps:
+      - { call: readDeploySettings, expect: { value: { settings: { version: 1 }, deploy: { environments: {} } } } }
+
+  - name: an invalid deploy section in the file fails
+    tags: [settings, validation]
+    init: { settings: { deploy: { environments: { stage: { api: { provider: heroku } } } } } }
+    steps:
+      - { call: readDeploySettings, expect: { error: { message: "Unknown deploy provider: heroku" } } }
+
+  - name: a missing settings file fails with the Node ENOENT message
+    tags: [settings, errors]
+    init: { noSettings: true }
+    steps:
+      - { call: readDeploySettings, expect: { error: { message: { $regex: "^ENOENT: no such file or directory, open '.+rt-app\\.settings\\.json'$" } } } }
+      - { call: saveDeploySettings, args: [{ environments: {} }], expect: { error: { message: { $regex: "^ENOENT: no such file or directory, open '.+rt-app\\.settings\\.json'$" } } } }
+      - { call: files, expect: { value: [] }, note: "saving never creates the settings file" }
+
+  - name: a settings file that is not JSON fails
+    tags: [settings, errors]
+    init: { settingsText: "{\"version\": 1," }
+    steps:
+      - { call: readDeploySettings, expect: { error: { message: { $type: string } } } }
+      - { call: saveDeploySettings, args: [{ environments: {} }], expect: { error: { message: { $type: string } } } }
+      - { call: text, expect: { value: "{\"version\": 1," } }
+
+  - name: saving keeps every other setting and writes the file the way JavaScript does
+    tags: [settings, format]
+    init:
+      providers: [*render, *neon]
+      settingsText: "{\"version\":1.0,\"project\":{\"name\":\"shop\",\"2\":\"two\",\"10\":\"ten\",\"1\":\"one\"},\"deploy\":{\"environments\":{\"prod\":{}}},\"runtime\":{\"local\":{\"mode\":\"json\"},\"empty\":{},\"list\":[],\"nested\":[[],{}]},\"n\":[1E21,1e-7,-0,0.5,12345678901234567890,1E400,100.0],\"s\":\"é😀<>&/\\u2028\\u0000\\u001f\\t\\\"\\\\\\u007f\",\"dup\":1,\"x\":true,\"dup\":2,\"z\":null}"
+    steps:
+      - call: saveDeploySettings
+        args: [{ environments: { stage: { api: { provider: render, settings: { region: oregon } }, database: { provider: neon } } } }]
+        expect: { value: { environments: { stage: { api: { provider: render, settings: { region: oregon } }, database: { provider: neon } } } } }
+      - call: text
+        expect:
+          value: "{\n  \"version\": 1,\n  \"project\": {\n    \"1\": \"one\",\n    \"2\": \"two\",\n    \"10\": \"ten\",\n    \"name\": \"shop\"\n  },\n  \"deploy\": {\n    \"environments\": {\n      \"stage\": {\n        \"api\": {\n          \"provider\": \"render\",\n          \"settings\": {\n            \"region\": \"oregon\"\n          }\n        },\n        \"database\": {\n          \"provider\": \"neon\"\n        }\n      }\n    }\n  },\n  \"runtime\": {\n    \"local\": {\n      \"mode\": \"json\"\n    },\n    \"empty\": {},\n    \"list\": [],\n    \"nested\": [\n      [],\n      {}\n    ]\n  },\n  \"n\": [\n    1e+21,\n    1e-7,\n    0,\n    0.5,\n    12345678901234567000,\n    null,\n    100\n  ],\n  \"s\": \"é😀<>&/ \\u0000\\u001f\\t\\\"\\\\\u007f\",\n  \"dup\": 2,\n  \"x\": true,\n  \"z\": null\n}\n"
+        note: deploy keeps its position; array-index keys come first; a repeated key keeps its first position and last value
+      - { call: mode, expect: { value: "644" } }
+      - { call: files, expect: { value: [rt-app.settings.json] }, note: "no temporary file survives" }
+
+  - name: a new deploy section is appended and the file mode becomes 0644
+    tags: [settings, format]
+    init:
+      providers: [*render]
+      settingsText: "{\"version\":1,\"project\":{\"name\":\"shop\"}}"
+    steps:
+      - { call: chmod, args: [rt-app.settings.json, "600"], expect: { value: null } }
+      - call: saveDeploySettings
+        args: [{ environments: { prod: {}, develop: { ssr: { provider: render } } } }]
+        expect: { value: { environments: { prod: {}, develop: { ssr: { provider: render } } } } }
+      - call: text
+        expect: { value: "{\n  \"version\": 1,\n  \"project\": {\n    \"name\": \"shop\"\n  },\n  \"deploy\": {\n    \"environments\": {\n      \"prod\": {},\n      \"develop\": {\n        \"ssr\": {\n          \"provider\": \"render\"\n        }\n      }\n    }\n  }\n}\n" }
+        note: environments keep the input order
+      - { call: mode, expect: { value: "644" } }
+      - { call: saveDeploySettings, args: [null], expect: { value: { environments: {} } } }
+      - { call: text, expect: { value: "{\n  \"version\": 1,\n  \"project\": {\n    \"name\": \"shop\"\n  },\n  \"deploy\": {\n    \"environments\": {}\n  }\n}\n" } }
+
+  - name: an invalid deploy section is not saved
+    tags: [settings, validation]
+    init:
+      providers: [*render]
+      settingsText: "{\"version\":1}"
+    steps:
+      - { call: saveDeploySettings, args: [{ environments: { stage: { database: { provider: render } } } }], expect: { error: { message: Render does not support the database role } } }
+      - { call: saveDeploySettings, args: [{ environments: { stage: { api: { provider: aws, settings: { region: x } } } } }], expect: { error: { message: Unknown setting region for aws } } }
+      - { call: text, expect: { value: "{\"version\":1}" } }
+      - { call: files, expect: { value: [rt-app.settings.json] } }
+
+  # --- local credentials ----------------------------------------------------------------------
+
+  - name: credentials live in a 0600 git-ignored file, one object per environment
+    tags: [credentials, format]
+    steps:
+      - { call: readCredentials, expect: { value: {} } }
+      - { call: files, args: [.rt-app], expect: { value: null } }
+      - { call: saveCredential, args: [stage, RENDER_API_KEY, rnd_secret], expect: { value: null } }
+      - { call: saveCredential, args: [prod, NEON_API_KEY, "neon é 😀"], expect: { value: null } }
+      - { call: saveCredential, args: [stage, OTHER_KEY, x], expect: { value: null } }
+      - { call: saveCredential, args: [stage, RENDER_API_KEY, rnd_secret_2], expect: { value: null } }
+      - { call: readCredentials, expect: { value: { stage: { RENDER_API_KEY: rnd_secret_2, OTHER_KEY: x }, prod: { NEON_API_KEY: "neon é 😀" } } } }
+      - call: text
+        args: [.rt-app/credentials.json]
+        expect: { value: "{\n  \"stage\": {\n    \"RENDER_API_KEY\": \"rnd_secret_2\",\n    \"OTHER_KEY\": \"x\"\n  },\n  \"prod\": {\n    \"NEON_API_KEY\": \"neon é 😀\"\n  }\n}\n" }
+        note: an updated key keeps its position
+      - { call: mode, args: [.rt-app/credentials.json], expect: { value: "600" } }
+      - { call: files, args: [.rt-app], expect: { value: [credentials.json] } }
+
+  - name: an empty value deletes the key and the environment stays
+    tags: [credentials, format]
+    init: { credentials: { stage: { A_KEY: a, B_KEY: b } } }
+    steps:
+      - { call: saveCredential, args: [stage, A_KEY, ""], expect: { value: null } }
+      - { call: saveCredential, args: [stage, B_KEY, ""], expect: { value: null } }
+      - { call: saveCredential, args: [prod, NOT_THERE, ""], expect: { value: null } }
+      - { call: text, args: [.rt-app/credentials.json], expect: { value: "{\n  \"stage\": {},\n  \"prod\": {}\n}\n" } }
+
+  - name: files written by another language are read, kept and rewritten in the same format
+    tags: [credentials, format]
+    init: { credentialsText: "{\"qa\":{\"X\":\"1\"},\"prod\":{\"B_KEY\":\"b\",\"A_KEY\":\"a\"}}" }
+    steps:
+      - { call: chmod, args: [.rt-app/credentials.json, "644"], expect: { value: null } }
+      - { call: readCredentials, expect: { value: { qa: { X: "1" }, prod: { B_KEY: b, A_KEY: a } } } }
+      - { call: saveCredential, args: [develop, C_KEY, c], expect: { value: null } }
+      - call: text
+        args: [.rt-app/credentials.json]
+        expect: { value: "{\n  \"qa\": {\n    \"X\": \"1\"\n  },\n  \"prod\": {\n    \"B_KEY\": \"b\",\n    \"A_KEY\": \"a\"\n  },\n  \"develop\": {\n    \"C_KEY\": \"c\"\n  }\n}\n" }
+        note: unknown top-level keys are kept; a new environment is appended
+      - { call: mode, args: [.rt-app/credentials.json], expect: { value: "600" } }
+
+  - name: environment, then name, then value are validated
+    tags: [credentials, validation]
+    steps:
+      - { call: saveCredential, args: [qa, lower, 5], expect: { error: { message: "Unknown environment: qa" } } }
+      - { call: saveCredential, args: [Stage, KEY_A, v], expect: { error: { message: "Unknown environment: Stage" } } }
+      - { call: saveCredential, args: [stage, lower, 5], expect: { error: { message: "Invalid credential name: lower" } } }
+      - { call: saveCredential, args: [stage, A, v], expect: { error: { message: "Invalid credential name: A" } } }
+      - { call: saveCredential, args: [stage, 1ABC, v], expect: { error: { message: "Invalid credential name: 1ABC" } } }
+      - { call: saveCredential, args: [stage, A-B, v], expect: { error: { message: "Invalid credential name: A-B" } } }
+      - { call: saveCredential, args: [stage, _AB, v], expect: { error: { message: "Invalid credential name: _AB" } } }
+      - { call: saveCredential, args: [stage, "AB\n", v], expect: { error: { message: "Invalid credential name: AB\n" } } }
+      - { call: saveCredential, args: [stage, { $text: { repeat: A, count: 82 } }, v], expect: { error: { message: { $regex: "^Invalid credential name: A{82}$" } } } }
+      - { call: saveCredential, args: [stage, { $text: { repeat: A, count: 81 } }, v], expect: { value: null } }
+      - { call: saveCredential, args: [stage, A1, v], expect: { value: null } }
+      - { call: saveCredential, args: [stage, KEY_A, 5], expect: { error: { message: Invalid credential value } } }
+      - { call: saveCredential, args: [stage, KEY_A, null], expect: { error: { message: Invalid credential value } } }
+      - { call: saveCredential, args: [stage, KEY_A, { $text: { repeat: v, count: 10001 } }], expect: { error: { message: Invalid credential value } } }
+      - { call: saveCredential, args: [stage, KEY_A, { $text: { repeat: "😀", count: 5001 } }], expect: { error: { message: Invalid credential value } }, note: "the limit counts UTF-16 units" }
+      - { call: saveCredential, args: [stage, KEY_A, { $text: { repeat: "😀", count: 5000 } }], expect: { value: null } }
+      - { call: saveCredential, args: [stage, KEY_B, { $text: { repeat: v, count: 10000 } }], expect: { value: null } }
+      - { call: readCredentials, expect: { value: { stage: { $partial: { A1: v, KEY_A: { $length: 10000 }, KEY_B: { $length: 10000 } } } } } }
+
+  - name: credential status lists each provider once with present flags and missing keys
+    tags: [credentials, secrets]
+    init:
+      providers: [*render, *neon]
+      settings:
+        project: { name: shop }
+        deploy:
+          environments:
+            stage: { ssr: { provider: render }, database: { provider: neon }, api: { provider: render }, frontend: { provider: aws } }
+            prod: { database: { provider: neon } }
+      credentials: { stage: { NEON_API_KEY: neon-secret-value, RENDER_API_KEY: "" } }
+    steps:
+      - call: credentialStatus
+        expect:
+          value:
+            develop: []
+            stage:
+              - provider: render
+                credentials:
+                  - { key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys", present: false }
+                  - { key: RENDER_OWNER_ID, label: Workspace id, optional: true, present: false }
+                missing: [RENDER_API_KEY]
+              - { provider: neon, credentials: [{ key: NEON_API_KEY, label: API key, present: true }], missing: [] }
+              - { provider: aws, credentials: [], missing: [] }
+            prod:
+              - { provider: neon, credentials: [{ key: NEON_API_KEY, label: API key, present: false }], missing: [NEON_API_KEY] }
+      - call: credentialStatus
+        args: [{ RENDER_API_KEY: from-env, RENDER_OWNER_ID: own, NEON_API_KEY: "" }]
+        expect:
+          value:
+            develop: []
+            stage:
+              - { provider: render, credentials: [{ key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys", present: false }, { key: RENDER_OWNER_ID, label: Workspace id, optional: true, present: true }], missing: [RENDER_API_KEY] }
+              - { provider: neon, credentials: [{ key: NEON_API_KEY, label: API key, present: true }], missing: [] }
+              - { provider: aws, credentials: [], missing: [] }
+            prod:
+              - { provider: neon, credentials: [{ key: NEON_API_KEY, label: API key, present: false }], missing: [NEON_API_KEY] }
+        note: the local file wins over the environment, even with an empty value
+
+  # --- GitHub ---------------------------------------------------------------------------------
+
+  - name: the GitHub repository comes from the origin remote
+    tags: [github]
+    steps:
+      - { call: githubRepository, expect: { value: acme/shop } }
+      - { call: setOrigin, args: ["https://github.com/acme/shop"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: acme/shop } }
+      - { call: setOrigin, args: ["https://github.com/acme/shop.git"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: acme/shop } }
+      - { call: setOrigin, args: ["ssh://git@github.com/acme-co/shop_2.git"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: acme-co/shop_2 } }
+      - { call: setOrigin, args: ["https://x-access-token:tok@github.com/acme/shop.git"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: acme/shop } }
+      - { call: setOrigin, args: ["  https://github.com/acme/shop.git \n\n"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: acme/shop } }
+      - { call: setOrigin, args: ["https://gitlab.com/acme/shop.git"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: null } }
+      - { call: setOrigin, args: ["https://github.com/acme/my.repo.git"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: null } }
+      - { call: setOrigin, args: ["https://github.com/acme/shop/"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: null } }
+      - { call: setOrigin, args: ["https://GitHub.com/acme/shop"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: null } }
+      - { call: setOrigin, args: ["https://github.com/acme/shop.git\nhttps://github.com/other/repo"], expect: { value: null } }
+      - { call: githubRepository, expect: { value: other/repo } }
+      - { call: setOrigin, args: [""], expect: { value: null } }
+      - { call: githubRepository, expect: { value: null } }
+      - { call: runs, expect: { value: [{ $repeat: { count: 12, item: { command: git, args: [remote, get-url, origin], input: null, cwd: "." } } }] } }
+
+  - name: sync creates the environments and pushes secrets through stdin only
+    tags: [github, secrets]
+    init: { credentials: { stage: { RENDER_API_KEY: rnd_local_secret, JWT_SECRET: jwt_local_wins, lower_key: skipped } } }
+    steps:
+      - call: syncGithub
+        args: [{ environments: [stage], secrets: { JWT_SECRET: jwt_env_secret, SMTP_URL: null, MAIL_FROM: "", DATABASE_URL: "postgres://env-db", "1BAD": x } }]
+        expect: { value: { repository: acme/shop, secrets: { stage: [JWT_SECRET, DATABASE_URL, RENDER_API_KEY] } } }
+        note: provided secrets first, local keys after; a local value wins; invalid names are skipped
+      - call: runs
+        expect:
+          value:
+            - { command: git, args: [remote, get-url, origin], input: null, cwd: "." }
+            - { command: gh, args: [auth, status], input: null, cwd: "." }
+            - { command: gh, args: [api, --method, PUT, repos/acme/shop/environments/stage, --silent], input: null, cwd: "." }
+            - { command: gh, args: [secret, set, JWT_SECRET, --env, stage, --repo, acme/shop], input: jwt_local_wins, cwd: "." }
+            - { command: gh, args: [secret, set, DATABASE_URL, --env, stage, --repo, acme/shop], input: "postgres://env-db", cwd: "." }
+            - { command: gh, args: [secret, set, RENDER_API_KEY, --env, stage, --repo, acme/shop], input: rnd_local_secret, cwd: "." }
+
+  - name: sync covers the three environments by default
+    tags: [github]
+    init: { credentials: { prod: { NEON_API_KEY: n } } }
+    steps:
+      - { call: syncGithub, expect: { value: { repository: acme/shop, secrets: { develop: [], stage: [], prod: [NEON_API_KEY] } } } }
+      - call: runs
+        expect:
+          value:
+            - { command: git, args: [remote, get-url, origin], input: null, cwd: "." }
+            - { command: gh, args: [auth, status], input: null, cwd: "." }
+            - { command: gh, args: [api, --method, PUT, repos/acme/shop/environments/develop, --silent], input: null, cwd: "." }
+            - { command: gh, args: [api, --method, PUT, repos/acme/shop/environments/stage, --silent], input: null, cwd: "." }
+            - { command: gh, args: [api, --method, PUT, repos/acme/shop/environments/prod, --silent], input: null, cwd: "." }
+            - { command: gh, args: [secret, set, NEON_API_KEY, --env, prod, --repo, acme/shop], input: n, cwd: "." }
+
+  - name: sync needs an origin and an authenticated GitHub CLI
+    tags: [github, errors]
+    init: { origin: "", ghAuthenticated: false }
+    steps:
+      - { call: syncGithub, expect: { error: { message: "No GitHub origin. Run: rta github connect" } } }
+      - { call: setOrigin, args: ["git@github.com:acme/shop.git"], expect: { value: null } }
+      - { call: syncGithub, expect: { error: { message: "GitHub CLI is not authenticated. Run: gh auth login" } } }
+      - { call: runs, expect: { value: { $length: 3 } } }
+
+  - name: sync reports the failing gh command with its stderr
+    tags: [github, errors]
+    init: { failOn: environments/develop, credentials: { stage: { RENDER_API_KEY: r } } }
+    steps:
+      - { call: syncGithub, expect: { error: { message: "Could not create environment develop: boom" } } }
+      - { call: syncGithub, args: [{ environments: [stage] }], expect: { value: { repository: acme/shop, secrets: { stage: [RENDER_API_KEY] } } } }
+
+  - name: sync stops at a secret that cannot be set
+    tags: [github, errors]
+    init: { failOn: secret set RENDER_API_KEY, credentials: { stage: { A_KEY: a, RENDER_API_KEY: r, Z_KEY: z } } }
+    steps:
+      - { call: syncGithub, args: [{ environments: [stage, prod] }], expect: { error: { message: "Could not set RENDER_API_KEY in stage: boom" } } }
+      - call: runs
+        expect: { value: [{ $any: true }, { $any: true }, { $any: true }, { $partial: { args: [secret, set, A_KEY, --env, stage, --repo, acme/shop] } }, { $partial: { args: [secret, set, RENDER_API_KEY, --env, stage, --repo, acme/shop], input: r } }] }
+
+  - name: connect reuses an origin
+    tags: [github]
+    steps:
+      - { call: connectGithub, args: [{ visibility: public, name: acme/other }], expect: { value: { repository: acme/shop, created: false } } }
+      - { call: runs, expect: { value: [{ command: git, args: [remote, get-url, origin], input: null, cwd: "." }] } }
+
+  - name: connect creates a private repository and pushes
+    tags: [github]
+    init: { origin: "" }
+    steps:
+      - { call: connectGithub, expect: { value: { repository: acme/shop, created: true } } }
+      - call: runs
+        expect:
+          value:
+            - { command: git, args: [remote, get-url, origin], input: null, cwd: "." }
+            - { command: gh, args: [auth, status], input: null, cwd: "." }
+            - { command: gh, args: [repo, create, --private, --source, ., --push], input: null, cwd: "." }
+            - { command: git, args: [remote, get-url, origin], input: null, cwd: "." }
+
+  - name: connect can name the repository and make it public
+    tags: [github]
+    init: { origin: "" }
+    steps:
+      - { call: connectGithub, args: [{ visibility: public, name: acme/new-shop }], expect: { value: { repository: acme/new-shop, created: true } } }
+      - call: runs
+        expect:
+          value:
+            - { command: git, args: [remote, get-url, origin], input: null, cwd: "." }
+            - { command: gh, args: [auth, status], input: null, cwd: "." }
+            - { command: gh, args: [repo, create, acme/new-shop, --public, --source, ., --push], input: null, cwd: "." }
+            - { command: git, args: [remote, get-url, origin], input: null, cwd: "." }
+
+  - name: connect needs gh auth and reports gh failures
+    tags: [github, errors]
+    init: { origin: "", ghAuthenticated: false }
+    steps:
+      - { call: connectGithub, expect: { error: { message: "GitHub CLI is not authenticated. Run: gh auth login" } } }
+
+  - name: connect reports a failed repository creation
+    tags: [github, errors]
+    init: { origin: "", failOn: repo create }
+    steps:
+      - { call: connectGithub, expect: { error: { message: "gh repo create failed: boom" } } }
+
+  # --- plan / apply / status ------------------------------------------------------------------
+
+  - name: plan uses the project name, the repository, the environment branch and local credentials
+    tags: [plan, secrets]
+    init:
+      providers: [*render, *neon]
+      settings: *settings
+      credentials: { stage: { NEON_API_KEY: neon-local-key, JWT_SECRET: jwt-local } }
+      env: { RENDER_API_KEY: rnd-env-key, JWT_SECRET: jwt-env, NEON_API_KEY: neon-env-key, DATABASE_URL: "postgres://env-db", VERCEL_TOKEN: unused }
+    steps:
+      - call: planDeployment
+        args: [{ environment: stage }]
+        expect:
+          value:
+            - { provider: neon, role: database, environment: stage, actions: [{ action: create, resource: shop-stage-database, detail: new }] }
+            - { provider: render, role: api, environment: stage, actions: [{ action: create, resource: shop-stage-api, detail: new }] }
+        note: the aws frontend is left to Terraform
+      - call: calls
+        expect:
+          value:
+            - call: plan
+              provider: neon
+              app: shop
+              environment: stage
+              role: database
+              settings: {}
+              credentials: { NEON_API_KEY: neon-local-key }
+              variables: { RT_APP_TARGET: portable, RT_APP_ENVIRONMENT: stage, NODE_ENV: production, JWT_SECRET: jwt-local, DATABASE_URL: "postgres://env-db" }
+              source: { repository: acme/shop, branch: stage, directory: ".", runtime: node }
+            - call: plan
+              provider: render
+              app: shop
+              environment: stage
+              role: api
+              settings: { region: frankfurt }
+              credentials: { RENDER_API_KEY: rnd-env-key }
+              variables: { RT_APP_TARGET: portable, RT_APP_ENVIRONMENT: stage, NODE_ENV: production, JWT_SECRET: jwt-local, DATABASE_URL: "postgres://env-db" }
+              source: { repository: acme/shop, branch: stage, directory: ".", runtime: node, buildCommand: "npm ci --include=dev && npm run build", startCommand: "node apps/server/dist/migrate.js up && node apps/server/dist/index.js" }
+      - { call: logs, expect: { value: [neon plan database, render plan api] } }
+      - { call: planDeployment, args: [{ environment: stage, roles: [api, frontend] }], expect: { value: [{ $partial: { provider: render, role: api } }] } }
+      - { call: planDeployment, args: [{ environment: prod }], expect: { value: [] } }
+      - { call: planDeployment, args: [{ environment: develop }], expect: { value: [] } }
+      - { call: calls, expect: { value: { $length: 3 } }, note: "AWS-only and empty environments call nothing" }
+
+  - name: plan fails before any call when a credential is missing
+    tags: [plan, credentials]
+    init: { providers: [*render, *neon], settings: *settings }
+    steps:
+      - { call: planDeployment, args: [{ environment: stage }], expect: { error: { message: "Missing credentials: neon:NEON_API_KEY, render:RENDER_API_KEY" } } }
+      - { call: planDeployment, args: [{ environment: stage, env: { RENDER_API_KEY: r } }], expect: { error: { message: "Missing credentials: neon:NEON_API_KEY" } } }
+      - { call: calls, expect: { value: [] } }
+
+  - name: the app name defaults to "app" and the repository may be missing
+    tags: [plan]
+    init:
+      providers: [*render]
+      settings: { project: { title: x }, deploy: { environments: { prod: { ssr: { provider: render } } } } }
+      origin: ""
+      env: { RENDER_API_KEY: r }
+    steps:
+      - { call: planDeployment, args: [{ environment: prod }], expect: { value: [{ provider: render, role: ssr, environment: prod, actions: [{ action: create, resource: app-prod-ssr, detail: new }] }] } }
+      - call: calls
+        expect: { value: [{ $partial: { app: app, variables: { RT_APP_TARGET: portable, RT_APP_ENVIRONMENT: prod, NODE_ENV: production }, source: { branch: main, directory: apps/ssr, runtime: node, buildCommand: npm run build, startCommand: npm start } } }] }
+        note: the SSR only receives public variables
+
+  - name: a numeric project name is converted with String()
+    tags: [plan]
+    init:
+      providers: [*render]
+      settings: { project: { name: 42 }, deploy: { environments: { develop: { api: { provider: render } } } } }
+      env: { RENDER_API_KEY: r }
+    steps:
+      - { call: planDeployment, args: [{ environment: develop }], expect: { value: [{ provider: render, role: api, environment: develop, actions: [{ action: create, resource: 42-develop-api, detail: new }] }] } }
+      - { call: calls, expect: { value: [{ $partial: { app: "42", source: { repository: acme/shop, branch: develop, directory: ".", runtime: node, buildCommand: "npm ci --include=dev && npm run build", startCommand: "node apps/server/dist/migrate.js up && node apps/server/dist/index.js" } } }] } }
+
+  - name: apply deploys the database first and feeds its URL to the API
+    tags: [apply, secrets]
+    init:
+      providers: [*render, *neon]
+      settings: *settings
+      env: { RENDER_API_KEY: rnd-env-key, NEON_API_KEY: neon-env-key, DATABASE_URL: "postgres://placeholder" }
+    steps:
+      - call: applyDeployment
+        args: [{ environment: stage }]
+        expect:
+          value:
+            results:
+              - { provider: neon, role: database, outputs: { DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" }, resources: [{ kind: service, id: neon-database, name: shop-stage-database }] }
+              - { provider: render, role: api, url: "https://shop-api.onrender.com", resources: [{ kind: service, id: render-api, name: shop-stage-api }] }
+            outputs: { DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop", RT_APP_API_URL: "https://shop-api.onrender.com" }
+      - call: calls
+        expect:
+          value:
+            - { $partial: { call: plan, role: database, variables: { RT_APP_TARGET: portable, RT_APP_ENVIRONMENT: stage, NODE_ENV: production, DATABASE_URL: "postgres://placeholder" } } }
+            - { $partial: { call: apply, role: database } }
+            - { $partial: { call: plan, role: api, variables: { RT_APP_TARGET: portable, RT_APP_ENVIRONMENT: stage, NODE_ENV: production, DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" } } }
+            - { $partial: { call: apply, role: api } }
+      - { call: applyDeployment, args: [{ environment: prod }], expect: { value: { results: [], outputs: {} } } }
+      - call: applyDeployment
+        args: [{ environment: stage, roles: [api], env: {} }]
+        expect: { error: { message: "Missing credentials: render:RENDER_API_KEY" } }
+
+  - name: status covers every configured role in role order and never throws for one
+    tags: [status, secrets]
+    init:
+      providers:
+        - *render
+        - { id: neon, name: Neon, roles: [database], credentials: [{ key: NEON_API_KEY, label: API key }, { key: NEON_PROJECT, label: Project }], fail: { status: { message: "GET /projects → 500 key neon-secret-key rejected", status: 500 } } }
+      settings:
+        project: { name: shop }
+        deploy:
+          environments:
+            stage: { database: { provider: neon }, frontend: { provider: aws }, ssr: { provider: render }, api: { provider: render } }
+      env: { RENDER_API_KEY: rnd-key, NEON_API_KEY: neon-secret-key, NEON_PROJECT: p-1 }
+    steps:
+      - call: deploymentStatus
+        args: [{ environment: stage }]
+        expect:
+          value:
+            - { role: api, provider: render, state: live, url: "https://shop-api.onrender.com" }
+            - { role: ssr, provider: render, state: deploying, detail: build 42 }
+            - { role: frontend, provider: aws, state: unknown, detail: See the GitHub deploy workflow or rta urls }
+            - { role: database, provider: neon, state: unknown, detail: "neon: GET /projects → 500 key [redacted] rejected" }
+      - call: deploymentStatus
+        args: [{ environment: stage, env: { NEON_PROJECT: p-1 } }]
+        expect:
+          value:
+            - { role: api, provider: render, state: unknown, detail: Missing RENDER_API_KEY }
+            - { role: ssr, provider: render, state: unknown, detail: Missing RENDER_API_KEY }
+            - { role: frontend, provider: aws, state: unknown, detail: See the GitHub deploy workflow or rta urls }
+            - { role: database, provider: neon, state: unknown, detail: Missing NEON_API_KEY }
+      - call: deploymentStatus
+        args: [{ environment: stage, env: {} }]
+        expect: { value: [{ $any: true }, { $any: true }, { $any: true }, { role: database, provider: neon, state: unknown, detail: "Missing NEON_API_KEY, NEON_PROJECT" }] }
+      - { call: deploymentStatus, args: [{ environment: prod }], expect: { value: [] } }
+      - call: calls
+        expect:
+          value:
+            - { call: status, provider: render, app: shop, environment: stage, role: api, settings: { region: oregon }, credentials: { RENDER_API_KEY: rnd-key }, variables: {}, source: { repository: acme/shop, branch: stage, directory: ".", runtime: node, buildCommand: "npm ci --include=dev && npm run build", startCommand: "node apps/server/dist/migrate.js up && node apps/server/dist/index.js" } }
+            - { $partial: { call: status, role: ssr, variables: {} } }
+            - { $partial: { call: status, role: database, credentials: { NEON_API_KEY: neon-secret-key, NEON_PROJECT: p-1 }, variables: {} }, note: "status calls receive no runtime variables" }

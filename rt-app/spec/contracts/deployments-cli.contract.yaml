@@ -1,0 +1,294 @@
+contract: 1
+module: deployments-cli
+subject: deployments
+title: rta deploy and rta github commands (argument parsing and printed text)
+description: |
+  deployCommand, githubCommand and withCiSecrets of @gsalgadotoledo/rt-app-deployments/cli, driven
+  through the deployments subject (see the deployments contract for init, the fake providers and
+  the fake git/gh runner): deployCommand(argv, stdin?) and githubCommand(argv) return the printed
+  lines (stdin: the text piped in, or null for no stdin); a failing command throws and output()
+  keeps the lines printed before the failure. withCiSecrets(env) is the CI helper. The process
+  environment of the commands is init.env.
+
+  Arguments: argv[0] is the action; the rest is parsed first: an argument that does not start
+  with "--" is positional; --<boolean> sets true; --<value flag> takes the next argument when it
+  exists, is not empty and does not start with "--"; anything else (unknown flags, --env=stage, a
+  missing value) throws Error(USAGE) (the whole usage text is the message). deploy flags: values env
+  and role, boolean json; github flags: values env and name, booleans public and json. --env must
+  be develop, stage or prod and --role a comma-separated list of roles, else Error(USAGE).
+
+  rta deploy: the environment is withCiSecrets(env) (computed before the action, so an invalid
+  RT_APP_SECRETS_JSON fails every action). Provider log lines are printed as "  " + line, except
+  with --json.
+  - providers: one line per catalog entry: id.padEnd(13) + " " + roles.join(", ").padEnd(34) + " "
+    + credential keys joined by " " (optional ones end with "?"); --json: JSON.stringify(catalog,
+    null, 2) as one line.
+  - credentials --env E: the credential status of E (the local file wins over the environment):
+    "<provider>: KEY ✓|–|✗" joined by two spaces (✓ present, – optional and absent, ✗ missing), or
+    "No providers configured for E."; --json: JSON.stringify(status, null, 2).
+  - credentials set --env E KEY: the stdin text trimmed (JavaScript trim) must not be empty
+    ("Pipe the value through stdin, e.g. pbpaste | rta deploy credentials set --env stage
+    RENDER_API_KEY"), then saveCredential, then "Saved KEY for E in .rt-app/credentials.json (local,
+    not committed). Push it with: rta github sync --env E". The value is never printed.
+  - plan --env E [--role r1,r2]: role.padEnd(9) + " " + provider.padEnd(13) + " " +
+    action.padEnd(7) + " " + resource + " — " + detail per action, or "Nothing to plan for E (no
+    provider roles, or AWS only)."; --json: the plans.
+  - apply: role.padEnd(9) + " " + provider.padEnd(13) + " " + (url ?? "(no public URL)"), or
+    "Nothing to apply for E."; --json: [{provider, role, url?, resources}] (never outputs).
+  - status: role.padEnd(9) + " " + provider.padEnd(13) + " " + state.padEnd(9) + " " + (url ??
+    detail ?? ""); nothing printed when no role is configured; --json: the statuses.
+  - any other action: Error(USAGE).
+  rta github: connect prints "Already connected to R" or "Created and pushed R" (--public,
+  --name owner/repo); sync [--env E] pushes local credentials plus the RUNTIME_SECRETS found in the
+  environment (not withCiSecrets) and prints "GitHub R:" then "  E: KEY, KEY" or "  E: environment
+  ready, no secrets yet" per environment; --json: JSON.stringify(result, null, 2).
+
+  withCiSecrets(env): when env.RT_APP_SECRETS_JSON is truthy it is parsed (else Error
+  "RT_APP_SECRETS_JSON is not valid JSON"); the string values of Object.entries(parsed) except
+  github_token come first, then env (explicit variables win), and RT_APP_SECRETS_JSON becomes
+  undefined. JSON null throws a TypeError (message not pinned).
+init:
+  providers:
+    - &render
+      id: render
+      name: Render
+      roles: [api, ssr]
+      website: "https://render.example"
+      credentials:
+        - { key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys" }
+        - { key: RENDER_OWNER_ID, label: Workspace id, optional: true }
+      settings: [{ key: region, label: Region, type: string, default: oregon, options: [oregon, frankfurt], help: Closest to your users }]
+      notes: Free services sleep
+      urls: { api: "https://shop-api.onrender.com" }
+      statuses: { api: { state: live, url: "https://shop-api.onrender.com" } }
+    - &neon
+      id: neon
+      name: Neon
+      roles: [database]
+      website: "https://neon.example"
+      credentials: [{ key: NEON_API_KEY, label: API key }]
+      outputs: { database: { DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" } }
+  settings: &settings
+    version: 1
+    project: { name: shop }
+    deploy: { environments: { stage: { database: { provider: neon }, api: { provider: render }, frontend: { provider: aws } } } }
+  env: &env { RENDER_API_KEY: rnd-env-key, NEON_API_KEY: neon-env-key }
+cases:
+  - name: providers lists every provider with its roles and credential names
+    tags: [cli]
+    steps:
+      - call: deployCommand
+        args: [[providers]]
+        expect: { value: ["aws           api, ssr, frontend, files, database ", "render        api, ssr                           RENDER_API_KEY RENDER_OWNER_ID?", "neon          database                           NEON_API_KEY"] }
+        note: optional credentials end with "?"; padEnd never truncates (aws keeps a trailing space)
+      - call: deployCommand
+        args: [[providers, --json]]
+        expect: { value: ["[\n  {\n    \"id\": \"aws\",\n    \"name\": \"AWS (Lambda, S3 + CloudFront, Amplify, DynamoDB)\",\n    \"roles\": [\n      \"api\",\n      \"ssr\",\n      \"frontend\",\n      \"files\",\n      \"database\"\n    ],\n    \"website\": \"https://aws.amazon.com\",\n    \"credentials\": [],\n    \"settings\": [],\n    \"notes\": \"Deployed by Terraform: run `rta install` once, then merges deploy through the GitHub workflow.\"\n  },\n  {\n    \"id\": \"render\",\n    \"name\": \"Render\",\n    \"roles\": [\n      \"api\",\n      \"ssr\"\n    ],\n    \"website\": \"https://render.example\",\n    \"credentials\": [\n      {\n        \"key\": \"RENDER_API_KEY\",\n        \"label\": \"API key\",\n        \"url\": \"https://dashboard.render.com/u/settings#api-keys\"\n      },\n      {\n        \"key\": \"RENDER_OWNER_ID\",\n        \"label\": \"Workspace id\",\n        \"optional\": true\n      }\n    ],\n    \"settings\": [\n      {\n        \"key\": \"region\",\n        \"label\": \"Region\",\n        \"type\": \"string\",\n        \"default\": \"oregon\",\n        \"options\": [\n          \"oregon\",\n          \"frankfurt\"\n        ],\n        \"help\": \"Closest to your users\"\n      }\n    ],\n    \"notes\": \"Free services sleep\"\n  },\n  {\n    \"id\": \"neon\",\n    \"name\": \"Neon\",\n    \"roles\": [\n      \"database\"\n    ],\n    \"website\": \"https://neon.example\",\n    \"credentials\": [\n      {\n        \"key\": \"NEON_API_KEY\",\n        \"label\": \"API key\"\n      }\n    ],\n    \"settings\": []\n  }\n]"] }
+        note: key order is the catalog order; notes are omitted when undefined
+
+  - name: credentials shows presence marks and never values
+    tags: [cli, credentials, secrets]
+    init: { providers: [*render, *neon], settings: *settings, env: { RENDER_API_KEY: rnd-env-key }, credentials: { stage: { NEON_API_KEY: neon-local-secret } } }
+    steps:
+      - { call: deployCommand, args: [[credentials, --env, stage]], expect: { value: ["neon: NEON_API_KEY ✓", "render: RENDER_API_KEY ✓  RENDER_OWNER_ID –", "aws: "] } }
+      - { call: deployCommand, args: [[credentials, --env, stage, --json]], expect: { value: ["[\n  {\n    \"provider\": \"neon\",\n    \"credentials\": [\n      {\n        \"key\": \"NEON_API_KEY\",\n        \"label\": \"API key\",\n        \"present\": true\n      }\n    ],\n    \"missing\": []\n  },\n  {\n    \"provider\": \"render\",\n    \"credentials\": [\n      {\n        \"key\": \"RENDER_API_KEY\",\n        \"label\": \"API key\",\n        \"url\": \"https://dashboard.render.com/u/settings#api-keys\",\n        \"present\": true\n      },\n      {\n        \"key\": \"RENDER_OWNER_ID\",\n        \"label\": \"Workspace id\",\n        \"optional\": true,\n        \"present\": false\n      }\n    ],\n    \"missing\": []\n  },\n  {\n    \"provider\": \"aws\",\n    \"credentials\": [],\n    \"missing\": []\n  }\n]"] } }
+      - { call: deployCommand, args: [[credentials, --env, prod]], expect: { value: ["No providers configured for prod."] } }
+      - call: deployCommand
+        args: [[credentials, --env, stage]]
+        expect: { value: ["neon: NEON_API_KEY ✓", "render: RENDER_API_KEY ✓  RENDER_OWNER_ID –", "aws: "] }
+
+  - name: missing credentials are marked with a cross
+    tags: [cli, credentials]
+    init: { providers: [*render, *neon], settings: *settings }
+    steps:
+      - { call: deployCommand, args: [[credentials, --env, stage]], expect: { value: ["neon: NEON_API_KEY ✗", "render: RENDER_API_KEY ✗  RENDER_OWNER_ID –", "aws: "] } }
+
+  - name: credentials set reads the value from stdin and never prints it
+    tags: [cli, credentials, secrets]
+    init: { providers: [*render, *neon], settings: *settings }
+    steps:
+      - call: deployCommand
+        args: [[credentials, set, --env, stage, RENDER_API_KEY], "  rnd_from_stdin\n"]
+        expect: { value: ["Saved RENDER_API_KEY for stage in .rt-app/credentials.json (local, not committed). Push it with: rta github sync --env stage"] }
+      - { call: readCredentials, expect: { value: { stage: { RENDER_API_KEY: rnd_from_stdin } } } }
+      - { call: deployCommand, args: [[credentials, --env, stage], null], expect: { value: ["neon: NEON_API_KEY ✗", "render: RENDER_API_KEY ✓  RENDER_OWNER_ID –", "aws: "] } }
+      - call: deployCommand
+        args: [[credentials, set, --env, stage, KEY_Y], " \t\n"]
+        expect: { error: { message: "Pipe the value through stdin, e.g. pbpaste | rta deploy credentials set --env stage RENDER_API_KEY" } }
+      - call: deployCommand
+        args: [[credentials, set, --env, stage, KEY_Y], null]
+        expect: { error: { message: "Pipe the value through stdin, e.g. pbpaste | rta deploy credentials set --env stage RENDER_API_KEY" } }
+      - { call: deployCommand, args: [[credentials, set, --env, stage, lower], v], expect: { error: { message: "Invalid credential name: lower" } } }
+      - { call: deployCommand, args: [[credentials, set, --env, prod, KEY_Z, extra], "\u00a0z\ufeff"], expect: { value: ["Saved KEY_Z for prod in .rt-app/credentials.json (local, not committed). Push it with: rta github sync --env prod"] } }
+      - { call: readCredentials, expect: { value: { stage: { RENDER_API_KEY: rnd_from_stdin }, prod: { KEY_Z: z } } }, note: "JavaScript trim removes NBSP and BOM" }
+
+  - name: plan prints one line per action after the provider log lines
+    tags: [cli, plan]
+    init: { providers: [*render, *neon], settings: *settings, env: *env }
+    steps:
+      - call: deployCommand
+        args: [[plan, --env, stage]]
+        expect: { value: ["  neon plan database", "  render plan api", "database  neon          create  shop-stage-database — new", "api       render        create  shop-stage-api — new"] }
+      - { call: deployCommand, args: [[plan, --json, --role, api, --env, stage]], expect: { value: ["[\n  {\n    \"provider\": \"render\",\n    \"role\": \"api\",\n    \"environment\": \"stage\",\n    \"actions\": [\n      {\n        \"action\": \"create\",\n        \"resource\": \"shop-stage-api\",\n        \"detail\": \"new\"\n      }\n    ]\n  }\n]"] } }
+      - { call: deployCommand, args: [[plan, --env, stage, --role, "frontend,files"]], expect: { value: ["Nothing to plan for stage (no provider roles, or AWS only)."] } }
+      - { call: deployCommand, args: [[plan, --env, prod]], expect: { value: ["Nothing to plan for prod (no provider roles, or AWS only)."] } }
+      - { call: deployCommand, args: [[plan, --env, prod, --json]], expect: { value: ["[]"] } }
+
+  - name: long action names and resources are not truncated
+    tags: [cli, plan]
+    init:
+      providers: [{ id: digitalocean-apps, roles: [ssr], actions: [{ action: recreate, detail: "size changed: basic → pro" }] }]
+      settings: { project: { name: my-very-long-shop }, deploy: { environments: { develop: { ssr: { provider: digitalocean-apps } } } } }
+    steps:
+      - call: deployCommand
+        args: [[plan, --env, develop]]
+        expect: { value: ["  digitalocean-apps plan ssr", "ssr       digitalocean-apps recreate my-very-long-shop-develop-ssr — size changed: basic → pro"] }
+
+  - name: apply prints URLs, never outputs
+    tags: [cli, apply, secrets]
+    init: { providers: [*render, *neon], settings: *settings, env: *env }
+    steps:
+      - call: deployCommand
+        args: [[apply, --env, stage]]
+        expect: { value: ["  neon plan database", "  neon apply database", "  render plan api", "  render apply api", "database  neon          (no public URL)", "api       render        https://shop-api.onrender.com"] }
+      - { call: deployCommand, args: [[apply, --env, stage, --json]], expect: { value: ["[\n  {\n    \"provider\": \"neon\",\n    \"role\": \"database\",\n    \"resources\": [\n      {\n        \"kind\": \"service\",\n        \"id\": \"neon-database\",\n        \"name\": \"shop-stage-database\"\n      }\n    ]\n  },\n  {\n    \"provider\": \"render\",\n    \"role\": \"api\",\n    \"url\": \"https://shop-api.onrender.com\",\n    \"resources\": [\n      {\n        \"kind\": \"service\",\n        \"id\": \"render-api\",\n        \"name\": \"shop-stage-api\"\n      }\n    ]\n  }\n]"] } }
+      - { call: deployCommand, args: [[apply, --env, develop]], expect: { value: ["Nothing to apply for develop."] } }
+
+  - name: a failed apply keeps the lines printed so far
+    tags: [cli, apply, errors]
+    init:
+      providers: [*neon, { id: render, roles: [api], credentials: [{ key: RENDER_API_KEY, label: Key }], fail: { apply: "quota exceeded for rnd-env-key" } }]
+      settings: *settings
+      env: *env
+    steps:
+      - { call: deployCommand, args: [[apply, --env, stage]], expect: { error: { message: "quota exceeded for [redacted] (already applied: database:neon)" } } }
+      - { call: output, expect: { value: ["  neon plan database", "  neon apply database", "  render plan api", "  render apply api"] } }
+      - { call: deployCommand, args: [[plan, --env, stage], null], expect: { value: { $length: 4 } } }
+      - { call: deployCommand, args: [[apply, --env, stage, --json]], expect: { error: { message: "quota exceeded for [redacted] (already applied: database:neon)" } } }
+      - { call: output, expect: { value: [] }, note: "--json prints no log lines" }
+
+  - name: status prints state and URL or detail
+    tags: [cli, status]
+    init: { providers: [*render, *neon], settings: *settings, env: *env }
+    steps:
+      - call: deployCommand
+        args: [[status, --env, stage]]
+        expect: { value: ["api       render        live      https://shop-api.onrender.com", "frontend  aws           unknown   See the GitHub deploy workflow or rta urls", "database  neon          live      "] }
+      - { call: deployCommand, args: [[status, --env, stage, --json]], expect: { value: ["[\n  {\n    \"role\": \"api\",\n    \"provider\": \"render\",\n    \"state\": \"live\",\n    \"url\": \"https://shop-api.onrender.com\"\n  },\n  {\n    \"role\": \"frontend\",\n    \"provider\": \"aws\",\n    \"state\": \"unknown\",\n    \"detail\": \"See the GitHub deploy workflow or rta urls\"\n  },\n  {\n    \"role\": \"database\",\n    \"provider\": \"neon\",\n    \"state\": \"live\"\n  }\n]"] } }
+      - { call: deployCommand, args: [[status, --env, prod]], expect: { value: [] } }
+      - { call: deployCommand, args: [[status, --env, stage, --role, api]], expect: { value: { $length: 3 } }, note: "status accepts --role but reports every role" }
+
+  - name: plan and apply fail on missing credentials before printing anything
+    tags: [cli, credentials, errors]
+    init: { providers: [*render, *neon], settings: *settings }
+    steps:
+      - { call: deployCommand, args: [[plan, --env, stage]], expect: { error: { message: "Missing credentials: neon:NEON_API_KEY, render:RENDER_API_KEY" } } }
+      - { call: output, expect: { value: [] } }
+      - { call: deployCommand, args: [[apply, --env, stage, --role, api]], expect: { error: { message: "Missing credentials: render:RENDER_API_KEY" } } }
+      - call: deployCommand
+        args: [[status, --env, stage]]
+        expect: { value: ["api       render        unknown   Missing RENDER_API_KEY", "frontend  aws           unknown   See the GitHub deploy workflow or rta urls", "database  neon          unknown   Missing NEON_API_KEY"] }
+
+  - name: CI passes every environment secret as RT_APP_SECRETS_JSON
+    tags: [cli, ci, secrets]
+    init:
+      providers: [*render, *neon]
+      settings: *settings
+      env: { RT_APP_SECRETS_JSON: "{\"RENDER_API_KEY\":\"from-ci\",\"NEON_API_KEY\":\"neon-ci\",\"JWT_SECRET\":\"jwt-ci\",\"github_token\":\"ghs_x\",\"NUM\":5}", NEON_API_KEY: neon-explicit }
+    steps:
+      - { call: deployCommand, args: [[plan, --env, stage, --json]], expect: { value: { $length: 1 } } }
+      - call: calls
+        expect:
+          value:
+            - { $partial: { role: database, credentials: { NEON_API_KEY: neon-explicit } } }
+            - { $partial: { role: api, credentials: { RENDER_API_KEY: from-ci }, variables: { RT_APP_TARGET: portable, RT_APP_ENVIRONMENT: stage, NODE_ENV: production, JWT_SECRET: jwt-ci } } }
+        note: explicit variables win; github_token and non-string values are dropped
+
+  - name: an invalid RT_APP_SECRETS_JSON fails every deploy action
+    tags: [cli, ci, errors]
+    init: { env: { RT_APP_SECRETS_JSON: "{" } }
+    steps:
+      - { call: deployCommand, args: [[providers]], expect: { error: { message: RT_APP_SECRETS_JSON is not valid JSON } } }
+      - { call: deployCommand, args: [[plan, --env, qa]], expect: { error: { message: RT_APP_SECRETS_JSON is not valid JSON } }, note: "the environment is read before the action and --env are checked" }
+      - { call: deployCommand, args: [[plan, --force]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } }, note: "flags are parsed first" }
+      - { call: githubCommand, args: [[sync, --env, stage]], expect: { value: ["GitHub acme/shop:", "  stage: environment ready, no secrets yet"] }, note: "rta github does not read RT_APP_SECRETS_JSON" }
+
+  - name: usage errors carry the whole usage text
+    tags: [cli, errors]
+    steps:
+      - { call: deployCommand, args: [[]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --env, qa]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --env]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --env, --json]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --env, ""]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --env=stage]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, -e, stage]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --force, --env, stage]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --env, stage, --role, email]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --env, stage, --role, "api,"]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[plan, --env, stage, --role]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[launch, --env, stage]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[providers, --role]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[credentials, set, --env, stage]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[credentials]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+      - { call: deployCommand, args: [[--env, stage, plan]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } }, note: "the action must come first" }
+      - { call: deployCommand, args: [[Plan, --env, stage]], expect: { error: { message: "Usage:\n  rta deploy providers [--json]                 providers and the roles they serve\n  rta deploy plan   --env develop|stage|prod [--role api] [--json]\n  rta deploy apply  --env develop|stage|prod [--role api] [--json]\n  rta deploy status --env develop|stage|prod [--json]\n  rta deploy credentials --env stage [--json]   which API keys are present (never values)\n  rta deploy credentials set --env stage KEY    reads the value from stdin\n  (AWS outputs: rta deploy <outputs.json>)" } } }
+
+  - name: repeated flags keep the last value and extra positionals are ignored
+    tags: [cli]
+    init: { providers: [*render, *neon], settings: *settings, env: *env }
+    steps:
+      - { call: deployCommand, args: [[plan, --env, qa, --env, prod, extra]], expect: { value: ["Nothing to plan for prod (no provider roles, or AWS only)."] } }
+      - { call: deployCommand, args: [[providers, --json, --json, --env, stage]], expect: { value: { $length: 1 } } }
+
+  - name: github connect reuses or creates the repository
+    tags: [cli, github]
+    steps:
+      - { call: githubCommand, args: [[connect]], expect: { value: ["Already connected to acme/shop"] } }
+      - { call: setOrigin, args: [""], expect: { value: null } }
+      - { call: githubCommand, args: [[connect, --public, --name, acme/new-shop]], expect: { value: ["Created and pushed acme/new-shop"] } }
+      - { call: runs, expect: { value: { $length: 5 } } }
+      - call: runs
+        expect: { value: [{ $any: true }, { $any: true }, { $any: true }, { command: gh, args: [repo, create, acme/new-shop, --public, --source, ., --push], input: null, cwd: "." }, { $any: true }] }
+
+  - name: github sync pushes local keys and runtime secrets from the environment
+    tags: [cli, github, secrets]
+    init: { credentials: { stage: { RENDER_API_KEY: rnd_local } }, env: { JWT_SECRET: jwt-from-env, SMTP_URL: "", RENDER_API_KEY: not-a-runtime-secret } }
+    steps:
+      - { call: githubCommand, args: [[sync, --env, stage]], expect: { value: ["GitHub acme/shop:", "  stage: JWT_SECRET, RENDER_API_KEY"] } }
+      - { call: githubCommand, args: [[sync]], expect: { value: ["GitHub acme/shop:", "  develop: JWT_SECRET", "  stage: JWT_SECRET, RENDER_API_KEY", "  prod: JWT_SECRET"] } }
+      - { call: githubCommand, args: [[sync, --json, --env, stage]], expect: { value: ["{\n  \"repository\": \"acme/shop\",\n  \"secrets\": {\n    \"stage\": [\n      \"JWT_SECRET\",\n      \"RENDER_API_KEY\"\n    ]\n  }\n}"] } }
+
+  - name: github sync with nothing to push and its errors
+    tags: [cli, github, errors]
+    init: { origin: "" }
+    steps:
+      - { call: githubCommand, args: [[sync]], expect: { error: { message: "No GitHub origin. Run: rta github connect" } } }
+      - { call: setOrigin, args: ["git@github.com:acme/shop.git"], expect: { value: null } }
+      - { call: githubCommand, args: [[sync, --env, prod]], expect: { value: ["GitHub acme/shop:", "  prod: environment ready, no secrets yet"] } }
+
+  - name: github usage errors
+    tags: [cli, github, errors]
+    steps:
+      - { call: githubCommand, args: [[]], expect: { error: { message: "Usage:\n  rta github connect [--public] [--name owner/repo]   create the repo and push\n  rta github sync [--env stage]                       environments + secrets (local keys and runtime secrets)" } } }
+      - { call: githubCommand, args: [[publish]], expect: { error: { message: "Usage:\n  rta github connect [--public] [--name owner/repo]   create the repo and push\n  rta github sync [--env stage]                       environments + secrets (local keys and runtime secrets)" } } }
+      - { call: githubCommand, args: [[sync, --env, qa]], expect: { error: { message: "Usage:\n  rta github connect [--public] [--name owner/repo]   create the repo and push\n  rta github sync [--env stage]                       environments + secrets (local keys and runtime secrets)" } } }
+      - { call: githubCommand, args: [[connect, --private]], expect: { error: { message: "Usage:\n  rta github connect [--public] [--name owner/repo]   create the repo and push\n  rta github sync [--env stage]                       environments + secrets (local keys and runtime secrets)" } } }
+      - { call: githubCommand, args: [[connect, --name]], expect: { error: { message: "Usage:\n  rta github connect [--public] [--name owner/repo]   create the repo and push\n  rta github sync [--env stage]                       environments + secrets (local keys and runtime secrets)" } } }
+      - { call: githubCommand, args: [[sync, --role, api]], expect: { error: { message: "Usage:\n  rta github connect [--public] [--name owner/repo]   create the repo and push\n  rta github sync [--env stage]                       environments + secrets (local keys and runtime secrets)" } } }
+      - { call: runs, expect: { value: [] } }
+
+  - name: CI secrets become environment variables and explicit variables win
+    tags: [ci]
+    steps:
+      - { call: withCiSecrets, args: [{ A: "1" }], expect: { value: { A: "1" } } }
+      - { call: withCiSecrets, args: [{ A: "1", RT_APP_SECRETS_JSON: "" }], expect: { value: { A: "1", RT_APP_SECRETS_JSON: "" } } }
+      - call: withCiSecrets
+        args: [{ RT_APP_SECRETS_JSON: "{\"RENDER_KEY\":\"r\",\"A\":\"from-json\",\"github_token\":\"gh\",\"NUM\":5,\"NUL\":null,\"OBJ\":{},\"EMPTY\":\"\"}", A: explicit }]
+        expect: { value: { RENDER_KEY: r, A: explicit, EMPTY: "", RT_APP_SECRETS_JSON: null } }
+      - { call: withCiSecrets, args: [{ RT_APP_SECRETS_JSON: "[\"x\",1]" }], expect: { value: { "0": x } } }
+      - { call: withCiSecrets, args: [{ RT_APP_SECRETS_JSON: "\"ab\"" }], expect: { value: { "0": a, "1": b } } }
+      - { call: withCiSecrets, args: [{ RT_APP_SECRETS_JSON: "5" }], expect: { value: {} } }
+      - { call: withCiSecrets, args: [{ RT_APP_SECRETS_JSON: "{" }], expect: { error: { message: RT_APP_SECRETS_JSON is not valid JSON } } }
+      - { call: withCiSecrets, args: [{ RT_APP_SECRETS_JSON: "null" }], expect: { error: { message: { $type: string } } } }

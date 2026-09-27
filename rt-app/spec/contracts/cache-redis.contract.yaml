@@ -1,0 +1,224 @@
+contract: 1
+module: cache-redis
+title: Cache over Redis (RedisCache on a recording Redis fake)
+description: |
+  RedisCache(client, prefix = "rt-app:cache:") is a cache adapter (see cache.contract.yaml, which
+  also runs every shared case on this subject). It talks to Redis through three commands and owns
+  no connection:
+    get(key)             GET <prefix><key>; nil is a miss, anything else is JSON.parse(text).
+    set(key, value, ttl)  validateEntry(key, ttl), then canonical(value), then the 64000-byte
+                          limit; only then SET <prefix><key> <canonical JSON> PX <ttl>. The TTL
+                          is sent as whole milliseconds (1.0 is "1"); Redis owns expiry.
+    delete(key)          DEL <prefix><key>.
+  The prefix is concatenated as is ("" is allowed; null means the default). Keys are sent exactly,
+  without normalization; get and delete never validate them. Values are canonical JSON (keys
+  sorted by UTF-16 units, JavaScript numbers, no escaping of U+2028 or "<>&"). A value written by
+  someone else is parsed with JSON.parse (any key order or whitespace); text that is not JSON
+  fails the read (the message is the language's parser error and is not pinned). Client errors
+  (connection loss, READONLY replicas, timeouts) propagate unchanged: no retries, no mapping, and
+  a failed read is not a miss.
+
+  Facade (subject cache-redis): the cache facade (get → {hit:false} | {hit:true, value}, set,
+  delete, remember, loads, rememberConcurrently, canonical, contentKey, validateEntry, setNow)
+  over Cache(RedisCache(fake, init.prefix)), init {now: epoch ms (default 4102444800000), prefix?}.
+  The fake honors PX on the facade clock (expired when expires <= now) and records every command
+  as Redis receives it, all arguments strings: ["GET", key], ["SET", key, value, "PX", ms],
+  ["DEL", key]. takeCommands() → the commands since the last call; fail(command, message, skip?)
+  makes the next call of that command after `skip` successful ones throw Error(message) (the
+  command is still recorded); seed(key, text, ttlMs?) stores raw text without recording; raw(key)
+  → the stored text of a live key or null; ttl(key) → PTTL (ms left, -1 without expiry, -2 when
+  missing); keys() → live keys, sorted.
+subject: cache-redis
+init: { now: 4102444800000 }
+cases:
+  # --- commands ------------------------------------------------------------------------------
+  - name: set, get and delete send one command each under the default prefix
+    tags: [ commands ]
+    steps:
+      - { call: set, args: [ k, { b: 1, a: [ 1.5, "é😀" ] }, 1500 ], expect: { value: null } }
+      - call: takeCommands
+        expect: { value: [ [ SET, "rt-app:cache:k", '{"a":[1.5,"é😀"],"b":1}', PX, "1500" ] ] }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: { a: [ 1.5, "é😀" ], b: 1 } } } }
+      - { call: takeCommands, expect: { value: [ [ GET, "rt-app:cache:k" ] ] } }
+      - { call: delete, args: [ k ], expect: { value: null } }
+      - { call: takeCommands, expect: { value: [ [ DEL, "rt-app:cache:k" ] ] } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } } }
+      - { call: takeCommands, expect: { value: [ [ GET, "rt-app:cache:k" ] ] } }
+      - { call: keys, expect: { value: [] } }
+
+  - name: deleting an absent key still sends DEL
+    tags: [ commands ]
+    steps:
+      - { call: delete, args: [ never-set ], expect: { value: null } }
+      - { call: takeCommands, expect: { value: [ [ DEL, "rt-app:cache:never-set" ] ] } }
+
+  - name: a custom prefix is concatenated as is
+    tags: [ commands, keys ]
+    init: { now: 4102444800000, prefix: "tenant-1:" }
+    steps:
+      - { call: set, args: [ k, 1, 1000 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: 1 } } }
+      - { call: delete, args: [ k ], expect: { value: null } }
+      - call: takeCommands
+        expect: { value: [ [ SET, "tenant-1:k", "1", PX, "1000" ], [ GET, "tenant-1:k" ], [ DEL, "tenant-1:k" ] ] }
+
+  - name: an empty prefix uses the bare key
+    tags: [ commands, keys ]
+    init: { now: 4102444800000, prefix: "" }
+    steps:
+      - { call: set, args: [ k, 1, 1000 ], expect: { value: null } }
+      - { call: keys, expect: { value: [ k ] } }
+
+  - name: keys are sent exactly, without normalization or validation on reads
+    tags: [ commands, keys, unicode ]
+    steps:
+      - { call: set, args: [ "é😀 x", 1, 1000 ], expect: { value: null } }
+      - { call: get, args: [ "é😀 x" ], expect: { value: { hit: false } } }
+      - { call: get, args: [ "" ], expect: { value: { hit: false } } }
+      - { call: delete, args: [ { $text: { repeat: k, count: 300 } } ], expect: { value: null } }
+      - call: takeCommands
+        expect:
+          value:
+            - [ SET, "rt-app:cache:é😀 x", "1", PX, "1000" ]
+            - [ GET, "rt-app:cache:é😀 x" ]
+            - [ GET, "rt-app:cache:" ]
+            - [ DEL, { $regex: "^rt-app:cache:k{300}$" } ]
+
+  # --- TTL -----------------------------------------------------------------------------------
+  - name: the TTL is sent as whole milliseconds with PX
+    tags: [ ttl, commands ]
+    steps:
+      - { call: set, args: [ a, 1, 1 ], expect: { value: null } }
+      - { call: set, args: [ b, 1, 2592000000 ], expect: { value: null } }
+      - { call: set, args: [ c, 1, 1.0 ], expect: { value: null }, note: JSON cannot tell 1.0 from 1 }
+      - { call: set, args: [ d, 1, 61000 ], expect: { value: null }, note: never rounded to EX seconds }
+      - call: takeCommands
+        expect:
+          value:
+            - [ SET, "rt-app:cache:a", "1", PX, "1" ]
+            - [ SET, "rt-app:cache:b", "1", PX, "2592000000" ]
+            - [ SET, "rt-app:cache:c", "1", PX, "1" ]
+            - [ SET, "rt-app:cache:d", "1", PX, "61000" ]
+      - { call: ttl, args: [ "rt-app:cache:b" ], expect: { value: 2592000000 } }
+      - { call: ttl, args: [ "rt-app:cache:missing" ], expect: { value: -2 } }
+
+  - name: overwriting sends a new SET with the new TTL
+    tags: [ ttl, commands ]
+    steps:
+      - { call: set, args: [ k, 1, 1000 ], expect: { value: null } }
+      - { call: set, args: [ k, 2, 10 ], expect: { value: null } }
+      - { call: ttl, args: [ "rt-app:cache:k" ], expect: { value: 10 } }
+      - { call: setNow, args: [ 4102444800010 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } }, note: Redis expired the key }
+      - call: takeCommands
+        expect: { value: [ [ SET, "rt-app:cache:k", "1", PX, "1000" ], [ SET, "rt-app:cache:k", "2", PX, "10" ], [ GET, "rt-app:cache:k" ] ] }
+
+  # --- validation before any command ---------------------------------------------------------
+  - name: rejected entries send nothing
+    tags: [ validation, commands ]
+    steps:
+      - { call: set, args: [ k, 1, 0 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, 2592000001 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, "100" ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ "", 1, 1000 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ { $text: { repeat: k, count: 241 } }, 1, 1000 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, { $text: { repeat: x, count: 63999 } }, 1000 ], expect: { error: { message: Cache values are limited to 64 KB } } }
+      - { call: set, args: [ k, { $text: { repeat: "é", count: 32000 } }, 1000 ], expect: { error: { message: Cache values are limited to 64 KB } } }
+      - { call: takeCommands, expect: { value: [] } }
+      - { call: set, args: [ k, { $text: { repeat: x, count: 63998 } }, 1000 ], expect: { value: null } }
+      - { call: takeCommands, expect: { value: { $length: 1 } } }
+      - { call: raw, args: [ "rt-app:cache:k" ], expect: { value: { $length: 64000 } } }
+
+  # --- serialization -------------------------------------------------------------------------
+  - name: values are stored as canonical JSON
+    tags: [ serialization, canonical ]
+    steps:
+      - { call: set, args: [ n, [ 1e21, 0.0000001, -0, 12345678901234567890, 0.1, 1.0 ], 1000 ], expect: { value: null } }
+      - { call: raw, args: [ "rt-app:cache:n" ], expect: { value: "[1e+21,1e-7,0,12345678901234567000,0.1,1]" } }
+      - { call: set, args: [ s, "</script>& \u007f\n\"", 1000 ], expect: { value: null } }
+      - { call: raw, args: [ "rt-app:cache:s" ], expect: { value: "\"</script>& \u007f\\n\\\"\"" } }
+      - { call: set, args: [ o, { "！": 1, "😀": 2, "10": 3, "2": 4, a: { z: null, y: true } }, 1000 ], expect: { value: null } }
+      - { call: raw, args: [ "rt-app:cache:o" ], expect: { value: '{"10":3,"2":4,"a":{"y":true,"z":null},"😀":2,"！":1}' } }
+
+  - name: falsy values are stored and read as hits
+    tags: [ serialization ]
+    steps:
+      - { call: set, args: [ f, false, 1000 ], expect: { value: null } }
+      - { call: set, args: [ z, null, 1000 ], expect: { value: null } }
+      - { call: set, args: [ e, "", 1000 ], expect: { value: null } }
+      - { call: set, args: [ zero, 0, 1000 ], expect: { value: null } }
+      - { call: raw, args: [ "rt-app:cache:f" ], expect: { value: "false" } }
+      - { call: raw, args: [ "rt-app:cache:z" ], expect: { value: "null" } }
+      - { call: raw, args: [ "rt-app:cache:e" ], expect: { value: '""' } }
+      - { call: raw, args: [ "rt-app:cache:zero" ], expect: { value: "0" } }
+      - { call: get, args: [ f ], expect: { value: { hit: true, value: false } } }
+      - { call: get, args: [ z ], expect: { value: { hit: true, value: null } } }
+      - { call: get, args: [ e ], expect: { value: { hit: true, value: "" } } }
+      - { call: get, args: [ zero ], expect: { value: { hit: true, value: 0 } } }
+
+  - name: values written by other clients are parsed as JSON
+    tags: [ serialization, interop ]
+    steps:
+      - { call: seed, args: [ "rt-app:cache:x", ' { "b" : 1, "a" : [ 2, 3.50 ] } ' ], expect: { value: null } }
+      - { call: get, args: [ x ], expect: { value: { hit: true, value: { a: [ 2, 3.5 ], b: 1 } } } }
+      - { call: seed, args: [ "rt-app:cache:n", "null" ], expect: { value: null } }
+      - { call: get, args: [ n ], expect: { value: { hit: true, value: null } } }
+      - { call: seed, args: [ "rt-app:cache:u", '"\\u00e9\\ud83d\\ude00"' ], expect: { value: null } }
+      - { call: get, args: [ u ], expect: { value: { hit: true, value: "é😀" } } }
+      - { call: seed, args: [ "rt-app:cache:t", "1", 50 ], expect: { value: null } }
+      - { call: setNow, args: [ 4102444800050 ], expect: { value: null } }
+      - { call: get, args: [ t ], expect: { value: { hit: false } } }
+
+  - name: a stored value that is not JSON fails the read
+    tags: [ serialization, errors ]
+    steps:
+      - { call: seed, args: [ "rt-app:cache:bad", "not json" ], expect: { value: null } }
+      - { call: get, args: [ bad ], expect: { error: { status: null, message: { $type: string } } } }
+      - { call: seed, args: [ "rt-app:cache:nan", "NaN" ], expect: { value: null } }
+      - { call: get, args: [ nan ], expect: { error: { status: null, message: { $type: string } } }, note: NaN is not JSON }
+
+  # --- errors --------------------------------------------------------------------------------
+  - name: client errors propagate unchanged and are not retried
+    tags: [ errors ]
+    steps:
+      - { call: fail, args: [ GET, Connection is closed. ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { error: { status: null, message: Connection is closed. } }, note: a failed read is not a miss }
+      - { call: fail, args: [ SET, "READONLY You can't write against a read only replica." ], expect: { value: null } }
+      - { call: set, args: [ k, 1, 1000 ], expect: { error: { status: null, message: "READONLY You can't write against a read only replica." } } }
+      - { call: fail, args: [ DEL, Command timed out ], expect: { value: null } }
+      - { call: delete, args: [ k ], expect: { error: { status: null, message: Command timed out } } }
+      - call: takeCommands
+        expect: { value: [ [ GET, "rt-app:cache:k" ], [ SET, "rt-app:cache:k", "1", PX, "1000" ], [ DEL, "rt-app:cache:k" ] ] }
+      - { call: set, args: [ k, 1, 1000 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: 1 } } }
+
+  # --- remember ------------------------------------------------------------------------------
+  - name: remember reads, loads on a miss and writes under the content key
+    tags: [ remember, commands ]
+    steps:
+      - { call: remember, args: [ "tenant-1:products", { page: 1 }, 60000, { value: [ item ] } ], expect: { value: [ item ] } }
+      - call: takeCommands
+        expect:
+          value:
+            - [ GET, "rt-app:cache:tenant-1:products:70fb0185588d2e765454a7927f2792ae2b6faa2516781deb69864246e0803d05" ]
+            - [ SET, "rt-app:cache:tenant-1:products:70fb0185588d2e765454a7927f2792ae2b6faa2516781deb69864246e0803d05", '["item"]', PX, "60000" ]
+      - { call: remember, args: [ "tenant-1:products", { page: 1 }, 60000, { value: [ other ] } ], expect: { value: [ item ] } }
+      - call: takeCommands
+        expect: { value: [ [ GET, "rt-app:cache:tenant-1:products:70fb0185588d2e765454a7927f2792ae2b6faa2516781deb69864246e0803d05" ] ] }
+      - { call: loads, expect: { value: 1 } }
+
+  - name: remember propagates a failed read without loading
+    tags: [ remember, errors ]
+    steps:
+      - { call: fail, args: [ GET, Connection is closed. ], expect: { value: null } }
+      - { call: remember, args: [ ns, 1, 1000, { value: 1 } ], expect: { error: { message: Connection is closed. } } }
+      - { call: loads, expect: { value: 0 } }
+
+  - name: remember does not keep a load whose write failed
+    tags: [ remember, errors ]
+    steps:
+      - { call: fail, args: [ SET, OOM command not allowed when used memory > 'maxmemory'. ], expect: { value: null } }
+      - { call: remember, args: [ ns, 1, 1000, { value: first } ], expect: { error: { message: "OOM command not allowed when used memory > 'maxmemory'." } } }
+      - { call: remember, args: [ ns, 1, 1000, { value: second } ], expect: { value: second } }
+      - { call: loads, expect: { value: 2 } }
+      - { call: takeCommands, expect: { value: { $length: 4 } } }

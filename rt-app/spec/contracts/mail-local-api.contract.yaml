@@ -1,0 +1,33 @@
+contract: 1
+kind: http
+module: mail-local-api
+title: Local inbox capture endpoint (local mode)
+description: |
+  GET /__dev/mailbox lists the sign-in codes the local mailer captured (@gsalgadotoledo/rt-app-auth
+  LocalMailbox): [{email, code, purpose, at}], newest first, at most 30, `at` like toISOString
+  (2026-01-02T03:04:05.678Z). It is a loopback development tool: the TypeScript server
+  (packages/create/starter/apps/server/src/index.ts) answers it before the framework dispatch,
+  only in local mode, and it never exists on Lambda. No access check (the local server only
+  accepts loopback requests); other methods and /admin/app/__dev/mailbox fall through to the
+  framework (404 "Endpoint not found"). The example APIs send no mail, so the list is empty; the
+  capture itself is pinned by mail-local.contract.yaml (mailbox()). Responses are JSON with
+  cache-control: no-store.
+cases:
+  - name: the local inbox lists captured codes
+    request: { method: GET, path: /__dev/mailbox }
+    expect: { status: 200, body: [], headers: { content-type: { $regex: "^application/json" }, cache-control: no-store } }
+
+  - name: query strings are ignored
+    request: { method: GET, path: /__dev/mailbox, query: { limit: "1" } }
+    expect: { status: 200, body: [] }
+
+  - name: only GET is served
+    tags: [edge]
+    requests:
+      - { request: { method: POST, path: /__dev/mailbox, body: {} }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: DELETE, path: /__dev/mailbox }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: the inbox is not an admin endpoint
+    tags: [security]
+    request: { method: GET, path: /admin/app/__dev/mailbox }
+    expect: { status: 404, body: { error: Endpoint not found } }

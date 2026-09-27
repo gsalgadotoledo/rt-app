@@ -1,0 +1,233 @@
+contract: 1
+module: deploy-client
+subject: deploy
+title: Provider API client (createApi) over a fake fetch
+description: |
+  createApi of @gsalgadotoledo/rt-app-deploy: the JSON client every provider package uses for its
+  REST API. No network: the subject builds the client over a fake fetch and a recording sleep.
+
+  Subject deploy (see the deploy contract) with init.api = {provider ("Example"), baseUrl
+  ("https://api.example/v1"), headers ({}), secrets ([]), retries (2), routes}. routes:
+  {"METHOD url-prefix": response | [response, …]}; the longest matching prefix wins and a list is
+  consumed one response per call (the last repeats). A response is {status? (200), body? (a
+  string is sent as raw text, anything else as JSON), headers?, throw? (the fetch rejects with
+  Error(throw): a network error)}. An unmatched request rejects with "Unexpected request: METHOD
+  url". Methods: request(method, path, body?) with method get | find | post | put | patch | delete
+  → {value} or, for a ProviderError, {error: {provider, status, message}}; fetches() → [{method,
+  url, headers (lower-case names), body (parsed JSON or null)}]; sleeps() → [ms…].
+
+  Requests: url = path when it starts with "https://", else baseUrl without one trailing "/" +
+  path. Headers: accept: application/json, content-type: application/json when there is a body,
+  then the configured headers (which win). get/find/delete send no body; post/put/patch send
+  JSON.stringify(body ?? {}).
+
+  Responses: 404 on find → null. Retry when the attempt < retries and the status is 429 (any
+  method) or 502/503/504 (GET only), or when a GET fails at the network level. The wait is
+  Number(retry-after) seconds when that is finite and > 0 (capped at 30, in ms), else
+  500 * 2^attempt ms (a network retry always uses the backoff). Writes are never retried on 5xx or
+  network errors. Any other non-2xx fails with ProviderError(provider, status, redact("METHOD path
+  → status " + first 500 UTF-16 units of the body, secrets)); a network failure with
+  ProviderError(provider, 0, redact("METHOD path failed: " + error message, secrets)). The message
+  of a ProviderError is "<provider>: <text>" and path is the path argument, not the URL. A 2xx body
+  that is empty is undefined (null here), JSON is parsed, anything else is returned as text.
+init:
+  api:
+    provider: Example
+    baseUrl: "https://api.example/v1/"
+    headers: { authorization: "Bearer sk_live_123456" }
+    secrets: [sk_live_123456, "abc"]
+    routes:
+      "GET https://api.example/v1/ok": { body: { ok: true, n: 1.5 } }
+      "GET https://api.example/v1/missing": { status: 404, body: { message: not found } }
+      "GET https://api.example/v1/text": { body: plain text }
+      "GET https://api.example/v1/empty": { status: 200 }
+      "GET https://api.example/v1/flaky": [{ status: 503, body: busy }, { status: 502 }, { body: { ok: 3 } }]
+      "GET https://api.example/v1/down": { status: 503, body: "down, token sk_live_123456" }
+      "GET https://api.example/v1/gateway": [{ status: 504 }, { status: 500, body: internal }]
+      "GET https://api.example/v1/net": [{ throw: "connect ECONNREFUSED sk_live_123456" }, { body: [1, 2] }]
+      "GET https://api.example/v1/offline": { throw: "getaddrinfo ENOTFOUND api.example" }
+      "GET https://other.example/abs": { body: { absolute: true } }
+      "POST https://api.example/v1/items": { status: 201, body: { id: item-1 } }
+      "POST https://api.example/v1/limited": { status: 429, body: slow down, headers: { retry-after: "2" } }
+      "POST https://api.example/v1/fail": { status: 500, body: "token sk_live_123456 invalid; abc stays" }
+      "POST https://api.example/v1/busy": { status: 503, body: busy }
+      "POST https://api.example/v1/net": { throw: socket hang up }
+      "PUT https://api.example/v1/empty": { status: 204 }
+      "PATCH https://api.example/v1/text": { body: plain }
+      "DELETE https://api.example/v1/gone": { status: 200 }
+      "DELETE https://api.example/v1/missing": { status: 404, body: "" }
+cases:
+  - name: GET returns parsed JSON with the default and configured headers
+    tags: [client]
+    steps:
+      - { call: request, args: [get, /ok], expect: { value: { value: { ok: true, n: 1.5 } } } }
+      - call: fetches
+        expect: { value: [{ method: GET, url: "https://api.example/v1/ok", headers: { accept: application/json, authorization: "Bearer sk_live_123456" }, body: null }] }
+        note: one trailing "/" of baseUrl is dropped; GET sends no content-type
+      - { call: sleeps, expect: { value: [] } }
+
+  - name: text, empty and 204 bodies
+    tags: [client]
+    steps:
+      - { call: request, args: [get, /text], expect: { value: { value: plain text } } }
+      - { call: request, args: [get, /empty], expect: { value: { value: null } } }
+      - { call: request, args: [put, /empty], expect: { value: { value: null } } }
+      - { call: request, args: [patch, /text, {}], expect: { value: { value: plain } } }
+      - { call: request, args: [delete, /gone], expect: { value: { value: null } } }
+
+  - name: writes send JSON bodies (an empty object by default)
+    tags: [client]
+    steps:
+      - { call: request, args: [post, /items, { name: shop, tags: [a], price: 10 }], expect: { value: { value: { id: item-1 } } } }
+      - { call: request, args: [post, /items], expect: { value: { value: { id: item-1 } } } }
+      - call: fetches
+        expect:
+          value:
+            - { method: POST, url: "https://api.example/v1/items", headers: { accept: application/json, content-type: application/json, authorization: "Bearer sk_live_123456" }, body: { name: shop, tags: [a], price: 10 } }
+            - { method: POST, url: "https://api.example/v1/items", headers: { accept: application/json, content-type: application/json, authorization: "Bearer sk_live_123456" }, body: {} }
+
+  - name: 404 is null for find and an error for get and delete
+    tags: [client, errors]
+    steps:
+      - { call: request, args: [find, /missing], expect: { value: { value: null } } }
+      - call: request
+        args: [get, /missing]
+        expect: { value: { error: { provider: Example, status: 404, message: "Example: GET /missing → 404 {\"message\":\"not found\"}" } } }
+      - call: request
+        args: [delete, /missing]
+        expect: { value: { error: { provider: Example, status: 404, message: "Example: DELETE /missing → 404 " } } }
+      - { call: sleeps, expect: { value: [] } }
+
+  - name: reads are retried on 502/503/504 with exponential backoff
+    tags: [client, retries]
+    steps:
+      - { call: request, args: [get, /flaky], expect: { value: { value: { ok: 3 } } } }
+      - { call: sleeps, expect: { value: [500, 1000] } }
+      - call: request
+        args: [get, /gateway]
+        expect: { value: { error: { provider: Example, status: 500, message: "Example: GET /gateway → 500 internal" } } }
+        note: 500 is not retried
+      - { call: sleeps, expect: { value: [500, 1000, 500] } }
+      - { call: fetches, expect: { value: { $length: 5 } } }
+
+  - name: retries are bounded and the last error is reported with secrets redacted
+    tags: [client, retries, secrets]
+    steps:
+      - call: request
+        args: [get, /down]
+        expect: { value: { error: { provider: Example, status: 503, message: "Example: GET /down → 503 down, token [redacted]" } } }
+      - { call: sleeps, expect: { value: [500, 1000] } }
+      - { call: fetches, expect: { value: { $length: 3 } } }
+
+  - name: rate limits are retried for every method and honor retry-after
+    tags: [client, retries]
+    steps:
+      - call: request
+        args: [post, /limited, { a: 1 }]
+        expect: { value: { error: { provider: Example, status: 429, message: "Example: POST /limited → 429 slow down" } } }
+      - { call: sleeps, expect: { value: [2000, 2000] } }
+
+  - name: retry-after is capped at 30 seconds; zero, invalid or missing values use the backoff
+    tags: [client, retries]
+    init:
+      api:
+        routes:
+          "GET https://api.example/v1/a": [{ status: 429, headers: { retry-after: "100" } }, { status: 429, headers: { retry-after: "0.25" } }, { body: 1 }]
+          "GET https://api.example/v1/b": [{ status: 429, headers: { retry-after: "0" } }, { status: 429, headers: { retry-after: soon } }, { body: 2 }]
+          "GET https://api.example/v1/c": [{ status: 429 }, { status: 429, headers: { retry-after: "-5" } }, { body: 3 }]
+          "GET https://api.example/v1/d": [{ status: 429, headers: { retry-after: " 3 " } }, { status: 429, headers: { retry-after: "1e1" } }, { body: 4 }]
+          "GET https://api.example/v1/e": [{ status: 429, headers: { retry-after: "" } }, { status: 429, headers: { retry-after: "Infinity" } }, { body: 5 }]
+    steps:
+      - { call: request, args: [get, /a], expect: { value: { value: 1 } } }
+      - { call: request, args: [get, /b], expect: { value: { value: 2 } } }
+      - { call: request, args: [get, /c], expect: { value: { value: 3 } } }
+      - { call: request, args: [get, /d], expect: { value: { value: 4 } } }
+      - { call: request, args: [get, /e], expect: { value: { value: 5 } } }
+      - { call: sleeps, expect: { value: [30000, 250, 500, 1000, 500, 1000, 3000, 10000, 500, 1000] } }
+      - { call: fetches, expect: { value: { $length: 15 } } }
+
+  - name: writes are not retried on 5xx
+    tags: [client, retries]
+    steps:
+      - call: request
+        args: [post, /busy]
+        expect: { value: { error: { provider: Example, status: 503, message: "Example: POST /busy → 503 busy" } } }
+      - call: request
+        args: [post, /fail]
+        expect: { value: { error: { provider: Example, status: 500, message: "Example: POST /fail → 500 token [redacted] invalid; abc stays" } } }
+        note: secrets shorter than 4 units are not redacted
+      - { call: sleeps, expect: { value: [] } }
+      - { call: fetches, expect: { value: { $length: 2 } } }
+
+  - name: network errors retry reads only and report status 0 with secrets redacted
+    tags: [client, retries, secrets]
+    steps:
+      - { call: request, args: [get, /net], expect: { value: { value: [1, 2] } } }
+      - { call: sleeps, expect: { value: [500] } }
+      - call: request
+        args: [get, /offline]
+        expect: { value: { error: { provider: Example, status: 0, message: "Example: GET /offline failed: getaddrinfo ENOTFOUND api.example" } } }
+      - { call: sleeps, expect: { value: [500, 500, 1000] } }
+      - call: request
+        args: [post, /net, { a: 1 }]
+        expect: { value: { error: { provider: Example, status: 0, message: "Example: POST /net failed: socket hang up" } } }
+      - { call: fetches, expect: { value: { $length: 6 } } }
+
+  - name: network errors never leak secrets
+    tags: [client, secrets]
+    init:
+      api:
+        secrets: [abcd1234]
+        retries: 0
+        routes:
+          "GET https://api.example/v1/a": { throw: "connect ECONNREFUSED key=abcd1234" }
+    steps:
+      - call: request
+        args: [get, /a]
+        expect: { value: { error: { provider: Example, status: 0, message: "Example: GET /a failed: connect ECONNREFUSED key=[redacted]" } } }
+      - { call: sleeps, expect: { value: [] }, note: "retries 0 never retries" }
+
+  - name: an unmatched request is a network error
+    tags: [client]
+    steps:
+      - call: request
+        args: [get, "https://nowhere.example/x"]
+        expect: { value: { error: { provider: Example, status: 0, message: "Example: GET https://nowhere.example/x failed: Unexpected request: GET https://nowhere.example/x" } } }
+      - { call: sleeps, expect: { value: [500, 1000] } }
+
+  - name: absolute https paths are used as they are
+    tags: [client]
+    steps:
+      - { call: request, args: [get, "https://other.example/abs"], expect: { value: { value: { absolute: true } } } }
+      - call: request
+        args: [get, "http://other.example/abs"]
+        expect: { value: { error: { provider: Example, status: 0, message: "Example: GET http://other.example/abs failed: Unexpected request: GET https://api.example/v1http://other.example/abs" } } }
+        note: only https:// is absolute
+      - call: fetches
+        expect: { value: [{ $partial: { url: "https://other.example/abs" } }, { $partial: { url: "https://api.example/v1http://other.example/abs" } }, { $any: true }, { $any: true }] }
+
+  - name: configured headers override the defaults
+    tags: [client]
+    init:
+      api:
+        baseUrl: "https://api.example/v1//"
+        headers: { accept: text/plain, content-type: application/merge-patch+json, x-team: t1 }
+        routes:
+          "PATCH https://api.example/v1//x": { body: { ok: true } }
+    steps:
+      - { call: request, args: [patch, /x, { a: null }], expect: { value: { value: { ok: true } } } }
+      - call: fetches
+        expect: { value: [{ method: PATCH, url: "https://api.example/v1//x", headers: { accept: text/plain, content-type: application/merge-patch+json, x-team: t1 }, body: { a: null } }] }
+        note: only one trailing "/" of baseUrl is removed
+
+  - name: error bodies are cut at 500 UTF-16 units
+    tags: [client, unicode]
+    init:
+      api:
+        routes:
+          "GET https://api.example/v1/long": { status: 400, body: { $text: { repeat: "😀é", count: 200 } } }
+    steps:
+      - call: request
+        args: [get, /long]
+        expect: { value: { error: { provider: Example, status: 400, message: { $regex: "^Example: GET /long → 400 (😀é){166}😀$" } } } }
+        note: 166 × 3 units + "😀" is exactly 500 units (a code point or byte count cuts elsewhere)

@@ -25,15 +25,17 @@ description: |
     returned. A failed load or failed set is not cached and the next call loads again.
   Errors are TypeErrors without status (store errors propagate unchanged).
 
-  Facade (subjects cache-memory, cache-nosql, cache-file, cache-dynamodb): init {now: epoch ms
-  (default 4102444800000), capacity? (memory), namespace? (nosql/file/dynamodb), rows? (nosql)}.
+  Facade (subjects cache-memory, cache-nosql, cache-file, cache-dynamodb, cache-redis): init
+  {now: epoch ms (default 4102444800000), capacity? (memory), namespace? (nosql/file/dynamodb),
+  rows? (nosql), prefix? (redis; a recording Redis fake that honors PX on the same clock, see
+  cache-redis.contract.yaml)}.
   get(key) → {hit:false} | {hit:true, value} (wire null cannot tell a miss from a cached null);
   set, delete → null; remember(namespace, input, ttlMs, outcome) where the loader returns
   outcome.value or throws Error(outcome.error); loads() counts loader calls;
   rememberConcurrently(namespace, input, ttlMs, value, count) runs count concurrent remember calls
   whose loader takes 50 ms → {loads, results}; canonical, contentKey, validateEntry (→ null);
   setNow(ms).
-subjects: [ cache-memory, cache-nosql, cache-file, cache-dynamodb ]
+subjects: [ cache-memory, cache-nosql, cache-file, cache-dynamodb, cache-redis ]
 optionalSubjects: [ cache-dynamodb ]
 init: { now: 4102444800000 }
 cases:

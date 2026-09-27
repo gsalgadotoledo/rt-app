@@ -1,15 +1,15 @@
 contract: 1
 module: nosql
-title: NoSQL stores (memory, PostgreSQL, DynamoDB)
+title: NoSQL stores (memory, JSON file, PostgreSQL, DynamoDB)
 description: |
   Every store implementation runs the same cases. Rows are {pk, sk, version, data, ttl?}.
-  Hosts create one isolated store per case (a fresh table for PostgreSQL and DynamoDB) holding
-  init.rows; the database stores are available when RT_APP_TEST_POSTGRES_URL /
-  RT_APP_TEST_DYNAMODB_ENDPOINT are set (see rt-app/spec/services.mjs), otherwise skipped.
+  Hosts create one isolated store per case (a fresh table for PostgreSQL and DynamoDB, a fresh
+  temporary file for the JSON store, see json.contract.yaml) holding init.rows; the database
+  stores are available when RT_APP_TEST_POSTGRES_URL / RT_APP_TEST_DYNAMODB_ENDPOINT are set (see rt-app/spec/services.mjs), otherwise skipped.
   transact() applies version-guarded writes atomically: expected null means "must not exist",
   a number means "must have exactly this version". list() returns one partition sorted by sk
   in Unicode code point order (the order DynamoDB uses), 50 rows per page, with an opaque cursor.
-subjects: [nosql-memory, nosql-postgres, nosql-dynamodb]
+subjects: [nosql-memory, nosql-json, nosql-postgres, nosql-dynamodb]
 optionalSubjects: [nosql-postgres, nosql-dynamodb]
 init: { rows: [] }
 cases:

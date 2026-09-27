@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -19,12 +20,26 @@ type Message struct {
 	At      time.Time `json:"at"`
 }
 
+// MarshalJSON writes At like JavaScript toISOString (UTC, milliseconds: 2026-01-02T03:04:05.678Z),
+// the format of GET /__dev/mailbox in every language.
+func (m Message) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Email   string `json:"email"`
+		Code    string `json:"code"`
+		Purpose string `json:"purpose"`
+		At      string `json:"at"`
+	}{m.Email, m.Code, m.Purpose, m.At.UTC().Format("2006-01-02T15:04:05.000Z")})
+}
+
 // mailboxSize is how many messages a LocalMailbox keeps.
 const mailboxSize = 30
 
 // LocalMailbox is a Mailer for local development and tests: it keeps the last 30 messages,
 // newest first, instead of sending them. It is safe for concurrent use.
 type LocalMailbox struct {
+	// Now stamps messages (time.Now when nil).
+	Now func() time.Time
+
 	mu       sync.Mutex
 	messages []Message
 }
@@ -33,7 +48,11 @@ type LocalMailbox struct {
 func (m *LocalMailbox) SendCode(_ context.Context, email, code, purpose string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.messages = append([]Message{{Email: email, Code: code, Purpose: purpose, At: time.Now().UTC()}}, m.messages...)
+	now := time.Now
+	if m.Now != nil {
+		now = m.Now
+	}
+	m.messages = append([]Message{{Email: email, Code: code, Purpose: purpose, At: now().UTC()}}, m.messages...)
 	m.messages = m.messages[:min(len(m.messages), mailboxSize)]
 	return nil
 }

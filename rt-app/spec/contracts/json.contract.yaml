@@ -1,0 +1,645 @@
+contract: 1
+module: json
+subject: json-store
+title: JSON file store (file format, locking, retention, secret file)
+description: |
+  @gsalgadotoledo/rt-app-json JsonStore: a NoSQL store in one local JSON file, shared by every
+  process and language on the machine. The generic store behavior (versions, atomic transactions,
+  code point ordering, 50-row pages, cursors) is the nosql contract (subject nosql-json); this
+  contract pins what another process or language sees on disk.
+
+  Subject json-store: init {rows?, text?, path?, lockTimeout?, now?}. Each instance owns a fresh
+  temporary directory; the database file is "db.json" there (init.path: another relative path).
+  init.text is written to the file before the store opens; init.rows are then created in one
+  transaction. now is the retention clock in epoch milliseconds (default 1767225600000,
+  2026-01-01). Methods: get, transact, list (the store), race(writes, count) → {committed,
+  conflicts, errors} (count store instances run the same transaction at once), document() (the
+  parsed file, or null), text(name?) / writeText(text, name?) / remove(name?) / mode(name?) (octal
+  permission bits, e.g. "600", or null) / chmod(mode, name?) on files of the directory (name
+  relative to it; default the database), files() (sorted names in the directory), lock() /
+  unlock() (create or remove "<file>.lock"), setNow(ms), localSecret() (the generated server's
+  auth key for this database, stored in "<file>.key").
+
+  File format: UTF-8 JSON.stringify({format: 1, rows: [row, ...]}), compact, no trailing newline.
+  A row is {pk, sk, version, data, ttl?} plus any other fields, which are kept. Rows keep the
+  order of their first insertion (an update keeps the position, a new row is appended, a delete
+  removes it). Every write re-serializes the whole file the way JavaScript does: JSON.parse then
+  JSON.stringify, so numbers are JavaScript numbers (1.0 → 1, 1E21 → 1e+21, -0 → 0), strings
+  escape only '"', '\' and U+0000–U+001F (\b \f \n \r \t, else \u00xx), and object keys follow
+  JavaScript property order: array-index keys ("0".."4294967294") in ascending numeric order,
+  then the other keys in first-insertion order (a repeated key keeps its first position and its
+  last value). Unknown top-level fields are dropped.
+
+  A file is valid when it parses to an object with format === 1 (1.0 counts, true and "1" do not)
+  and rows is an array of rows with a string pk and sk, a safe-integer version (1.0 counts, 1.5,
+  "1" and 2^53 do not) and a non-array object data. Otherwise every operation (reads included)
+  fails with Error "Invalid JSON database"; two rows with the same (pk, sk) fail with
+  "Duplicate JSON database key". A file that is not JSON (or JSON null) also fails; TypeScript
+  reports the parser's message, the ports "Invalid JSON database". A missing file is an empty
+  database: reads do not create it (only its directory), and a write creates it.
+
+  Every operation holds "<file>.lock", created exclusively (O_CREAT|O_EXCL, mode 0600) after
+  creating the directory (mode 0700); it retries every 20 ms and after lockTimeout ms (default
+  5000; the first attempt always runs) fails with Error "JSON store locked: <absolute lock path>.
+  Stop writers before removing a stale lock.", leaving the stale lock in place. The lock is
+  removed when the operation ends, whatever its outcome.
+
+  transact(writes) checks each write in order: a valid row (else Error "Invalid JSON row"), a new
+  key (else "Duplicate transaction key"), then its version guard (409 Conflict, like the nosql
+  contract); a failure leaves the file byte-for-byte unchanged. Then the writes apply, retention
+  runs, and the file is replaced atomically: "<file>.<uuid>.tmp" created with mode 0600, written,
+  fsynced, renamed over the file (so the file ends up 0600 whatever its mode was). No temporary
+  file survives. transact([]) still runs retention and rewrites the file.
+
+  Retention: after the writes of every transaction, rows whose pk starts with "OBSERVER#" or
+  "CACHE#", or equals "VISITS", are dropped when their ttl is truthy and ttl <= now / 1000
+  (JavaScript: a string ttl is converted with Number(), true is 1; 0, "" and null never expire).
+  Reads never drop rows. TypeScript takes now from the optional clock of
+  new JsonStore(file, lockTimeoutMs?, {now}) (the system clock by default).
+
+  Cursors are base64url (no padding) of JSON.stringify({pk, sk}) of the last row of the page, the
+  format of every store; an empty cursor means the first page.
+
+  The auth key (generated server, packages/create/starter/apps/server/src/local-secret.ts,
+  localSecret(database)): file "<absolute database path>.key". When it does not exist it is
+  created exclusively with mode 0600 and 96 lowercase hex characters (48 random bytes), fsynced;
+  when it exists it is kept. The content must match ^[a-f0-9]{96}$ exactly (no newline), else
+  Error "Invalid local auth key; restore it with the matching database". It never touches the
+  database file.
+init: {}
+cases:
+  # --- file format ----------------------------------------------------------------------------
+
+  - name: the file is compact JSON with format 1 and the rows in insertion order
+    tags: [format]
+    steps:
+      - call: transact
+        args: [[{ row: { pk: USERS, sk: bob, version: 1, data: { name: Bob } }, expected: null }, { row: { pk: USERS, sk: alice, version: 1, data: { age: 30, name: Alice } }, expected: null }]]
+        expect: { value: null }
+      - call: text
+        expect: { value: '{"format":1,"rows":[{"pk":"USERS","sk":"bob","version":1,"data":{"name":"Bob"}},{"pk":"USERS","sk":"alice","version":1,"data":{"age":30,"name":"Alice"}}]}' }
+      - call: document
+        expect: { value: { format: 1, rows: [{ pk: USERS, sk: bob, version: 1, data: { name: Bob } }, { pk: USERS, sk: alice, version: 1, data: { age: 30, name: Alice } }] } }
+      - call: files
+        expect: { value: [db.json] }
+        note: no lock or temporary file survives
+
+  - name: updates keep the row position, new rows are appended and deletes remove the row
+    tags: [format]
+    init:
+      rows:
+        - { pk: A, sk: "1", version: 1, data: { v: 1 } }
+        - { pk: A, sk: "2", version: 1, data: { v: 2 } }
+        - { pk: A, sk: "3", version: 1, data: { v: 3 } }
+    steps:
+      - call: transact
+        args:
+          - - { row: { pk: A, sk: "0", version: 1, data: { v: 0 } }, expected: null }
+            - { row: { pk: A, sk: "1", version: 2, data: { v: 10 } }, expected: 1 }
+            - { row: { pk: A, sk: "2", version: 1, data: { v: 2 } }, expected: 1, delete: true }
+        expect: { value: null }
+      - call: text
+        expect: { value: '{"format":1,"rows":[{"pk":"A","sk":"1","version":2,"data":{"v":10}},{"pk":"A","sk":"3","version":1,"data":{"v":3}},{"pk":"A","sk":"0","version":1,"data":{"v":0}}]}' }
+
+  - name: strings are written like JSON.stringify
+    tags: [format, unicode]
+    steps:
+      - call: transact
+        args: [[{ row: { pk: S, sk: "é😀", version: 1, data: { s: "q\"b\\s/\b\f\n\r\t\u0001\u001f\u007f\u2028\u2029<>&é😀" } }, expected: null }]]
+        expect: { value: null }
+      - call: text
+        expect: { value: "{\"format\":1,\"rows\":[{\"pk\":\"S\",\"sk\":\"é😀\",\"version\":1,\"data\":{\"s\":\"q\\\"b\\\\s/\\b\\f\\n\\r\\t\\u0001\\u001f\u007f\u2028\u2029<>&é😀\"}}]}" }
+        note: only '"', '\' and U+0000–U+001F are escaped (lowercase hex); never '/', DEL, U+2028 or <>&
+      - call: get
+        args: [S, "é😀"]
+        expect: { value: { pk: S, sk: "é😀", version: 1, data: { s: "q\"b\\s/\b\f\n\r\t\u0001\u001f\u007f\u2028\u2029<>&é😀" } } }
+
+  - name: numbers are written as JavaScript numbers
+    tags: [format, numbers]
+    steps:
+      - call: transact
+        args: [[{ row: { pk: N, sk: n, version: 1, data: { a: 1.0, b: 1.5, c: 1e+21, d: 1e-7, e: -0.5, f: 123456789012, g: 9007199254740993, h: 0.1, i: 100 } }, expected: null }]]
+        expect: { value: null }
+      - call: text
+        expect: { value: '{"format":1,"rows":[{"pk":"N","sk":"n","version":1,"data":{"a":1,"b":1.5,"c":1e+21,"d":1e-7,"e":-0.5,"f":123456789012,"g":9007199254740992,"h":0.1,"i":100}}]}' }
+
+  - name: a file written by another process or language is read as JSON
+    tags: [format, interop]
+    init:
+      text: |
+        {
+          "comment": "pretty-printed, keys in any order, extra fields",
+          "rows": [
+            { "data": { "name": "Alice", "tags": ["a", "b"] }, "version": 2.0, "sk": "alice", "pk": "USERS", "ttl": 4102444800, "owner": "kept" },
+            { "sk": "bob", "pk": "USERS", "version": -3, "data": {} }
+          ],
+          "format": 1.0
+        }
+    steps:
+      - call: get
+        args: [USERS, alice]
+        expect: { value: { $partial: { pk: USERS, sk: alice, version: 2, data: { name: Alice, tags: [a, b] }, ttl: 4102444800 } } }
+        note: rows keep fields the store does not know (Go reads them into nosql.Row, see $partial)
+      - call: list
+        args: [USERS]
+        expect: { value: { items: [{ $partial: { pk: USERS, sk: alice, version: 2 } }, { pk: USERS, sk: bob, version: -3, data: {} }] } }
+      - call: text
+        expect: { value: { $regex: "^\\{\\n  \"comment\"" } }
+        note: reads never rewrite the file
+
+  - name: a rewrite keeps unknown row fields, drops unknown top-level fields and normalizes JSON
+    tags: [format, interop, numbers]
+    init:
+      text: '{"rows":[{"pk":"P","sk":"a","version":1.0,"data":{"b":1.0,"2":"two","a":[1E21,-0,0.50],"10":{"z":null,"1":true},"b":2},"extra":{"y":1,"x":2}}],"format":1,"note":"dropped"}'
+    steps:
+      - call: transact
+        args: [[{ row: { pk: P, sk: b, version: 1, data: {} }, expected: null }]]
+        expect: { value: null }
+      - call: text
+        expect: { value: '{"format":1,"rows":[{"pk":"P","sk":"a","version":1,"data":{"2":"two","10":{"1":true,"z":null},"b":2,"a":[1e+21,0,0.5]},"extra":{"y":1,"x":2}},{"pk":"P","sk":"b","version":1,"data":{}}]}' }
+        note: 'JavaScript property order: array-index keys first ascending, then first-insertion order; a repeated key keeps its first position and last value'
+
+  - name: reads of a missing file return nothing and do not create it
+    tags: [format]
+    init: { path: nested/deeper/db.json }
+    steps:
+      - call: get
+        args: [A, a]
+        expect: { value: null }
+      - call: list
+        args: [A]
+        expect: { value: { items: [] } }
+      - call: document
+        expect: { value: null }
+      - call: files
+        expect: { value: [nested] }
+      - call: mode
+        args: [nested]
+        expect: { value: "700" }
+        note: the directory is created with mode 0700
+      - call: files
+        expect: { value: [nested] }
+
+  - name: an empty transaction still writes the file
+    tags: [format]
+    steps:
+      - call: transact
+        args: [[]]
+        expect: { value: null }
+      - call: text
+        expect: { value: '{"format":1,"rows":[]}' }
+
+  - name: the database file is private (0600), even after another tool widened it
+    tags: [format, security]
+    init: { rows: [{ pk: A, sk: a, version: 1, data: {} }] }
+    steps:
+      - call: mode
+        expect: { value: "600" }
+      - call: chmod
+        args: ["644"]
+        expect: { value: null }
+      - call: transact
+        args: [[{ row: { pk: A, sk: b, version: 1, data: {} }, expected: null }]]
+        expect: { value: null }
+      - call: mode
+        expect: { value: "600" }
+
+  # --- invalid files --------------------------------------------------------------------------
+
+  - name: a file that is not JSON fails closed and is left untouched
+    tags: [invalid]
+    init: { text: broken }
+    steps:
+      - call: transact
+        args: [[{ row: { pk: A, sk: a, version: 1, data: {} }, expected: null }]]
+        expect: { error: { status: null, message: { $type: string } } }
+        note: TypeScript reports the JSON parser's message, the ports "Invalid JSON database"
+      - call: get
+        args: [A, a]
+        expect: { error: { status: null, message: { $type: string } } }
+      - call: text
+        expect: { value: broken }
+      - call: files
+        expect: { value: [db.json] }
+
+  - name: an empty file is not a database
+    tags: [invalid]
+    init: { text: "" }
+    call: get
+    args: [A, a]
+    expect: { error: { status: null, message: { $type: string } } }
+
+  - name: format must be exactly 1
+    tags: [invalid]
+    init: { text: '{"format":2,"rows":[]}' }
+    call: get
+    args: [A, a]
+    expect: { error: { status: null, message: Invalid JSON database } }
+
+  - name: format true is not 1
+    tags: [invalid]
+    init: { text: '{"format":true,"rows":[]}' }
+    call: list
+    args: [A]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: format "1" is not 1
+    tags: [invalid]
+    init: { text: '{"format":"1","rows":[]}' }
+    call: list
+    args: [A]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: rows must be an array
+    tags: [invalid]
+    init: { text: '{"format":1,"rows":{}}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: a missing rows field is invalid
+    tags: [invalid]
+    init: { text: '{"format":1}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: a JSON array is not a database
+    tags: [invalid]
+    init: { text: "[]" }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: a fractional version is invalid
+    tags: [invalid, numbers]
+    init: { text: '{"format":1,"rows":[{"pk":"A","sk":"a","version":1.5,"data":{}}]}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: a string version is invalid
+    tags: [invalid]
+    init: { text: '{"format":1,"rows":[{"pk":"A","sk":"a","version":"1","data":{}}]}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: a version beyond 2^53 - 1 is invalid
+    tags: [invalid, numbers]
+    init: { text: '{"format":1,"rows":[{"pk":"A","sk":"a","version":9007199254740992,"data":{}}]}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: array data is invalid
+    tags: [invalid]
+    init: { text: '{"format":1,"rows":[{"pk":"A","sk":"a","version":1,"data":[]}]}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: null data is invalid
+    tags: [invalid]
+    init: { text: '{"format":1,"rows":[{"pk":"A","sk":"a","version":1,"data":null}]}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: a numeric partition key is invalid
+    tags: [invalid]
+    init: { text: '{"format":1,"rows":[{"pk":1,"sk":"a","version":1,"data":{}}]}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: a null row is invalid
+    tags: [invalid]
+    init: { text: '{"format":1,"rows":[null]}' }
+    call: get
+    args: [A, a]
+    expect: { error: { message: Invalid JSON database } }
+
+  - name: two rows with the same key are rejected
+    tags: [invalid]
+    init: { text: '{"format":1,"rows":[{"pk":"A","sk":"a","version":1,"data":{}},{"pk":"A","sk":"a","version":2,"data":{}}]}' }
+    call: get
+    args: [A, b]
+    expect: { error: { status: null, message: Duplicate JSON database key } }
+
+  # --- transactions ---------------------------------------------------------------------------
+
+  - name: a write without data is rejected
+    tags: [transact]
+    call: transact
+    args: [[{ row: { pk: A, sk: a, version: 1 }, expected: null }]]
+    expect: { error: { status: null, message: Invalid JSON row } }
+
+  - name: a write with a fractional version is rejected
+    tags: [transact, numbers]
+    call: transact
+    args: [[{ row: { pk: A, sk: a, version: 1.5, data: {} }, expected: null }]]
+    expect: { error: { message: Invalid JSON row } }
+
+  - name: a write with array data is rejected
+    tags: [transact]
+    call: transact
+    args: [[{ row: { pk: A, sk: a, version: 1, data: [] }, expected: null }]]
+    expect: { error: { message: Invalid JSON row } }
+
+  - name: a delete also needs a valid row
+    tags: [transact]
+    init: { rows: [{ pk: A, sk: a, version: 1, data: {} }] }
+    steps:
+      - call: transact
+        args: [[{ row: { pk: A, sk: a, version: 1 }, expected: 1, delete: true }]]
+        expect: { error: { message: Invalid JSON row } }
+      - call: get
+        args: [A, a]
+        expect: { value: { pk: A, sk: a, version: 1, data: {} } }
+
+  - name: writes are checked in order (a conflict before an invalid row)
+    tags: [transact]
+    init: { rows: [{ pk: A, sk: a, version: 1, data: {} }] }
+    call: transact
+    args: [[{ row: { pk: A, sk: a, version: 1, data: {} }, expected: null }, { row: { pk: A, sk: b, version: 1 }, expected: null }]]
+    expect: { error: { status: 409, message: "Conflict: refresh and try again" } }
+
+  - name: writes are checked in order (an invalid row before a repeated key)
+    tags: [transact]
+    call: transact
+    args: [[{ row: { pk: A, sk: a, version: 1, data: {} }, expected: null }, { row: { pk: A, sk: a, version: 1 }, expected: null }]]
+    expect: { error: { message: Invalid JSON row } }
+
+  - name: a missing expected version means the row must not exist
+    tags: [transact]
+    init: { rows: [{ pk: A, sk: a, version: 1, data: {} }] }
+    steps:
+      - call: transact
+        args: [[{ row: { pk: A, sk: b, version: 1, data: {} } }]]
+        expect: { value: null }
+      - call: transact
+        args: [[{ row: { pk: A, sk: a, version: 2, data: {} } }]]
+        expect: { error: { status: 409 } }
+
+  - name: a failed transaction leaves the file byte-for-byte unchanged
+    tags: [transact]
+    init: { text: '{"format":1,"rows":[{"pk":"A","sk":"a","version":1,"data":{"n":1.0}},{"pk":"CACHE#x","sk":"old","version":1,"data":{},"ttl":1}]}' }
+    steps:
+      - call: transact
+        args: [[{ row: { pk: A, sk: new, version: 1, data: {} }, expected: null }, { row: { pk: A, sk: a, version: 2, data: {} }, expected: 5 }]]
+        expect: { error: { status: 409 } }
+      - call: text
+        expect: { value: '{"format":1,"rows":[{"pk":"A","sk":"a","version":1,"data":{"n":1.0}},{"pk":"CACHE#x","sk":"old","version":1,"data":{},"ttl":1}]}' }
+      - call: files
+        expect: { value: [db.json] }
+
+  - name: exactly one of several concurrent writers creates a row
+    tags: [transact, concurrency]
+    steps:
+      - call: race
+        args: [[{ row: { pk: P, sk: once, version: 1, data: {} }, expected: null }], 4]
+        expect: { value: { committed: 1, conflicts: 3, errors: [] } }
+      - call: list
+        args: [P]
+        expect: { value: { items: [{ pk: P, sk: once, version: 1, data: {} }] } }
+      - call: files
+        expect: { value: [db.json] }
+
+  - name: only one of several concurrent updates of the same version wins
+    tags: [transact, concurrency]
+    init: { rows: [{ pk: C, sk: n, version: 1, data: {} }] }
+    steps:
+      - call: race
+        args: [[{ row: { pk: C, sk: n, version: 2, data: {} }, expected: 1 }], 3]
+        expect: { value: { committed: 1, conflicts: 2, errors: [] } }
+      - call: get
+        args: [C, n]
+        expect: { value: { pk: C, sk: n, version: 2, data: {} } }
+
+  # --- locking --------------------------------------------------------------------------------
+
+  - name: a held lock blocks readers and writers until it times out
+    tags: [lock]
+    init: { lockTimeout: 60 }
+    steps:
+      - call: lock
+        expect: { value: null }
+      - call: get
+        args: [A, a]
+        expect: { error: { status: null, message: { $regex: "^JSON store locked: /.+/db\\.json\\.lock\\. Stop writers before removing a stale lock\\.$" } } }
+      - call: transact
+        args: [[{ row: { pk: A, sk: a, version: 1, data: {} }, expected: null }]]
+        expect: { error: { message: { $regex: "^JSON store locked: .*db\\.json\\.lock\\." } } }
+      - call: files
+        expect: { value: [db.json.lock] }
+        note: the stale lock stays and nothing else was written
+      - call: unlock
+        expect: { value: null }
+      - call: transact
+        args: [[{ row: { pk: A, sk: a, version: 1, data: {} }, expected: null }]]
+        expect: { value: null }
+      - call: files
+        expect: { value: [db.json] }
+
+  - name: a zero lock timeout still makes one attempt
+    tags: [lock, edge]
+    init: { lockTimeout: 0 }
+    steps:
+      - call: transact
+        args: [[{ row: { pk: A, sk: a, version: 1, data: {} }, expected: null }]]
+        expect: { value: null }
+      - call: lock
+        expect: { value: null }
+      - call: list
+        args: [A]
+        expect: { error: { message: { $regex: "^JSON store locked: " } } }
+
+  - name: the lock is released after a failed operation
+    tags: [lock]
+    init: { text: '{"format":2,"rows":[]}' }
+    steps:
+      - call: get
+        args: [A, a]
+        expect: { error: { message: Invalid JSON database } }
+      - call: files
+        expect: { value: [db.json] }
+
+  # --- retention ------------------------------------------------------------------------------
+
+  - name: writes drop expired observer, cache and visits rows by the clock
+    tags: [retention]
+    init:
+      now: 1767225600000
+      text: '{"format":1,"rows":[{"pk":"OBSERVER#e","sk":"1","version":1,"data":{},"ttl":1767225599},{"pk":"CACHE#c","sk":"past","version":1,"data":{},"ttl":1767225599},{"pk":"CACHE#c","sk":"now","version":1,"data":{},"ttl":1767225600},{"pk":"CACHE#c","sk":"future","version":1,"data":{},"ttl":1767225601},{"pk":"CACHE#c","sk":"zero","version":1,"data":{},"ttl":0},{"pk":"CACHE#c","sk":"none","version":1,"data":{}},{"pk":"VISITS","sk":"recent","version":1,"data":{},"ttl":1},{"pk":"VISITSX","sk":"kept","version":1,"data":{},"ttl":1},{"pk":"USERS","sk":"kept","version":1,"data":{},"ttl":1},{"pk":"cache#lower","sk":"kept","version":1,"data":{},"ttl":1}]}'
+    steps:
+      - call: get
+        args: [OBSERVER#e, "1"]
+        expect: { value: { pk: OBSERVER#e, sk: "1", version: 1, data: {}, ttl: 1767225599 } }
+        note: reads never drop rows
+      - call: transact
+        args: [[]]
+        expect: { value: null }
+      - call: document
+        expect:
+          value:
+            format: 1
+            rows:
+              - { pk: CACHE#c, sk: future, version: 1, data: {}, ttl: 1767225601 }
+              - { pk: CACHE#c, sk: zero, version: 1, data: {}, ttl: 0 }
+              - { pk: CACHE#c, sk: none, version: 1, data: {} }
+              - { pk: VISITSX, sk: kept, version: 1, data: {}, ttl: 1 }
+              - { pk: USERS, sk: kept, version: 1, data: {}, ttl: 1 }
+              - { pk: cache#lower, sk: kept, version: 1, data: {}, ttl: 1 }
+        note: ttl <= now / 1000 expires (1767225600 expires at 1767225600000 ms)
+
+  - name: the clock is read at every write
+    tags: [retention]
+    init: { now: 1767225600000, rows: [{ pk: CACHE#c, sk: a, version: 1, data: {}, ttl: 1767225660 }] }
+    steps:
+      - call: setNow
+        args: [1767225659999]
+        expect: { value: null }
+      - call: transact
+        args: [[]]
+        expect: { value: null }
+      - call: get
+        args: [CACHE#c, a]
+        expect: { value: { pk: CACHE#c, sk: a, version: 1, data: {}, ttl: 1767225660 } }
+      - call: setNow
+        args: [1767225660000]
+        expect: { value: null }
+      - call: transact
+        args: [[{ row: { pk: USERS, sk: u, version: 1, data: {} }, expected: null }]]
+        expect: { value: null }
+      - call: get
+        args: [CACHE#c, a]
+        expect: { value: null }
+
+  - name: a row written already expired is dropped by its own transaction
+    tags: [retention]
+    init: { now: 1767225600000 }
+    steps:
+      - call: transact
+        args: [[{ row: { pk: OBSERVER#x, sk: old, version: 1, data: {}, ttl: 100 }, expected: null }, { row: { pk: USERS, sk: kept, version: 1, data: { name: User } }, expected: null }]]
+        expect: { value: null }
+      - call: get
+        args: [OBSERVER#x, old]
+        expect: { value: null }
+      - call: get
+        args: [USERS, kept]
+        expect: { value: { pk: USERS, sk: kept, version: 1, data: { name: User } } }
+
+  - name: ttl uses JavaScript truthiness and number conversion
+    tags: [retention, edge]
+    init:
+      now: 1767225600000
+      text: '{"format":1,"rows":[{"pk":"CACHE#t","sk":"string","version":1,"data":{},"ttl":"100"},{"pk":"CACHE#t","sk":"text","version":1,"data":{},"ttl":"soon"},{"pk":"CACHE#t","sk":"true","version":1,"data":{},"ttl":true},{"pk":"CACHE#t","sk":"false","version":1,"data":{},"ttl":false},{"pk":"CACHE#t","sk":"empty","version":1,"data":{},"ttl":""},{"pk":"CACHE#t","sk":"null","version":1,"data":{},"ttl":null},{"pk":"CACHE#t","sk":"negative","version":1,"data":{},"ttl":-5},{"pk":"CACHE#t","sk":"fraction","version":1,"data":{},"ttl":1767225599.5}]}'
+    steps:
+      - call: transact
+        args: [[]]
+        expect: { value: null }
+      - call: list
+        args: [CACHE#t]
+        expect:
+          value:
+            items:
+              - { $partial: { sk: empty } }
+              - { $partial: { sk: "false" } }
+              - { $partial: { sk: "null" } }
+              - { $partial: { sk: text } }
+        note: '"100", true, -5 and 1767225599.5 are expired; "soon" (NaN), "", false and null are not'
+
+  # --- cursors --------------------------------------------------------------------------------
+
+  - name: cursors are base64url JSON of the last key, readable by every store
+    tags: [cursor, interop]
+    init:
+      rows:
+        - $repeat: { count: 51, item: { pk: P, sk: "k{i:02}", version: 1, data: {} } }
+    steps:
+      - call: list
+        args: [P]
+        expect: { value: { items: { $length: 50 }, cursor: eyJwayI6IlAiLCJzayI6Ims0OSJ9 } }
+      - call: list
+        args: [P, eyJwayI6IlAiLCJzayI6ImszOSJ9]
+        expect: { value: { items: { $length: 11 } } }
+        note: '{"pk":"P","sk":"k39"} continues after k39'
+      - call: list
+        args: [P, ""]
+        expect: { value: { items: { $length: 50 }, cursor: { $type: string } } }
+        note: an empty cursor is the first page
+
+  - name: a cursor whose sort key is not a string is rejected
+    tags: [cursor, security]
+    call: list
+    args: [P, eyJwayI6IlAiLCJzayI6MX0]
+    expect: { error: { status: 400, message: Invalid cursor } }
+    note: '{"pk":"P","sk":1}'
+
+  # --- secret file ----------------------------------------------------------------------------
+
+  - name: the local auth key is created once, private and stable
+    tags: [secret, security]
+    steps:
+      - call: localSecret
+        expect: { value: { $regex: "^[a-f0-9]{96}$" } }
+      - call: localSecret
+        expect: { value: { $ref: "0.value" } }
+      - call: text
+        args: [db.json.key]
+        expect: { value: { $ref: "0.value" } }
+      - call: mode
+        args: [db.json.key]
+        expect: { value: "600" }
+      - call: files
+        expect: { value: [db.json.key] }
+        note: the database file is not created
+
+  - name: an existing auth key written elsewhere is kept
+    tags: [secret, interop]
+    steps:
+      - call: writeText
+        args: [0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, db.json.key]
+        expect: { value: null }
+      - call: localSecret
+        expect: { value: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef }
+
+  - name: a corrupt auth key is refused
+    tags: [secret, security]
+    steps:
+      - call: writeText
+        args: [broken, db.json.key]
+        expect: { value: null }
+      - call: localSecret
+        expect: { error: { status: null, message: Invalid local auth key; restore it with the matching database } }
+      - call: text
+        args: [db.json.key]
+        expect: { value: broken }
+
+  - name: an auth key with a trailing newline is refused
+    tags: [secret, edge]
+    steps:
+      - call: writeText
+        args: ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", db.json.key]
+        expect: { value: null }
+      - call: localSecret
+        expect: { error: { message: Invalid local auth key; restore it with the matching database } }
+
+  - name: an upper-case auth key is refused
+    tags: [secret, edge]
+    steps:
+      - call: writeText
+        args: [0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, db.json.key]
+        expect: { value: null }
+      - call: localSecret
+        expect: { error: { message: Invalid local auth key; restore it with the matching database } }
+
+  - name: an empty auth key file is refused
+    tags: [secret, edge]
+    steps:
+      - call: writeText
+        args: ["", db.json.key]
+        expect: { value: null }
+      - call: localSecret
+        expect: { error: { message: Invalid local auth key; restore it with the matching database } }

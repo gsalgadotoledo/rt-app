@@ -104,7 +104,10 @@ export async function handleDeployRequest(request: DeployRequest, options: Deplo
     }
     return { status: 404, body: { error: "Not found" } };
   } catch (error: any) {
-    return { status: error.status ?? 400, body: { error: error.message } };
+    // ProviderError carries the provider API status, 0 for a network failure: only HTTP error
+    // statuses (400-599) pass through, anything else answers 400 (writeHead(0) would throw).
+    const status = Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599 ? error.status : 400;
+    return { status, body: { error: error.message } };
   }
 }
 

@@ -64,3 +64,12 @@ test('TOTP matches RFC 6238 SHA-1 vectors (six-digit truncation)',()=>{
  assert.equal(totpCode(key,Math.floor(59/30)),'287082');
  assert.equal(totpCode(key,Math.floor(1111111109/30)),'081804');
 });
+test('LocalMailbox stamps messages with the injected clock and keeps the newest 30',async()=>{
+ const {LocalMailbox:Mailbox}=await import('../dist/index.js');
+ let now=Date.UTC(2026,0,2,3,4,5,678);const box=new Mailbox({now:()=>now});
+ await box.sendCode('a@example.test','111111','Sign in');now=new Date(Date.UTC(2026,0,2,3,4,6));
+ await box.send({to:'b@example.test',subject:'s',text:'t'});
+ assert.deepEqual(box.messages,[{email:'b@example.test',code:'t',purpose:'s',at:'2026-01-02T03:04:06.000Z'},{email:'a@example.test',code:'111111',purpose:'Sign in',at:'2026-01-02T03:04:05.678Z'}]);
+ for(let i=0;i<40;i++)await box.sendCode('c@example.test',String(i),'x');
+ assert.equal(box.messages.length,30);assert.equal(box.messages[0].code,'39');
+});

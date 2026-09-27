@@ -74,3 +74,17 @@ test("admin password generation needs the hashing function", async (t) => {
   assert.deepEqual([r.status, r.body.error], [400, "Password hashing is not available"]);
   assert.deepEqual(await readCredentials(root), {});
 });
+
+test("provider errors keep HTTP error statuses; network failures (status 0) answer 400", async (t) => {
+  const { ProviderError } = await import("@gsalgadotoledo/rt-app-deploy");
+  const { call } = await setup(t);
+  const original = render.plan;
+  t.after(() => { render.plan = original; });
+  await call("PUT", "/__dev/deploy", { deploy: { environments: { stage: { api: { provider: "render" } } } } });
+  await call("PUT", "/__dev/deploy/credentials", { environment: "stage", key: "RENDER_API_KEY", value: "rnd_live_secret" });
+  for (const [status, expected] of [[0, 400], [502, 502], [401, 401], [200, 400]]) {
+    render.plan = async () => { throw new ProviderError("Render", status, "GET /services failed"); };
+    const r = await call("POST", "/__dev/deploy/plan", { environment: "stage" });
+    assert.deepEqual([r.status, r.body.error], [expected, "Render: GET /services failed"]);
+  }
+});

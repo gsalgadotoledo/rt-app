@@ -1,0 +1,308 @@
+contract: 1
+module: deployments-server
+subject: deployments
+title: Local admin API for the Deployments page (/__dev/deploy handler)
+description: |
+  handleDeployRequest of @gsalgadotoledo/rt-app-deployments/server, driven through the deployments
+  subject (see the deployments contract for init and the fake runner):
+  handle(method, path, body?, query?) → {status, body}.
+
+  Why a facade and not a kind: http contract: the handler is not a Feature endpoint. The generated
+  starter server (packages/create/starter/apps/server/src/index.ts) calls it itself, only in local
+  mode, for "/__dev/deploy…" paths, after its own checks (owner actor, else 403 "Only the owner can
+  manage deployments"; Origin allowlist; JSON body). The reference API (createApplication, and the
+  Python/Go example APIs) does not mount it, so the handler is contracted directly, with the
+  starter's inputs: method, path (no query string), the parsed JSON body ({} when empty) and the
+  query parameters. The handler never reads the environment for credentials: presence comes from
+  .rt-app/credentials.json only.
+
+  Routes (exact method and path; anything else → 404 {error: "Not found"}):
+  - GET /__dev/deploy → 200 {providers: catalog (aws first), roles: [{id, label}], environments:
+    [{id, branch}], runtimeSecrets, deploy (validated from rt-app.settings.json), credentials:
+    credentialStatus(…, env {}), runtime: {env: [{key, present}] for RUNTIME_SECRETS from the local
+    file}, repository (or null)}.
+  - PUT /__dev/deploy {deploy} → saveDeploySettings(body.deploy) → 200 {deploy}.
+  - PUT /__dev/deploy/credentials {environment, key, value} → the environment must be one of
+    develop/stage/prod (else 400 "Unknown environment"), then saveCredential(environment,
+    String(key ?? ""), String(value ?? "")) → 200 {ok: true} (JavaScript String: numbers as printed,
+    objects "[object Object]"; null or missing value deletes the key).
+  - POST /__dev/deploy/generate {environment, key, password?} → environment first; key JWT_SECRET
+    stores 96 lowercase hex characters (48 random bytes); key ADMIN_PASSWORD_VERIFIER needs
+    String(password ?? "") of 12 to 128 UTF-16 units (400 "The admin password needs 12 to 128
+    characters"), then the injected password hasher (none: 400 "Password hashing is not
+    available") and stores its result; any other key → 400 "Only JWT_SECRET and
+    ADMIN_PASSWORD_VERIFIER can be generated". 200 {ok: true}.
+  - POST /__dev/deploy/plan {environment} → 200 {plans}.
+  - POST /__dev/deploy/apply {environment} → 200 {results: [{provider, role, url?, resources}]}:
+    outputs (DATABASE_URL…) never leave the server.
+  - GET /__dev/deploy/status with query environment → 200 {statuses}.
+  - POST /__dev/deploy/github {environment?} → syncGithub for that environment (or all when it is
+    missing or empty), without runtime secrets from the process → 200 {repository, secrets}.
+  Errors thrown by any route answer {error: message} with the error's status when it is an
+  integer from 400 to 599 (a ProviderError from a provider API), else 400 — including status 0,
+  a provider network failure.
+init:
+  providers:
+    - &render
+      id: render
+      name: Render
+      roles: [api, ssr]
+      website: "https://render.com"
+      credentials: [{ key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys" }]
+      urls: { api: "https://shop-api.onrender.com" }
+      outputs: { api: { SECRET_OUT: hidden-output-value } }
+    - &neon
+      id: neon
+      name: Neon
+      roles: [database]
+      credentials: [{ key: NEON_API_KEY, label: API key }]
+      outputs: { database: { DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" } }
+  settings: &settings
+    version: 1
+    project: { name: shop }
+    deploy: { environments: { stage: { api: { provider: render }, database: { provider: neon } }, prod: { frontend: { provider: aws } } } }
+  env: { RENDER_API_KEY: env-value-not-used-by-the-handler }
+cases:
+  - name: the overview lists providers, roles, environments and presence flags only
+    tags: [overview, secrets]
+    init:
+      providers: [*render, *neon]
+      settings: *settings
+      env: { RENDER_API_KEY: env-value-not-used-by-the-handler }
+      credentials: { stage: { NEON_API_KEY: neon-secret-value, JWT_SECRET: jwt-secret-value, SMTP_URL: "" } }
+    steps:
+      - call: handle
+        args: [GET, /__dev/deploy]
+        expect:
+          value:
+            status: 200
+            body:
+              providers:
+                - { id: aws, name: "AWS (Lambda, S3 + CloudFront, Amplify, DynamoDB)", roles: [api, ssr, frontend, files, database], website: "https://aws.amazon.com", credentials: [], settings: [], notes: "Deployed by Terraform: run `rta install` once, then merges deploy through the GitHub workflow." }
+                - { id: render, name: Render, roles: [api, ssr], website: "https://render.com", credentials: [{ key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys" }], settings: [] }
+                - { id: neon, name: Neon, roles: [database], website: "https://neon.example", credentials: [{ key: NEON_API_KEY, label: API key }], settings: [] }
+              roles:
+                - { id: api, label: "API (Node, Python or Go process)" }
+                - { id: ssr, label: SSR (Next.js) }
+                - { id: frontend, label: Frontend (static SPA and admin) }
+                - { id: files, label: Files (uploads) }
+                - { id: database, label: Database }
+              environments: [{ id: develop, branch: develop }, { id: stage, branch: stage }, { id: prod, branch: main }]
+              runtimeSecrets: [JWT_SECRET, ADMIN_PASSWORD_VERIFIER, MAIL_FROM, SMTP_URL, DATABASE_URL]
+              deploy: { environments: { stage: { api: { provider: render }, database: { provider: neon } }, prod: { frontend: { provider: aws } } } }
+              credentials:
+                develop: []
+                stage:
+                  - { provider: render, credentials: [{ key: RENDER_API_KEY, label: API key, url: "https://dashboard.render.com/u/settings#api-keys", present: false }], missing: [RENDER_API_KEY] }
+                  - { provider: neon, credentials: [{ key: NEON_API_KEY, label: API key, present: true }], missing: [] }
+                prod:
+                  - { provider: aws, credentials: [], missing: [] }
+              runtime:
+                develop: [{ key: JWT_SECRET, present: false }, { key: ADMIN_PASSWORD_VERIFIER, present: false }, { key: MAIL_FROM, present: false }, { key: SMTP_URL, present: false }, { key: DATABASE_URL, present: false }]
+                stage: [{ key: JWT_SECRET, present: true }, { key: ADMIN_PASSWORD_VERIFIER, present: false }, { key: MAIL_FROM, present: false }, { key: SMTP_URL, present: false }, { key: DATABASE_URL, present: false }]
+                prod: [{ key: JWT_SECRET, present: false }, { key: ADMIN_PASSWORD_VERIFIER, present: false }, { key: MAIL_FROM, present: false }, { key: SMTP_URL, present: false }, { key: DATABASE_URL, present: false }]
+              repository: acme/shop
+        note: the process environment is ignored (RENDER_API_KEY is not present); no value is ever returned
+
+  - name: the overview without a GitHub origin or deploy section
+    tags: [overview]
+    init: { origin: "" }
+    steps:
+      - call: handle
+        args: [GET, /__dev/deploy]
+        expect: { value: { status: 200, body: { $partial: { deploy: { environments: {} }, credentials: { develop: [], stage: [], prod: [] }, repository: null } } } }
+
+  - name: a missing or invalid settings file answers 400
+    tags: [overview, errors]
+    init: { noSettings: true }
+    steps:
+      - call: handle
+        args: [GET, /__dev/deploy]
+        expect: { value: { status: 400, body: { error: { $regex: "^ENOENT: no such file or directory, open '.+rt-app\\.settings\\.json'$" } } } }
+      - { call: writeText, args: [rt-app.settings.json, "{\"deploy\":{\"environments\":{\"qa\":{}}}}"], expect: { value: null } }
+      - { call: handle, args: [GET, /__dev/deploy], expect: { value: { status: 400, body: { error: "Unknown environment: qa" } } } }
+
+  - name: targets are validated and saved
+    tags: [settings]
+    steps:
+      - call: handle
+        args: [PUT, /__dev/deploy, { deploy: { environments: { stage: { api: { provider: render, extra: 1 } } } } }]
+        expect: { value: { status: 200, body: { deploy: { environments: { stage: { api: { provider: render } } } } } } }
+      - { call: readDeploySettings, expect: { value: { settings: { version: 1, project: { name: shop }, deploy: { environments: { stage: { api: { provider: render } } } } }, deploy: { environments: { stage: { api: { provider: render } } } } } } }
+      - { call: handle, args: [PUT, /__dev/deploy, { deploy: { environments: { stage: { api: { provider: nope } } } } }], expect: { value: { status: 400, body: { error: "Unknown deploy provider: nope" } } } }
+      - { call: handle, args: [PUT, /__dev/deploy, { deploy: { environments: { stage: { database: { provider: render } } } } }], expect: { value: { status: 400, body: { error: Render does not support the database role } } } }
+      - { call: handle, args: [PUT, /__dev/deploy, { deploy: [] }], expect: { value: { status: 400, body: { error: deploy must be an object } } } }
+      - { call: readDeploySettings, expect: { value: { $partial: { deploy: { environments: { stage: { api: { provider: render } } } } } } } }
+      - call: handle
+        args: [PUT, /__dev/deploy, {}]
+        expect: { value: { status: 200, body: { deploy: { environments: {} } } } }
+        note: a body without deploy clears the targets
+
+  - name: credentials are saved without being echoed
+    tags: [credentials, secrets]
+    steps:
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: RENDER_API_KEY, value: rnd_live_secret }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: NUM_KEY, value: 123 }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: OBJ_KEY, value: { a: 1 } }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: prod, key: LIST_KEY, value: [a, null, 2] }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: readCredentials, expect: { value: { stage: { RENDER_API_KEY: rnd_live_secret, NUM_KEY: "123", OBJ_KEY: "[object Object]" }, prod: { LIST_KEY: "a,,2" } } }, note: "values go through JavaScript String()" }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: NUM_KEY }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: OBJ_KEY, value: null }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: readCredentials, expect: { value: { stage: { RENDER_API_KEY: rnd_live_secret }, prod: { LIST_KEY: "a,,2" } } }, note: "a missing or null value deletes the key" }
+
+  - name: credential requests are validated
+    tags: [credentials, validation]
+    steps:
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: qa, key: X_KEY, value: y }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { key: X_KEY, value: y }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: [stage], key: X_KEY, value: y }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: lower, value: y }], expect: { value: { status: 400, body: { error: "Invalid credential name: lower" } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, value: y }], expect: { value: { status: 400, body: { error: "Invalid credential name: " } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: 12, value: y }], expect: { value: { status: 400, body: { error: "Invalid credential name: 12" } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: X_KEY, value: { $text: { repeat: v, count: 10001 } } }], expect: { value: { status: 400, body: { error: Invalid credential value } } } }
+      - { call: readCredentials, expect: { value: {} } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, null], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+
+  - name: JWT_SECRET is generated as 96 hex characters and never returned
+    tags: [generate, secrets]
+    steps:
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: stage, key: JWT_SECRET }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: readCredentials, expect: { value: { stage: { JWT_SECRET: { $regex: "^[0-9a-f]{96}$" } } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: stage, key: JWT_SECRET, password: ignored }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: readCredentials, expect: { value: { stage: { JWT_SECRET: { $regex: "^[0-9a-f]{96}$" } } } } }
+      - { call: mode, args: [.rt-app/credentials.json], expect: { value: "600" } }
+      - { call: handle, args: [GET, /__dev/deploy], expect: { value: { status: 200, body: { $partial: { runtime: { develop: { $length: 5 }, stage: [{ key: JWT_SECRET, present: true }, { key: ADMIN_PASSWORD_VERIFIER, present: false }, { key: MAIL_FROM, present: false }, { key: SMTP_URL, present: false }, { key: DATABASE_URL, present: false }], prod: { $length: 5 } } } } } } }
+
+  - name: the admin password is stored as the hasher's verifier
+    tags: [generate, secrets, unicode]
+    steps:
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER, password: Admin-password-2026 }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: readCredentials, expect: { value: { prod: { ADMIN_PASSWORD_VERIFIER: "fake-verifier:19" } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER, password: "😀😀😀😀😀😀" }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: readCredentials, expect: { value: { prod: { ADMIN_PASSWORD_VERIFIER: "fake-verifier:12" } } }, note: "six emoji are 12 UTF-16 units" }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER, password: { $text: { repeat: p, count: 128 } } }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: readCredentials, expect: { value: { prod: { ADMIN_PASSWORD_VERIFIER: "fake-verifier:128" } } } }
+
+  - name: admin passwords need 12 to 128 characters
+    tags: [generate, validation]
+    steps:
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER, password: short-pass1 }], expect: { value: { status: 400, body: { error: The admin password needs 12 to 128 characters } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER, password: { $text: { repeat: p, count: 129 } } }], expect: { value: { status: 400, body: { error: The admin password needs 12 to 128 characters } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER }], expect: { value: { status: 400, body: { error: The admin password needs 12 to 128 characters } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER, password: 123456789012 }], expect: { value: { status: 200, body: { ok: true } } } }
+      - { call: readCredentials, expect: { value: { prod: { ADMIN_PASSWORD_VERIFIER: "fake-verifier:12" } } }, note: "the password goes through String()" }
+
+  - name: without a password hasher the verifier cannot be generated
+    tags: [generate, errors]
+    init: { passwordVerifier: false }
+    steps:
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER, password: short }], expect: { value: { status: 400, body: { error: The admin password needs 12 to 128 characters } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: prod, key: ADMIN_PASSWORD_VERIFIER, password: Admin-password-2026 }], expect: { value: { status: 400, body: { error: Password hashing is not available } } } }
+      - { call: readCredentials, expect: { value: {} } }
+
+  - name: only JWT_SECRET and ADMIN_PASSWORD_VERIFIER can be generated
+    tags: [generate, validation]
+    steps:
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: stage, key: SMTP_URL }], expect: { value: { status: 400, body: { error: Only JWT_SECRET and ADMIN_PASSWORD_VERIFIER can be generated } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: stage }], expect: { value: { status: 400, body: { error: Only JWT_SECRET and ADMIN_PASSWORD_VERIFIER can be generated } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: stage, key: jwt_secret }], expect: { value: { status: 400, body: { error: Only JWT_SECRET and ADMIN_PASSWORD_VERIFIER can be generated } } } }
+      - { call: handle, args: [POST, /__dev/deploy/generate, { environment: qa, key: JWT_SECRET }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: files, args: [.rt-app], expect: { value: null } }
+
+  - name: plan answers the plans or the first error
+    tags: [plan]
+    init:
+      providers: [*render, *neon]
+      settings: *settings
+      credentials: { stage: { RENDER_API_KEY: rnd_live_secret } }
+    steps:
+      - { call: handle, args: [POST, /__dev/deploy/plan, { environment: stage }], expect: { value: { status: 400, body: { error: "Missing credentials: neon:NEON_API_KEY" } } } }
+      - { call: handle, args: [PUT, /__dev/deploy/credentials, { environment: stage, key: NEON_API_KEY, value: neon-key }], expect: { value: { status: 200, body: { ok: true } } } }
+      - call: handle
+        args: [POST, /__dev/deploy/plan, { environment: stage }]
+        expect:
+          value:
+            status: 200
+            body:
+              plans:
+                - { provider: neon, role: database, environment: stage, actions: [{ action: create, resource: shop-stage-database, detail: new }] }
+                - { provider: render, role: api, environment: stage, actions: [{ action: create, resource: shop-stage-api, detail: new }] }
+      - { call: handle, args: [POST, /__dev/deploy/plan, { environment: prod }], expect: { value: { status: 200, body: { plans: [] } } } }
+      - { call: handle, args: [POST, /__dev/deploy/plan, { environment: production }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: handle, args: [POST, /__dev/deploy/plan, {}], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: logs, expect: { value: [] }, note: "the handler passes no log function, so provider log lines go nowhere" }
+
+  - name: provider API statuses pass through, a network failure (status 0) answers 400
+    tags: [plan, errors]
+    init:
+      providers:
+        - { id: render, name: Render, roles: [api], fail: { plan: { message: "GET /services → 502 bad gateway", status: 502 } } }
+        - { id: neon, name: Neon, roles: [database], fail: { plan: { message: "GET /projects failed: getaddrinfo ENOTFOUND console.neon.tech", status: 0 } } }
+        - { id: vercel, name: Vercel, roles: [ssr], fail: { plan: { message: "GET /v9/projects → 401 invalid token", status: 401 } } }
+      settings: { project: { name: shop }, deploy: { environments: { stage: { api: { provider: render } }, prod: { database: { provider: neon } }, develop: { ssr: { provider: vercel } } } } }
+    steps:
+      - { call: handle, args: [POST, /__dev/deploy/plan, { environment: stage }], expect: { value: { status: 502, body: { error: "render: GET /services → 502 bad gateway" } } } }
+      - { call: handle, args: [POST, /__dev/deploy/plan, { environment: prod }], expect: { value: { status: 400, body: { error: "neon: GET /projects failed: getaddrinfo ENOTFOUND console.neon.tech" } } } }
+      - { call: handle, args: [POST, /__dev/deploy/plan, { environment: develop }], expect: { value: { status: 401, body: { error: "vercel: GET /v9/projects → 401 invalid token" } } } }
+      - { call: handle, args: [POST, /__dev/deploy/apply, { environment: stage }], expect: { value: { status: 400, body: { error: "render: GET /services → 502 bad gateway (already applied: nothing)" } } }, note: "apply wraps provider errors, so they answer 400" }
+
+  - name: apply answers URLs and resources, never outputs
+    tags: [apply, secrets]
+    init:
+      providers: [*render, *neon]
+      settings: *settings
+      credentials: { stage: { RENDER_API_KEY: rnd_live_secret, NEON_API_KEY: neon-key } }
+    steps:
+      - call: handle
+        args: [POST, /__dev/deploy/apply, { environment: stage }]
+        expect:
+          value:
+            status: 200
+            body:
+              results:
+                - { provider: neon, role: database, resources: [{ kind: service, id: neon-database, name: shop-stage-database }] }
+                - { provider: render, role: api, url: "https://shop-api.onrender.com", resources: [{ kind: service, id: render-api, name: shop-stage-api }] }
+      - { call: handle, args: [POST, /__dev/deploy/apply, { environment: prod }], expect: { value: { status: 200, body: { results: [] } } } }
+      - { call: handle, args: [POST, /__dev/deploy/apply, { environment: null }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: calls, expect: { value: [{ $partial: { call: plan, role: database } }, { $partial: { call: apply, role: database } }, { $partial: { call: plan, role: api, variables: { $partial: { DATABASE_URL: "postgres://neon-user:neon-pass@db.neon.example/shop" } } } }, { $partial: { call: apply, role: api } }] } }
+
+  - name: status reads the environment from the query
+    tags: [status]
+    init:
+      providers: [*render, *neon]
+      settings: *settings
+      credentials: { stage: { RENDER_API_KEY: rnd_live_secret } }
+    steps:
+      - call: handle
+        args: [GET, /__dev/deploy/status, { environment: prod }, { environment: stage }]
+        expect: { value: { status: 200, body: { statuses: [{ role: api, provider: render, state: live }, { role: database, provider: neon, state: unknown, detail: Missing NEON_API_KEY }] } } }
+      - { call: handle, args: [GET, /__dev/deploy/status, { environment: stage }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: handle, args: [GET, /__dev/deploy/status, {}, { environment: nope }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - { call: handle, args: [GET, /__dev/deploy/status, {}, { environment: prod }], expect: { value: { status: 200, body: { statuses: [{ role: frontend, provider: aws, state: unknown, detail: See the GitHub deploy workflow or rta urls }] } } } }
+
+  - name: GitHub sync pushes local credentials for one or every environment
+    tags: [github, secrets]
+    init: { credentials: { stage: { RENDER_API_KEY: rnd_live_secret } }, env: { JWT_SECRET: not-pushed-by-the-handler } }
+    steps:
+      - { call: handle, args: [POST, /__dev/deploy/github, { environment: stage }], expect: { value: { status: 200, body: { repository: acme/shop, secrets: { stage: [RENDER_API_KEY] } } } } }
+      - { call: handle, args: [POST, /__dev/deploy/github, { environment: "" }], expect: { value: { status: 200, body: { repository: acme/shop, secrets: { develop: [], stage: [RENDER_API_KEY], prod: [] } } } } }
+      - { call: handle, args: [POST, /__dev/deploy/github, {}], expect: { value: { status: 200, body: { repository: acme/shop, secrets: { develop: [], stage: [RENDER_API_KEY], prod: [] } } } } }
+      - { call: handle, args: [POST, /__dev/deploy/github, { environment: qa }], expect: { value: { status: 400, body: { error: Unknown environment } } } }
+      - call: runs
+        expect: { value: { $length: 16 } }
+        note: an unknown environment runs nothing
+      - { call: setOrigin, args: [""], expect: { value: null } }
+      - { call: handle, args: [POST, /__dev/deploy/github, {}], expect: { value: { status: 400, body: { error: "No GitHub origin. Run: rta github connect" } } } }
+
+  - name: unknown routes answer 404
+    tags: [routing]
+    steps:
+      - { call: handle, args: [DELETE, /__dev/deploy], expect: { value: { status: 404, body: { error: Not found } } } }
+      - { call: handle, args: [GET, /__dev/deploy/], expect: { value: { status: 404, body: { error: Not found } } } }
+      - { call: handle, args: [get, /__dev/deploy], expect: { value: { status: 404, body: { error: Not found } } } }
+      - { call: handle, args: [GET, /__dev/deploy/plan], expect: { value: { status: 404, body: { error: Not found } } } }
+      - { call: handle, args: [POST, /__dev/deploy/status], expect: { value: { status: 404, body: { error: Not found } } } }
+      - { call: handle, args: [POST, /__dev/deploy/credentials], expect: { value: { status: 404, body: { error: Not found } } } }
+      - { call: handle, args: [GET, /__dev/deploy/generate], expect: { value: { status: 404, body: { error: Not found } } } }
+      - { call: handle, args: [GET, /__dev/deployments], expect: { value: { status: 404, body: { error: Not found } } } }
+      - { call: handle, args: [GET, "/__dev/deploy?environment=stage"], expect: { value: { status: 404, body: { error: Not found } } } }

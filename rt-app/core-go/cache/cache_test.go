@@ -14,6 +14,7 @@ import (
 
 	"rt.local/core-go/apperr"
 	"rt.local/core-go/nosql"
+	"rt.local/core-go/nosql/jsonstore"
 )
 
 const base = 4102444800000
@@ -217,8 +218,7 @@ func TestFileSharedAndPurged(t *testing.T) {
 	if _, err := NewFileStore(path).Get(ctx, "a", "b"); err == nil || err.Error() != "Invalid JSON database" {
 		t.Fatal(err)
 	}
-	store := NewFileStore(path)
-	store.lockTimeout = 50 * time.Millisecond
+	store := jsonstore.New(path, jsonstore.WithLockTimeout(50*time.Millisecond))
 	if err := os.WriteFile(path+".lock", nil, 0o600); err != nil {
 		t.Fatal(err)
 	}

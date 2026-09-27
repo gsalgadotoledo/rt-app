@@ -5,6 +5,21 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Conflict, HttpError } from '@gsalgadotoledo/rt-app-contracts';
 import { requiredCapabilities, type NoSQL, type Row, type Write } from '@gsalgadotoledo/rt-app-nosql';
 const key = (r: Row) => JSON.stringify([r.pk, r.sk]);
+/**
+ * Order strings by Unicode code point, like the other stores (DynamoDB, Postgres COLLATE "C",
+ * MemoryStore). JavaScript's `<` compares UTF-16 units and puts 😀 before U+E000–U+FFFF.
+ */
+function byCodePoint(a: string, b: string): number {
+  const x = a[Symbol.iterator](), y = b[Symbol.iterator]();
+  for (;;) {
+    const p = x.next(), q = y.next();
+    if (p.done || q.done) return p.done && q.done ? 0 : p.done ? -1 : 1;
+    const d = p.value.codePointAt(0)! - q.value.codePointAt(0)!;
+    if (d) return d;
+  }
+}
+/** Clock for TTL retention: epoch milliseconds or a Date (the system clock when omitted). */
+export interface JsonStoreOptions { now?: () => number | Date }
 function valid(r: any): r is Row {
   return r && typeof r.pk === 'string' && typeof r.sk === 'string' && Number.isSafeInteger(r.version) && r.data && typeof r.data === 'object' && !Array.isArray(r.data);
 }
@@ -13,7 +28,13 @@ export class JsonStore implements NoSQL {
   readonly provider = 'json';
   readonly capabilities = requiredCapabilities;
   readonly file: string;
-  constructor(file: string, private lockTimeout = 5000) { this.file = resolve(file); }
+  private now: () => number;
+  /** `new JsonStore(file, lockTimeoutMs?, {now}?)`: `now` drives TTL retention only (lock waits use real time). */
+  constructor(file: string, private lockTimeout = 5000, options: JsonStoreOptions = {}) {
+    this.file = resolve(file);
+    const clock = options.now;
+    this.now = clock ? () => { const value = clock(); return value instanceof Date ? value.getTime() : value; } : Date.now;
+  }
   private async locked<T>(operation: (rows: Map<string, Row>) => Promise<T> | T): Promise<T> {
     await mkdir(dirname(this.file), {recursive:true, mode:0o700});
     const lock = this.file + '.lock', deadline = Date.now() + this.lockTimeout;
@@ -52,7 +73,8 @@ export class JsonStore implements NoSQL {
       }
       for (const w of snapshot) { if (w.delete) rows.delete(key(w.row)); else rows.set(key(w.row),w.row); }
       // Observer retention also applies to the local JSON adapter.
-      for (const [k,row] of rows) if((row.pk.startsWith('OBSERVER#')||row.pk.startsWith('CACHE#')||row.pk==='VISITS') && row.ttl && row.ttl <= Date.now()/1000) rows.delete(k);
+      const seconds = this.now()/1000;
+      for (const [k,row] of rows) if((row.pk.startsWith('OBSERVER#')||row.pk.startsWith('CACHE#')||row.pk==='VISITS') && row.ttl && row.ttl <= seconds) rows.delete(k);
       const temp = this.file + '.' + randomUUID() + '.tmp';
       try {
         const out = await open(temp, 'wx', 0o600);
@@ -69,7 +91,7 @@ export class JsonStore implements NoSQL {
       catch { throw new HttpError(400,'Invalid cursor'); }
     }
     return this.locked(rows => {
-      const all = [...rows.values()].filter(r=>r.pk===pk && r.sk>after).sort((a,b)=>a.sk<b.sk?-1:1);
+      const all = [...rows.values()].filter(r=>r.pk===pk && byCodePoint(r.sk,after)>0).sort((a,b)=>byCodePoint(a.sk,b.sk));
       const items=all.slice(0,50);
       return {items, cursor:all.length>50 ? Buffer.from(JSON.stringify({pk,sk:items.at(-1)!.sk})).toString('base64url') : undefined};
     });
