@@ -135,6 +135,9 @@ No dependency-injection framework is needed:
 
 ## Subscriptions ledger and credits contracts
 
+Credit reservations (holds, settlement, pre-flight checks, thresholds):
+`docs/polyglot/subscriptions-reservations.md` and `spec/contracts/subscriptions-reservations*.contract.yaml`.
+
 Contracts: `spec/contracts/subscriptions-ledger.contract.yaml` and
 `subscriptions-credits.contract.yaml`. Node host: `spec/hosts/node/billing.mjs`. The contract
 descriptions hold the full algorithm; this section lists what a port has to expose.

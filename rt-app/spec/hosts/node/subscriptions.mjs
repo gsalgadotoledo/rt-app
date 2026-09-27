@@ -39,6 +39,16 @@ async function subscriptions(init) {
   if (Number.isNaN(now)) throw new Error("init.now must be an ISO 8601 date");
   const clock = () => now;
   const store = await memoryStore(init.rows ?? []);
+  // Failure injection (`failWrites`): the next transactions fail with 503 "Injected store
+  // failure", "before" committing (nothing written) or "after" (written, the reply is lost).
+  const injected = [];
+  const transact = store.transact.bind(store);
+  store.transact = async (writes) => {
+    const mode = injected.shift();
+    if (mode === "before") throw new HttpError(503, "Injected store failure");
+    await transact(writes);
+    if (mode === "after") throw new HttpError(503, "Injected store failure");
+  };
   const sent = [];
   // Fake catalog: deterministic ids; `setCatalog("fail")` makes publish fail with 502.
   let catalogMode = "ok";
@@ -61,7 +71,7 @@ async function subscriptions(init) {
     init.catalog === true ? () => catalog : undefined,
   );
   const feature = service.feature();
-  return {
+  const facade = {
     // Settings and catalog
     settings: () => service.settings(),
     saveSettings: (input, actorId) => service.saveSettings(input, actorId),
@@ -91,6 +101,12 @@ async function subscriptions(init) {
     estimate: (input) => service.estimate(input),
     consumeUsage: (userId, productId, usage, requestId) => service.consumeUsage(userId, productId, usage, requestId),
     ledger: (userId, cursor) => service.ledger(userId, given(cursor)),
+    // Reservations
+    reserve: (userId, productId, input, meta) => service.reserve(userId, productId, input, given(meta)),
+    settle: (userId, key, usage, meta) => service.settle(userId, key, usage, given(meta)),
+    release: (userId, key, meta) => service.release(userId, key, given(meta)),
+    preflight: (userId, productId, input) => service.preflight(userId, productId, input),
+    usageSummary: (userId) => service.usageSummary(userId),
     // Overview and maintenance
     overview: (months) => service.overview(given(months)),
     maintenance: () => service.maintenance(),
@@ -114,6 +130,68 @@ async function subscriptions(init) {
       catalogMode = mode;
       return null;
     },
+    // failWrites(count, mode): the next `count` transactions fail ("before" or "after" commit).
+    failWrites: (count, mode) => {
+      if (!["before", "after"].includes(mode)) throw new Error('failWrites mode is "before" or "after"');
+      for (let i = 0; i < count; i++) injected.push(mode);
+      return null;
+    },
+    // race(calls): runs [{call, args}] at once; {fulfilled, rejected: [{status, message}]} (sorted).
+    race: async (calls) => {
+      const results = await Promise.allSettled(calls.map(({ call, args }) => facade[call](...(args ?? []))));
+      const rejected = results
+        .filter((r) => r.status === "rejected")
+        .map((r) => ({ status: r.reason?.status ?? null, message: String(r.reason?.message ?? r.reason) }))
+        .sort((a, b) => (a.message < b.message ? -1 : a.message > b.message ? 1 : 0));
+      return { fulfilled: results.length - rejected.length, rejected };
+    },
+    // batch(calls): the same, one call after the other.
+    batch: async (calls) => {
+      const rejected = [];
+      for (const { call, args } of calls) {
+        try {
+          await facade[call](...(args ?? []));
+        } catch (error) {
+          rejected.push({ status: error?.status ?? null, message: String(error?.message ?? error) });
+        }
+      }
+      rejected.sort((a, b) => (a.message < b.message ? -1 : a.message > b.message ? 1 : 0));
+      return { fulfilled: calls.length - rejected.length, rejected };
+    },
+    // ledgerCheck(userId): statement invariants (see docs/polyglot/subscriptions-reservations.md).
+    ledgerCheck: async (userId) => {
+      const entries = [];
+      let cursor;
+      do {
+        const page = await store.list("SUB_LEDGER#" + userId, cursor);
+        entries.push(...page.items.map((r) => r.data));
+        cursor = page.cursor;
+      } while (cursor);
+      const account = (await store.get("SUB_ACCOUNTS", userId))?.data ?? {};
+      const windows = account.ledgerWindows;
+      const counters = windows?.key.startsWith("admin:") ? account.adminGrant?.counters : account.counters;
+      const sum = (values) => values.reduce((n, v) => n + v, 0);
+      const credits = sum(entries.map((e) => e.credits));
+      const held = sum(entries.map((e) => e.held ?? 0));
+      const reserved = sum((account.reservations ?? []).map((h) => h.credits));
+      const allowance = sum(
+        Object.entries(windows?.products ?? {}).map(([productId, w]) =>
+          w.allowance - (counters?.[productId]?.weekStart === w.start ? counters[productId].week : 0),
+        ),
+      );
+      const additional = sum(Object.values(account.creditBalance ?? {}));
+      const minAvailable = Math.min(0, ...entries.filter((e) => e.available !== undefined).map((e) => e.available));
+      return {
+        entries: entries.length,
+        credits,
+        held,
+        reserved,
+        allowance,
+        additional,
+        balanced: credits === allowance + additional && held === reserved,
+        negative: minAvailable < 0 || Object.values(account.creditBalance ?? {}).some((v) => v < 0),
+      };
+    },
     published: () => published,
     sent: () => sent,
     row: (pk, sk) => store.get(pk, sk),
@@ -129,6 +207,7 @@ async function subscriptions(init) {
       return rows.sort((a, b) => (canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0));
     },
   };
+  return facade;
 }
 
 export const subjects = { subscriptions };

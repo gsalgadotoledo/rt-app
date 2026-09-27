@@ -22,6 +22,22 @@ import {
   type WindowState,
 } from "./ledger.js";
 export * from "./ledger.js";
+import {
+  MAX_ACTIVE_RESERVATIONS,
+  RESERVATIONS,
+  activeHolds,
+  reservationKey,
+  reservationReason,
+  reservationTtl,
+  sameUsage,
+  settleUsage,
+  windowUsage,
+  type Hold,
+  type ReservationMeta,
+  type ReserveInput,
+  type SettleUsage,
+} from "./reservations.js";
+export * from "./reservations.js";
 export interface Product {
   id: string;
   name: string;
@@ -325,6 +341,17 @@ export function validateSettings(input: any): Settings {
   };
 }
 
+/** Request bodies of the reservation endpoints: only the documented fields reach the service. */
+const amountBody = (body: any) => ({ credits: body.credits, estimate: body.estimate });
+const reserveBody = (body: any): ReserveInput => ({
+  key: body.key,
+  credits: body.credits,
+  estimate: body.estimate,
+  ttlMs: body.ttlMs,
+  reason: body.reason,
+});
+const usageBody = (body: any) => ({ credits: body.credits, inputTokens: body.inputTokens, outputTokens: body.outputTokens }) as SettleUsage;
+
 const DAY = 86400000;
 const dayKey = (at: number) => new Date(at).toISOString().slice(0, 10);
 export class Subscriptions {
@@ -605,11 +632,6 @@ export class Subscriptions {
       : data;
   }
 
-  private valid(data: any) {
-    if (!data?.plan || data.status !== "active" || this.now() >= data.periodEnd)
-      throw new HttpError(402, "Subscription is inactive or expired");
-  }
-
   // -------------------------------------------------------------------------
   // Credit ledger. Every helper mutates `data` and returns writes for the caller's transaction.
   // -------------------------------------------------------------------------
@@ -624,9 +646,55 @@ export class Subscriptions {
     return Math.max(0, Math.min(product.dailyLimit - c.day, product.weeklyLimit - c.week, product.credits - c.period));
   }
 
-  /** Credits usable now for a product: remaining plan allowance plus additional (non-expiring) credits. */
+  /** Credits held by active (unexpired) reservations of a product. */
+  private held(data: any, productId: string) {
+    return activeHolds(data.reservations, this.now())
+      .filter((h) => h.productId === productId)
+      .reduce((n, h) => n + h.credits, 0);
+  }
+
+  /**
+   * What a new charge can use, net of active holds: spendable = max(0, allowance + balance −
+   * held), taken from the plan allowance first. Holds never push a charge onto additional
+   * credits (which do not expire) while the allowance can pay it and every hold stays covered.
+   * @example allowance 100, balance 10, held 60 → {allowance: 50, balance: 0}
+   */
+  private free(data: any, productId: string) {
+    const allowance = this.allowanceLeft(data, productId);
+    const balance = data.creditBalance?.[productId] ?? 0;
+    const held = this.held(data, productId);
+    const spendable = Math.max(0, allowance + balance - held);
+    const fromAllowance = Math.min(allowance, spendable);
+    return { allowance: fromAllowance, balance: spendable - fromAllowance, held, rawAllowance: allowance, rawBalance: balance };
+  }
+
+  /** Credits usable now for a product: plan allowance plus additional credits, minus active holds. */
   private available(data: any, productId: string) {
-    return this.allowanceLeft(data, productId) + (data.creditBalance?.[productId] ?? 0);
+    const free = this.free(data, productId);
+    return free.allowance + free.balance;
+  }
+
+  /**
+   * Why an account cannot be charged for a product now, or null: "inactive" (no active,
+   * unexpired entitlement), "payment" (payments required and the entitlement is not paid),
+   * "product" (the plan does not include it; skipped without a product).
+   */
+  private blocked(data: any, productId: string | undefined, paymentRequired: boolean) {
+    const entitlement = this.effective(data);
+    if (!entitlement?.plan || entitlement.status !== "active" || this.now() >= entitlement.periodEnd) return "inactive";
+    if (paymentRequired && entitlement.mode !== "admin" && entitlement.mode !== this.provider?.mode) return "payment";
+    if (productId !== undefined && !entitlement.plan.products.some((p: Product) => p.id === productId)) return "product";
+    return null;
+  }
+
+  /** The entitlement and product a charge uses; 402 inactive or unpaid, 403 product not in the plan. */
+  private async chargeable(data: any, productId: string) {
+    const reason = this.blocked(data, productId, (await this.settings()).values.paymentRequired);
+    if (reason === "inactive") throw new HttpError(402, "Subscription is inactive or expired");
+    if (reason === "payment") throw new HttpError(402, "A paid subscription is required");
+    if (reason === "product") throw new HttpError(403, "Product is not included in your plan");
+    const entitlement = this.effective(data);
+    return { entitlement, product: entitlement.plan.products.find((p: Product) => p.id === productId) as Product };
   }
 
   /** Allowance windows of the active entitlement, keyed so a plan change closes the previous ones. */
@@ -673,7 +741,7 @@ export class Subscriptions {
   }
 
   /** Persist the window rollover (weekly allowance and expiry) before any other change. */
-  private settle(userId: string, raw: any, data: any): Write[] {
+  private settleWindows(userId: string, raw: any, data: any): Write[] {
     const { entries, state } = this.pendingWindows(raw, data);
     data.ledgerWindows = state ?? null;
     return entries.map(({ seed, ...entry }) => this.ledgerEntry(userId, data, { ...entry, source: "system" }, seed));
@@ -831,7 +899,7 @@ export class Subscriptions {
         updatedAt: now,
       });
       const result = { ok: true };
-      const settled = this.settle(user.id, previous, data);
+      const settled = this.settleWindows(user.id, previous, data);
       const planEntry = this.ledgerEntry(
         user.id,
         data,
@@ -1036,7 +1104,7 @@ export class Subscriptions {
     // A payment problem (past_due, incomplete) is neither a new subscription nor a cancellation.
     const wasSubscribed =
       Boolean(old.data.plan) && old.data.status !== "canceled" && now < old.data.periodEnd;
-    const writes: Write[] = [...this.settle(userId, old.data, data)];
+    const writes: Write[] = [...this.settleWindows(userId, old.data, data)];
     // Billing events on the statement: paid period (start, renewal or plan change) and cancellation.
     if (isActive && (renewed || old.data.plan?.id !== plan.id))
       writes.push(
@@ -1110,25 +1178,15 @@ export class Subscriptions {
       }
       const old = await this.account(userId),
         data = this.normalized(old?.data ?? {});
-      const entitlement = this.effective(data);
-      this.valid(entitlement);
-      if (
-        (await this.settings()).values.paymentRequired &&
-        entitlement.mode !== "admin" &&
-        entitlement.mode !== this.provider?.mode
-      )
-        throw new HttpError(402, "A paid subscription is required");
-      const product: Product | undefined = entitlement.plan.products.find(
-        (p: Product) => p.id === productId,
-      );
-      if (!product)
-        throw new HttpError(403, "Product is not included in your plan");
-      const settled = this.settle(userId, old?.data, data);
+      const { entitlement, product } = await this.chargeable(data, productId);
+      const settled = this.settleWindows(userId, old?.data, data);
       const counter = entitlement.counters[productId];
       const balance = data.creditBalance?.[productId] ?? 0;
-      const fromAllowance = Math.min(credits, this.allowanceLeft(data, productId));
+      // Active reservations hold part of the allowance and balance: never spend them here.
+      const free = this.free(data, productId);
+      const fromAllowance = Math.min(credits, free.allowance);
       const fromBalance = credits - fromAllowance;
-      if (fromBalance > balance) {
+      if (fromBalance > free.balance) {
         const window =
           counter.day >= product.dailyLimit ? "day" : counter.week >= product.weeklyLimit ? "week" : "period";
         throw new HttpError(
@@ -1236,7 +1294,7 @@ export class Subscriptions {
         throw new HttpError(404, "Product not found");
       const old = await this.account(userId);
       const data = this.normalized({ ...old?.data, userId });
-      const settled = this.settle(userId, old?.data, data);
+      const settled = this.settleWindows(userId, old?.data, data);
       data.creditBalance ??= {};
       data.creditBalance[productId] = integer((data.creditBalance[productId] ?? 0) + input.credits, 0);
       const at = this.now();
@@ -1296,20 +1354,20 @@ export class Subscriptions {
       const productId = id(input.productId ?? "api");
       const row = await this.account(id(input.userId));
       const data = this.normalized(row?.data ?? {});
-      const allowance = this.allowanceLeft(data, productId);
-      const balance = data.creditBalance?.[productId] ?? 0;
-      const fromAllowance = Math.min(credits, allowance);
+      // Raw allowance and balance; the split and `available` are net of active reservations.
+      const free = this.free(data, productId);
+      const fromAllowance = Math.min(credits, free.allowance);
       const fromBalance = credits - fromAllowance;
       result.account = {
         userId: input.userId,
         productId,
-        allowanceLeft: allowance,
-        additionalCredits: balance,
-        available: allowance + balance,
+        allowanceLeft: free.rawAllowance,
+        additionalCredits: free.rawBalance,
+        available: free.allowance + free.balance,
         fromAllowance,
         fromBalance,
-        allowed: fromBalance <= balance && credits > 0,
-        availableAfter: Math.max(0, allowance + balance - credits),
+        allowed: fromBalance <= free.balance && credits > 0,
+        availableAfter: Math.max(0, free.allowance + free.balance - credits),
       };
     }
     return result;
@@ -1328,6 +1386,443 @@ export class Subscriptions {
       details: { rateId: estimate.rate.id, inputTokens: estimate.inputTokens, outputTokens: estimate.outputTokens },
     });
     return { ...receipt, valueMinor: estimate.valueMinor, currency: estimate.currency };
+  }
+
+  // -------------------------------------------------------------------------
+  // Credit reservations: reserve before a call, settle the real usage after it. Holds live on
+  // the account row (`reservations`) and in SUB_RESERVATION#<userId>/<key> receipts, and every
+  // change is a ledger entry in the same transaction. See reservations.ts and
+  // docs/polyglot/subscriptions-reservations.md.
+  // -------------------------------------------------------------------------
+
+  /** Credits of `{credits}` or `{estimate}` (priced at its maximum); 400 with both or neither. */
+  private async reservationAmount(input: any) {
+    const credits = input?.credits,
+      estimate = input?.estimate;
+    const hasCredits = credits !== undefined && credits !== null;
+    const hasEstimate = estimate !== undefined && estimate !== null;
+    if (hasCredits === hasEstimate || (hasEstimate && (typeof estimate !== "object" || Array.isArray(estimate))))
+      throw new HttpError(400, "Give credits or an estimate");
+    if (hasCredits) return { credits: integer(credits, 1), estimate: undefined, rateName: undefined };
+    const priced = await this.estimate({
+      rateId: estimate.rateId,
+      inputTokens: estimate.inputTokens,
+      outputTokens: estimate.maxOutputTokens ?? 0,
+    });
+    return {
+      credits: priced.credits as number,
+      estimate: { rateId: priced.rate.id, inputTokens: priced.inputTokens, maxOutputTokens: priced.outputTokens },
+      rateName: priced.rate.name as string,
+    };
+  }
+
+  /**
+   * Record the release of expired holds: a "release" entry at `expiresAt` (source system) and
+   * the receipt marked "expired". Mutates `data` and returns writes for the caller's
+   * transaction; the receipt of `skip` is left to the caller, which writes that row itself.
+   */
+  private async sweepHolds(userId: string, data: any, skip?: string): Promise<Write[]> {
+    const now = this.now();
+    const holds: Hold[] = data.reservations ?? [];
+    const expired = holds.filter((h) => now >= h.expiresAt);
+    if (!expired.length) return [];
+    data.reservations = holds.filter((h) => now < h.expiresAt);
+    const writes: Write[] = [];
+    for (const hold of expired) {
+      const row = await this.store.get(RESERVATIONS(userId), hold.key);
+      if (row && hold.key !== skip && row.data.status === "active")
+        writes.push(write(row, row.pk, row.sk, { ...row.data, status: "expired", releasedAt: hold.expiresAt }));
+      writes.push(
+        this.ledgerEntry(
+          userId,
+          data,
+          {
+            at: hold.expiresAt,
+            kind: "release",
+            source: "system",
+            credits: 0,
+            productId: hold.productId,
+            reason: "Reservation expired · " + (row?.data.reason ?? hold.key),
+            requestId: hold.key,
+            held: -hold.credits,
+          },
+          "expire:" + hold.key,
+        ),
+      );
+    }
+    return writes;
+  }
+
+  /** What `reserve` returns; an active receipt past its TTL reads as "expired". */
+  private reservationView(record: any, replayed: boolean) {
+    const status = record.status === "active" && this.now() >= record.expiresAt ? "expired" : record.status;
+    return {
+      key: record.key,
+      productId: record.productId,
+      credits: record.credits,
+      status,
+      at: record.at,
+      expiresAt: record.expiresAt,
+      available: record.available,
+      replayed,
+    };
+  }
+
+  /**
+   * Hold credits for a call before running it: `{credits}` or `{estimate: {rateId,
+   * inputTokens, maxOutputTokens}}` priced at its maximum. Nothing is charged: the hold only
+   * lowers what other calls can spend until `settle`, `release` or `expiresAt` (`ttlMs`,
+   * default 15 minutes). Idempotent per key: the same key and amount return the stored
+   * reservation with `replayed: true`; another product or amount fails with 409. Fails like
+   * `consume` (402, 403) and with 429 when the credits do not fit (the message says how many
+   * are missing) or 25 reservations are active. Writes the account, the receipt and a
+   * "reservation" entry (0 credits, `held` +credits) in one transaction.
+   * @example reserve("u1", "api", {key: "turn-7:0", estimate: {rateId: "standard", inputTokens: 1200, maxOutputTokens: 800}})
+   *   → {key: "turn-7:0", productId: "api", credits: 4, status: "active", at, expiresAt: at + 900000, available, replayed: false}
+   */
+  async reserve(userId: string, productId: string, input: ReserveInput, meta: ReservationMeta = {}) {
+    const key = reservationKey(input?.key);
+    id(productId);
+    const amount = await this.reservationAmount(input);
+    const ttlMs = reservationTtl(input.ttlMs);
+    const reason = reservationReason(input.reason);
+    const source = meta.source ?? "api";
+    return this.retry(async () => {
+      const prior = await this.store.get(RESERVATIONS(userId), key);
+      if (prior) {
+        if (prior.data.productId !== productId || prior.data.credits !== amount.credits)
+          throw new HttpError(409, "Reservation key already used with different amounts");
+        return this.reservationView(prior.data, true);
+      }
+      const old = await this.account(userId),
+        data = this.normalized(old?.data ?? {});
+      const { product } = await this.chargeable(data, productId);
+      const settled = this.settleWindows(userId, old?.data, data);
+      const swept = await this.sweepHolds(userId, data);
+      const holds: Hold[] = data.reservations ?? [];
+      if (holds.length >= MAX_ACTIVE_RESERVATIONS) throw new HttpError(429, "Too many active reservations");
+      const available = this.available(data, productId);
+      if (amount.credits > available)
+        throw new HttpError(429, `Not enough credits: ${amount.credits - available} missing. Add credits or wait for the reset.`);
+      const at = this.now();
+      const hold: Hold = { key, productId, credits: amount.credits, at, expiresAt: at + ttlMs };
+      data.reservations = [...holds, hold];
+      const text = reason ?? (amount.rateName ? amount.rateName + " request" : product.name + " usage");
+      const entry = this.ledgerEntry(
+        userId,
+        data,
+        {
+          at,
+          kind: "reservation",
+          source,
+          credits: 0,
+          productId,
+          reason: "Reserved · " + text,
+          requestId: key,
+          held: amount.credits,
+          expiresAt: hold.expiresAt,
+          ...(meta.actorId ? { actorId: meta.actorId } : {}),
+        },
+        "reserve:" + key,
+      );
+      const record = {
+        ...hold,
+        status: "active",
+        available: this.available(data, productId),
+        reason: text,
+        source,
+        ...(meta.actorId ? { actorId: meta.actorId } : {}),
+        ...(amount.estimate ? { estimate: amount.estimate } : {}),
+      };
+      await this.store.transact([
+        write(old, "SUB_ACCOUNTS", userId, data),
+        write(undefined, RESERVATIONS(userId), key, record),
+        ...settled,
+        ...swept,
+        entry,
+      ]);
+      return this.reservationView(record, false);
+    });
+  }
+
+  /**
+   * Charge the real usage of a reservation and remove its hold; the rest of the reserved
+   * amount is never charged. Usage is `{credits}` or `{inputTokens, outputTokens}` priced with
+   * the reserved rate. An expired reservation (a crash resumed after the TTL) is settled too:
+   * the usage is charged from what is available then. Usage the account cannot cover is not
+   * charged and is returned as `uncovered`, so balances never go negative. Idempotent per key:
+   * the same usage returns the stored settlement with `replayed: true`; other usage fails with
+   * 409. 404 for an unknown key (or, for source "user", a reservation the user did not make),
+   * 409 once released. Writes a "settlement" entry (− charged, `held` − reserved).
+   * @example settle("u1", "turn-7:0", {inputTokens: 1200, outputTokens: 150})
+   *   → {key: "turn-7:0", reserved: 4, used: 2, credits: 2, uncovered: 0, status: "settled", ..., replayed: false}
+   */
+  async settle(userId: string, key: string, usage: SettleUsage, meta: ReservationMeta = {}) {
+    const k = reservationKey(key);
+    const reported = settleUsage(usage);
+    return this.retry(async () => {
+      const row = await this.store.get(RESERVATIONS(userId), k);
+      if (!row || (meta.source === "user" && row.data.source !== "user")) throw new HttpError(404, "Reservation not found");
+      const record = row.data;
+      if (record.status === "settled") {
+        if (!sameUsage(record.settlement.usage, reported))
+          throw new HttpError(409, "Reservation already settled with different usage");
+        return { ...record.settlement, replayed: true };
+      }
+      if (record.status === "released") throw new HttpError(409, "Reservation was released");
+      if (!("credits" in reported) && !record.estimate) throw new HttpError(400, "Settle this reservation with credits");
+      const settings = await this.settings();
+      const priced =
+        "credits" in reported
+          ? undefined
+          : await this.estimate({ rateId: record.estimate.rateId, inputTokens: reported.inputTokens, outputTokens: reported.outputTokens });
+      const used: number = priced ? priced.credits : (reported as { credits: number }).credits;
+      const old = await this.account(userId),
+        data = this.normalized(old?.data ?? {});
+      const settled = this.settleWindows(userId, old?.data, data);
+      const swept = await this.sweepHolds(userId, data, k);
+      const holds: Hold[] = data.reservations ?? [];
+      const hold = holds.find((h) => h.key === k);
+      if (hold) data.reservations = holds.filter((h) => h !== hold);
+      // Charge like consume (allowance first) from what the other holds leave free.
+      const productId: string = record.productId;
+      const free = this.free(data, productId);
+      const fromAllowance = Math.min(used, free.allowance);
+      const fromBalance = Math.min(used - fromAllowance, free.balance);
+      const charged = fromAllowance + fromBalance;
+      const uncovered = used - charged;
+      if (fromAllowance > 0) {
+        const counter = this.effective(data).counters[productId];
+        counter.period += fromAllowance;
+        counter.day += fromAllowance;
+        counter.week += fromAllowance;
+      }
+      data.creditBalance ??= {};
+      data.creditBalance[productId] = free.rawBalance - fromBalance;
+      data.totalConsumed = (data.totalConsumed ?? 0) + charged;
+      const at = this.now();
+      const pack = settings.values.credits.pack;
+      const entry = this.ledgerEntry(
+        userId,
+        data,
+        {
+          at,
+          kind: "settlement",
+          source: meta.source ?? "api",
+          credits: charged ? -charged : 0,
+          productId,
+          reason: record.reason,
+          requestId: k,
+          fromAllowance,
+          fromBalance,
+          held: hold ? -hold.credits : 0,
+          details: {
+            ...(priced ? { rateId: priced.rate.id, inputTokens: priced.inputTokens, outputTokens: priced.outputTokens } : {}),
+            reserved: record.credits,
+            used,
+            uncovered,
+          },
+          ...(meta.actorId ? { actorId: meta.actorId } : {}),
+        },
+        "settle:" + k,
+      );
+      const settlement = {
+        key: k,
+        productId,
+        reserved: record.credits,
+        used,
+        credits: charged,
+        fromAllowance,
+        fromBalance,
+        uncovered,
+        expired: !hold,
+        status: "settled",
+        at,
+        available: this.available(data, productId),
+        valueMinor: Math.round((charged * pack.amountMinor) / pack.credits),
+        currency: pack.currency,
+        usage: reported,
+      };
+      await this.store.transact([
+        write(old, "SUB_ACCOUNTS", userId, data),
+        write(row, row.pk, row.sk, { ...record, status: "settled", settlement }),
+        ...settled,
+        ...swept,
+        entry,
+      ]);
+      return { ...settlement, replayed: false };
+    });
+  }
+
+  /** What `release` returns. */
+  private releaseView(record: any, replayed: boolean) {
+    return {
+      key: record.key,
+      productId: record.productId,
+      credits: record.credits,
+      status: record.status,
+      releasedAt: record.releasedAt,
+      replayed,
+    };
+  }
+
+  /**
+   * Remove a reservation's hold without charging it (the call did not run). Idempotent: a
+   * released or expired reservation returns its state with `replayed: true`. 409 once
+   * settled; 404 for an unknown key (or, for source "user", a reservation the user did not
+   * make). An active receipt past its TTL is recorded as "expired". Writes a "release" entry.
+   */
+  async release(userId: string, key: string, meta: ReservationMeta = {}) {
+    const k = reservationKey(key);
+    return this.retry(async () => {
+      const row = await this.store.get(RESERVATIONS(userId), k);
+      if (!row || (meta.source === "user" && row.data.source !== "user")) throw new HttpError(404, "Reservation not found");
+      const record = row.data;
+      if (record.status === "settled") throw new HttpError(409, "Reservation already settled");
+      if (record.status !== "active") return this.releaseView(record, true);
+      const old = await this.account(userId),
+        data = this.normalized(old?.data ?? {});
+      const writes = [...this.settleWindows(userId, old?.data, data), ...(await this.sweepHolds(userId, data, k))];
+      const holds: Hold[] = data.reservations ?? [];
+      const hold = holds.find((h) => h.key === k);
+      let next;
+      if (hold) {
+        data.reservations = holds.filter((h) => h !== hold);
+        const at = this.now();
+        writes.push(
+          this.ledgerEntry(
+            userId,
+            data,
+            {
+              at,
+              kind: "release",
+              source: meta.source ?? "api",
+              credits: 0,
+              productId: record.productId,
+              reason: "Released · " + record.reason,
+              requestId: k,
+              held: -hold.credits,
+              ...(meta.actorId ? { actorId: meta.actorId } : {}),
+            },
+            "release:" + k,
+          ),
+        );
+        next = { ...record, status: "released", releasedAt: at };
+      } else next = { ...record, status: "expired", releasedAt: record.expiresAt };
+      await this.store.transact([write(old, "SUB_ACCOUNTS", userId, data), write(row, row.pk, row.sk, next), ...writes]);
+      return this.releaseView(next, false);
+    });
+  }
+
+  /** Day, week and period usage of a product, holds included (see `windowUsage`); [] without one. */
+  private usageWindows(data: any, productId: string) {
+    const entitlement = this.effective(data);
+    if (!entitlement?.plan || entitlement.status !== "active" || this.now() >= entitlement.periodEnd) return [];
+    const product: Product | undefined = entitlement.plan.products.find((p: Product) => p.id === productId);
+    const c = entitlement.counters?.[productId];
+    if (!product || !c) return [];
+    // Holds sit on the allowance first: that part counts on every window once settled.
+    const reserved = Math.min(this.held(data, productId), this.allowanceLeft(data, productId));
+    return [
+      windowUsage("day", c.day, reserved, product.dailyLimit, c.dayStart + product.daySeconds * 1000),
+      windowUsage("week", c.week, reserved, product.weeklyLimit, c.weekStart + product.weekSeconds * 1000),
+      windowUsage("period", c.period, reserved, product.credits, entitlement.periodEnd),
+    ];
+  }
+
+  /**
+   * Pre-flight check of a batch before running it: does `{credits}` or `{estimate}` fit in what
+   * the user can spend now (plan allowance, the tightest window, plus additional credits,
+   * minus active reservations)? Returns `fits`, `reason` (null, "inactive", "payment",
+   * "product" or "credits"), `available` (0 when blocked), `missing`, the window usage with the
+   * threshold reached and, when credits are missing, a `topUp` offer priced with the credit
+   * pack. Never writes.
+   * @example preflight("u1", "api", {credits: 150}) with 100 available
+   *   → {fits: false, reason: "credits", available: 100, missing: 50, topUp: {credits: 50, packs: 1, amountMinor: 1000, valueMinor: 50, currency: "usd"}, ...}
+   */
+  async preflight(userId: string, productId: string, input: { credits?: number; estimate?: ReserveInput["estimate"] }) {
+    id(productId);
+    const amount = await this.reservationAmount(input);
+    const settings = await this.settings();
+    const row = await this.account(userId);
+    const data = this.normalized(row?.data ?? {});
+    const blocked = this.blocked(data, productId, settings.values.paymentRequired);
+    const free = this.free(data, productId);
+    const available = blocked ? 0 : free.allowance + free.balance;
+    const missing = Math.max(0, amount.credits - available);
+    const fits = !blocked && missing === 0;
+    const pack = settings.values.credits.pack;
+    const packs = Math.ceil(missing / pack.credits);
+    return {
+      productId,
+      credits: amount.credits,
+      fits,
+      reason: fits ? null : (blocked ?? "credits"),
+      available,
+      missing,
+      allowanceLeft: free.rawAllowance,
+      additionalCredits: free.rawBalance,
+      reserved: free.held,
+      windows: this.usageWindows(data, productId),
+      topUp:
+        !blocked && missing > 0
+          ? {
+              credits: missing,
+              packs,
+              amountMinor: packs * pack.amountMinor,
+              valueMinor: Math.round((missing * pack.amountMinor) / pack.credits),
+              currency: pack.currency,
+            }
+          : null,
+    };
+  }
+
+  /**
+   * Usage against limits for each product of the user (the effective plan's, then other
+   * additional-credit balances): raw allowance and balance, `reserved`, net `available`, the
+   * day/week/period windows with their threshold (0, 80, 95 or 100), active reservations,
+   * `alerts` for every window at 80 % or more, and the credit pack for a top-up offer.
+   * Never writes.
+   */
+  async usageSummary(userId: string) {
+    const settings = await this.settings();
+    const row = await this.account(userId);
+    const data = this.normalized(row?.data ?? {});
+    const plan: Product[] = this.effective(data).plan?.products ?? [];
+    const products = plan.map((p) => p.id);
+    for (const productId of Object.keys(data.creditBalance ?? {})) if (!products.includes(productId)) products.push(productId);
+    const items = products.map((productId) => {
+      const free = this.free(data, productId);
+      const windows = this.usageWindows(data, productId);
+      return {
+        productId,
+        name: plan.find((p) => p.id === productId)?.name ?? null,
+        allowanceLeft: free.rawAllowance,
+        additionalCredits: free.rawBalance,
+        reserved: free.held,
+        available: free.allowance + free.balance,
+        threshold: Math.max(0, ...windows.map((w) => w.threshold)),
+        windows,
+      };
+    });
+    return {
+      userId,
+      active: this.blocked(data, undefined, settings.values.paymentRequired) === null,
+      products: items,
+      reservations: activeHolds(data.reservations, this.now()).map((h) => ({
+        key: h.key,
+        productId: h.productId,
+        credits: h.credits,
+        at: h.at,
+        expiresAt: h.expiresAt,
+      })),
+      alerts: items.flatMap((p) =>
+        p.windows
+          .filter((w) => w.threshold >= 80)
+          .map((w) => ({ productId: p.productId, window: w.kind, percent: w.percent, threshold: w.threshold })),
+      ),
+      pack: settings.values.credits.pack,
+    };
   }
 
   /**
@@ -1454,7 +1949,7 @@ export class Subscriptions {
       const row = await this.account(userId);
       if (!row || !this.effective(this.normalized(row.data)).plan) throw new HttpError(404, "No subscription");
       const data = this.normalized(row.data);
-      const settled = this.settle(userId, row.data, data);
+      const settled = this.settleWindows(userId, row.data, data);
       const entries: Write[] = [];
       for (const [productId, c] of Object.entries(this.effective(data).counters) as [string, any][]) {
         const before = this.allowanceLeft(data, productId);
@@ -1637,7 +2132,7 @@ export class Subscriptions {
         fingerprint,
       };
       const wasActive = Boolean(this.windows(this.normalized({ ...row?.data })));
-      const settled = this.settle(userId, row?.data, data);
+      const settled = this.settleWindows(userId, row?.data, data);
       const entry = this.ledgerEntry(
         userId,
         data,
@@ -1783,8 +2278,11 @@ export class Subscriptions {
       const page = await this.store.list("SUB_ACCOUNTS", cursor);
       for (const row of page.items) {
         const d = row.data;
-        if (!d.plan) continue;
-        const renew = d.mode === "none" && !d.cancelAtPeriodEnd && this.now() >= d.periodEnd;
+        // Accounts without an own plan are skipped unless expired holds need releasing
+        // (reservations made on an administrator-assigned plan).
+        const expiredHolds = (d.reservations ?? []).some((h: Hold) => this.now() >= h.expiresAt);
+        if (!d.plan && !expiredHolds) continue;
+        const renew = !!d.plan && d.mode === "none" && !d.cancelAtPeriodEnd && this.now() >= d.periodEnd;
         const periods = renew
           ? Math.floor((this.now() - d.periodStart) / (d.plan.periodDays * 86400000))
           : 0;
@@ -1799,10 +2297,12 @@ export class Subscriptions {
             : d,
         );
         // Record closed weekly windows (expiry and new allowance) even for idle accounts.
-        const settled = this.settle(row.sk, d, next);
-        if (renew || settled.length)
+        const settled = this.settleWindows(row.sk, d, next);
+        // Release expired reservations after the window rollover, in the same transaction.
+        const swept = await this.sweepHolds(row.sk, next);
+        if (renew || settled.length || swept.length)
           await this.store
-            .transact([write(row, row.pk, row.sk, next), ...settled])
+            .transact([write(row, row.pk, row.sk, next), ...settled, ...swept])
             .catch((e) => {
               if (!(e instanceof Conflict)) throw e;
             });
@@ -2266,6 +2766,110 @@ export class Subscriptions {
             example: {},
           },
           handle: () => this.maintenance(),
+        },
+        // Credit reservations. Personal endpoints act on the signed-in user's own reservations
+        // (source "user"); a backend that meters model calls uses the owner endpoints below
+        // (admin token), whose reservations the user cannot settle or release.
+        {
+          method: "GET",
+          path: "/subscriptions/credits/usage",
+          resource: "subscriptions.me",
+          access: "authenticated",
+          handle: (c) => this.usageSummary(c.actor!.id),
+        },
+        {
+          method: "POST",
+          path: "/subscriptions/credits/preflight",
+          resource: "subscriptions.me",
+          access: "authenticated",
+          handle: (c) => this.preflight(c.actor!.id, c.request.body.productId, amountBody(c.request.body)),
+        },
+        {
+          method: "POST",
+          path: "/subscriptions/credits/reservations",
+          resource: "subscriptions.me",
+          access: "authenticated",
+          handle: (c) =>
+            this.reserve(c.actor!.id, c.request.body.productId, reserveBody(c.request.body), { source: "user", actorId: c.actor!.id }),
+        },
+        {
+          method: "POST",
+          path: "/subscriptions/credits/reservations/:key/settle",
+          resource: "subscriptions.me",
+          access: "authenticated",
+          handle: (c) => this.settle(c.actor!.id, c.params.key, usageBody(c.request.body), { source: "user", actorId: c.actor!.id }),
+        },
+        {
+          method: "POST",
+          path: "/subscriptions/credits/reservations/:key/release",
+          resource: "subscriptions.me",
+          access: "authenticated",
+          handle: (c) => this.release(c.actor!.id, c.params.key, { source: "user", actorId: c.actor!.id }),
+        },
+        {
+          method: "GET",
+          path: "/subscriptions/admin/accounts/:id/usage",
+          resource: "subscriptions.manage",
+          access: "owner",
+          tool: {
+            name: "subscriptions_credits_usage",
+            description:
+              "Usage against limits for a user: per product the day/week/period windows (used, reserved, limit, percent, threshold 0|80|95|100), active reservations, alerts at 80% or more and the credit pack for a top-up. params.id user. Never writes.",
+            example: { params: { id: "USER_ID" } },
+          },
+          handle: (c) => this.usageSummary(c.params.id),
+        },
+        {
+          method: "POST",
+          path: "/subscriptions/admin/accounts/:id/preflight",
+          resource: "subscriptions.manage",
+          access: "owner",
+          tool: {
+            name: "subscriptions_credits_preflight",
+            description:
+              "Check whether a batch fits before running it. Body: productId and credits, or estimate {rateId, inputTokens, maxOutputTokens}. Returns fits, reason (inactive|payment|product|credits), available, missing, windows and a topUp offer. Never writes.",
+            example: { params: { id: "USER_ID" }, body: { productId: "api", estimate: { rateId: "standard", inputTokens: 1200, maxOutputTokens: 800 } } },
+          },
+          handle: (c) => this.preflight(c.params.id, c.request.body.productId, amountBody(c.request.body)),
+        },
+        {
+          method: "POST",
+          path: "/subscriptions/admin/accounts/:id/reservations",
+          resource: "subscriptions.manage",
+          access: "owner",
+          tool: {
+            name: "subscriptions_credits_reserve",
+            description:
+              "Hold credits before a model call. Body: key (stable, e.g. turnId:step), productId, credits or estimate {rateId, inputTokens, maxOutputTokens}, optional ttlMs (default 900000) and reason. Reuse the key for retries; the same key with another amount fails with 409.",
+            example: { params: { id: "USER_ID" }, body: { key: "turn-1:0", productId: "api", estimate: { rateId: "standard", inputTokens: 1200, maxOutputTokens: 800 } } },
+          },
+          handle: (c) =>
+            this.reserve(c.params.id, c.request.body.productId, reserveBody(c.request.body), { source: "api", actorId: c.actor!.id }),
+        },
+        {
+          method: "POST",
+          path: "/subscriptions/admin/accounts/:id/reservations/:key/settle",
+          resource: "subscriptions.manage",
+          access: "owner",
+          tool: {
+            name: "subscriptions_credits_settle",
+            description:
+              "Charge the real usage of a reservation and release the rest. Body: inputTokens and outputTokens (priced with the reserved rate) or credits. Works after the reservation expired; returns uncovered credits it could not charge. Idempotent per key.",
+            example: { params: { id: "USER_ID", key: "turn-1:0" }, body: { inputTokens: 1200, outputTokens: 150 } },
+          },
+          handle: (c) => this.settle(c.params.id, c.params.key, usageBody(c.request.body), { source: "api", actorId: c.actor!.id }),
+        },
+        {
+          method: "POST",
+          path: "/subscriptions/admin/accounts/:id/reservations/:key/release",
+          resource: "subscriptions.manage",
+          access: "owner",
+          tool: {
+            name: "subscriptions_credits_release",
+            description: "Release a reservation without charging it (the call did not run). Idempotent per key.",
+            example: { params: { id: "USER_ID", key: "turn-1:0" } },
+          },
+          handle: (c) => this.release(c.params.id, c.params.key, { source: "api", actorId: c.actor!.id }),
         },
       ],
     };

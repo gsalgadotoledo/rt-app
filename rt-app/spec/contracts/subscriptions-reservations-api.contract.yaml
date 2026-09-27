@@ -1,0 +1,170 @@
+contract: 1
+kind: http
+module: subscriptions-reservations-api
+title: Credit reservations over HTTP (local mode)
+description: |
+  The reservation endpoints as every backend serves them (algorithms, ledger entries and row
+  formats: subscriptions-reservations.contract.yaml). A user is created through POST
+  /admin/app/users, signs in with POST /auth/login and gets the Starter plan through an
+  administrator grant (local owner), so the personal endpoints run with a Bearer token.
+
+    GET  /subscriptions/credits/usage                        authenticated  usageSummary(me)
+    POST /subscriptions/credits/preflight                    authenticated  {productId, credits | estimate}
+    POST /subscriptions/credits/reservations                 authenticated  {key, productId, credits | estimate, ttlMs?, reason?}
+    POST /subscriptions/credits/reservations/:key/settle     authenticated  {credits} | {inputTokens, outputTokens}
+    POST /subscriptions/credits/reservations/:key/release    authenticated
+    GET  /subscriptions/admin/accounts/:id/usage             owner (admin only)
+    POST /subscriptions/admin/accounts/:id/preflight         owner (admin only)
+    POST /subscriptions/admin/accounts/:id/reservations      owner (admin only)
+    POST /subscriptions/admin/accounts/:id/reservations/:key/settle   owner (admin only)
+    POST /subscriptions/admin/accounts/:id/reservations/:key/release  owner (admin only)
+
+  Personal endpoints act with source "user" and reach only reservations the user made (404
+  "Reservation not found" for the others); owner endpoints act with source "api" and the actor id.
+  Only the documented body fields reach the service. Times come from the server clock, so `at`,
+  `expiresAt`, `resetAt` and ledger ids are matched by type.
+cases:
+  - name: personal reservation endpoints need a signed-in actor
+    tags: [ security ]
+    requests:
+      - { request: { method: GET, path: /subscriptions/credits/usage }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: /subscriptions/credits/preflight, body: { productId: api, credits: 1 } }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: /subscriptions/credits/reservations, body: { key: "t:1", productId: api, credits: 1 } }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: "/subscriptions/credits/reservations/t:1/settle", body: { credits: 1 } }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: "/subscriptions/credits/reservations/t:1/release" }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: GET, path: /admin/app/subscriptions/credits/usage }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: owner reservation endpoints are served only under /admin/app
+    tags: [ security ]
+    requests:
+      - { request: { method: GET, path: /subscriptions/admin/accounts/api-res-nobody/usage }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /subscriptions/admin/accounts/api-res-nobody/reservations, body: { key: "t:1", productId: api, credits: 1 } }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /subscriptions/admin/accounts/api-res-nobody/preflight, body: { productId: api, credits: 1 } }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: "/subscriptions/admin/accounts/api-res-nobody/reservations/t:1/settle", body: { credits: 1 } }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: "/subscriptions/admin/accounts/api-res-nobody/reservations/t:1/release" }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: owner endpoints validate and report accounts without a plan
+    tags: [ validation ]
+    requests:
+      - request: { method: POST, path: /admin/app/subscriptions/admin/accounts/api-res-nobody/reservations, body: { key: "bad key", productId: api, credits: 1 } }
+        expect: { status: 400, body: { error: Invalid reservation key } }
+      - request: { method: POST, path: /admin/app/subscriptions/admin/accounts/api-res-nobody/reservations, body: { key: "t:1", productId: api } }
+        expect: { status: 400, body: { error: Give credits or an estimate } }
+      - request: { method: POST, path: /admin/app/subscriptions/admin/accounts/api-res-nobody/reservations, body: { key: "t:1", productId: api, credits: 5, ttlMs: 10 } }
+        expect: { status: 400, body: { error: Invalid reservation TTL } }
+      - request: { method: POST, path: /admin/app/subscriptions/admin/accounts/api-res-nobody/reservations, body: { key: "t:1", productId: api, estimate: { rateId: nope, inputTokens: 1 } } }
+        expect: { status: 404, body: { error: Credit rate not found } }
+      - request: { method: POST, path: /admin/app/subscriptions/admin/accounts/api-res-nobody/reservations, body: { key: "t:1", productId: api, credits: 5 } }
+        expect: { status: 402, body: { error: Subscription is inactive or expired } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/api-res-nobody/reservations/t:1/settle", body: {} }
+        expect: { status: 400, body: { error: Give credits or token usage } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/api-res-nobody/reservations/t:1/settle", body: { credits: 1 } }
+        expect: { status: 404, body: { error: Reservation not found } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/api-res-nobody/reservations/t%3A1/release" }
+        expect: { status: 404, body: { error: Reservation not found } }
+      - request: { method: POST, path: /admin/app/subscriptions/admin/accounts/api-res-nobody/preflight, body: { productId: api, credits: 5 } }
+        expect: { status: 200, body: { productId: api, credits: 5, fits: false, reason: inactive, available: 0, missing: 5, allowanceLeft: 0, additionalCredits: 0, reserved: 0, windows: [], topUp: null } }
+      - request: { method: POST, path: /admin/app/subscriptions/admin/accounts/api-res-nobody/preflight, body: { productId: "bad id", credits: 5 } }
+        expect: { status: 400, body: { error: Invalid identifier } }
+      - request: { method: GET, path: /admin/app/subscriptions/admin/accounts/api-res-nobody/usage }
+        expect: { status: 200, body: { userId: api-res-nobody, active: false, products: [], reservations: [], alerts: [], pack: { credits: 1000, amountMinor: 1000, currency: usd } } }
+
+  - name: a signed-in user reserves, settles and releases; the backend meters on the user's behalf
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: Credits Tester, email: credits-1@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { id: { $type: string }, email: credits-1@example.test } } }
+      - request: { method: POST, path: /auth/login, body: { email: credits-1@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { token: { $type: string } } } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/grant", body: { requestId: res-grant-1, kind: plan, planId: starter, reason: Pilot, currency: usd, valueMinor: 0 } }
+        expect: { status: 200, body: { ok: true } }
+      - request: { method: POST, path: /subscriptions/credits/reservations, headers: { authorization: "Bearer {{1.body.token}}" }, body: { key: "turn-1:0", productId: api, estimate: { rateId: standard, inputTokens: 12000, maxOutputTokens: 8000 }, extra: ignored } }
+        expect: { status: 200, headers: { cache-control: no-store }, body: { key: "turn-1:0", productId: api, credits: 36, status: active, at: { $type: integer }, expiresAt: { $type: integer }, available: 64, replayed: false } }
+      - request: { method: POST, path: /subscriptions/credits/reservations, headers: { authorization: "Bearer {{1.body.token}}" }, body: { key: "turn-1:0", productId: api, estimate: { rateId: standard, inputTokens: 12000, maxOutputTokens: 8000 } } }
+        expect: { status: 200, body: { key: "turn-1:0", productId: api, credits: 36, status: active, at: { $ref: "3.body.at" }, expiresAt: { $ref: "3.body.expiresAt" }, available: 64, replayed: true } }
+      - request: { method: POST, path: /subscriptions/credits/reservations, headers: { authorization: "Bearer {{1.body.token}}" }, body: { key: "turn-1:0", productId: api, credits: 35 } }
+        expect: { status: 409, body: { error: Reservation key already used with different amounts } }
+      - request: { method: POST, path: /subscriptions/credits/preflight, headers: { authorization: "Bearer {{1.body.token}}" }, body: { productId: api, credits: 70 } }
+        expect:
+          status: 200
+          body:
+            productId: api
+            credits: 70
+            fits: false
+            reason: credits
+            available: 64
+            missing: 6
+            allowanceLeft: 100
+            additionalCredits: 0
+            reserved: 36
+            windows:
+              - { kind: day, used: 0, reserved: 36, limit: 100, remaining: 64, percent: 36, threshold: 0, resetAt: { $type: integer } }
+              - { kind: week, used: 0, reserved: 36, limit: 500, remaining: 464, percent: 7, threshold: 0, resetAt: { $type: integer } }
+              - { kind: period, used: 0, reserved: 36, limit: 1000, remaining: 964, percent: 3, threshold: 0, resetAt: { $type: integer } }
+            topUp: { credits: 6, packs: 1, amountMinor: 1000, valueMinor: 6, currency: usd }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/reservations", body: { key: "srv:1", productId: api, credits: 50, reason: Agent step } }
+        expect: { status: 200, body: { key: "srv:1", productId: api, credits: 50, status: active, at: { $type: integer }, expiresAt: { $type: integer }, available: 14, replayed: false } }
+      - request: { method: POST, path: "/subscriptions/credits/reservations/srv:1/release", headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect: { status: 404, body: { error: Reservation not found } }
+        note: the user cannot release a reservation the backend made
+      - request: { method: GET, path: /subscriptions/credits/usage, headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect:
+          status: 200
+          body:
+            userId: { $ref: "0.body.id" }
+            active: true
+            products:
+              - productId: api
+                name: API credits
+                allowanceLeft: 100
+                additionalCredits: 0
+                reserved: 86
+                available: 14
+                threshold: 80
+                windows:
+                  - { kind: day, used: 0, reserved: 86, limit: 100, remaining: 14, percent: 86, threshold: 80, resetAt: { $type: integer } }
+                  - { kind: week, used: 0, reserved: 86, limit: 500, remaining: 414, percent: 17, threshold: 0, resetAt: { $type: integer } }
+                  - { kind: period, used: 0, reserved: 86, limit: 1000, remaining: 914, percent: 8, threshold: 0, resetAt: { $type: integer } }
+            reservations:
+              - { key: "turn-1:0", productId: api, credits: 36, at: { $type: integer }, expiresAt: { $type: integer } }
+              - { key: "srv:1", productId: api, credits: 50, at: { $type: integer }, expiresAt: { $type: integer } }
+            alerts: [ { productId: api, window: day, percent: 86, threshold: 80 } ]
+            pack: { credits: 1000, amountMinor: 1000, currency: usd }
+      - request: { method: POST, path: "/subscriptions/credits/reservations/turn-1%3A0/settle", headers: { authorization: "Bearer {{1.body.token}}" }, body: { inputTokens: 12000, outputTokens: 2000 } }
+        expect: { status: 200, body: { key: "turn-1:0", productId: api, reserved: 36, used: 18, credits: 18, fromAllowance: 18, fromBalance: 0, uncovered: 0, expired: false, status: settled, at: { $type: integer }, available: 32, valueMinor: 18, currency: usd, usage: { inputTokens: 12000, outputTokens: 2000 }, replayed: false } }
+      - request: { method: POST, path: "/subscriptions/credits/reservations/turn-1:0/settle", headers: { authorization: "Bearer {{1.body.token}}" }, body: { inputTokens: 12000, outputTokens: 2000 } }
+        expect: { status: 200, body: { $partial: { credits: 18, at: { $ref: "10.body.at" }, replayed: true } } }
+      - request: { method: POST, path: "/subscriptions/credits/reservations/turn-1:0/settle", headers: { authorization: "Bearer {{1.body.token}}" }, body: { credits: 18 } }
+        expect: { status: 409, body: { error: Reservation already settled with different usage } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/reservations/srv:1/settle", body: { inputTokens: 10 } }
+        expect: { status: 400, body: { error: Settle this reservation with credits } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/reservations/srv:1/settle", body: { credits: 60 } }
+        expect: { status: 200, body: { key: "srv:1", productId: api, reserved: 50, used: 60, credits: 60, fromAllowance: 60, fromBalance: 0, uncovered: 0, expired: false, status: settled, at: { $type: integer }, available: 22, valueMinor: 60, currency: usd, usage: { credits: 60 }, replayed: false } }
+        note: usage beyond the reservation is charged from what is free
+      - request: { method: POST, path: /subscriptions/credits/reservations, headers: { authorization: "Bearer {{1.body.token}}" }, body: { key: "turn-2:0", productId: api, credits: 10, ttlMs: 60000 } }
+        expect: { status: 200, body: { $partial: { credits: 10, status: active, available: 12 } } }
+      - request: { method: POST, path: "/subscriptions/credits/reservations/turn-2:0/release", headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect: { status: 200, body: { key: "turn-2:0", productId: api, credits: 10, status: released, releasedAt: { $type: integer }, replayed: false } }
+      - request: { method: POST, path: "/subscriptions/credits/reservations/turn-2:0/release", headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect: { status: 200, body: { $partial: { status: released, replayed: true } } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/reservations/turn-1:0/release" }
+        expect: { status: 409, body: { error: Reservation already settled } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/preflight", body: { productId: api, estimate: { rateId: advanced, inputTokens: 2000, maxOutputTokens: 1000 } } }
+        expect: { status: 200, body: { $partial: { credits: 25, fits: false, reason: credits, available: 22, missing: 3, topUp: { credits: 3, packs: 1, amountMinor: 1000, valueMinor: 3, currency: usd } } } }
+      - request: { method: GET, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/usage" }
+        expect: { status: 200, body: { $partial: { active: true, products: [ { $partial: { reserved: 0, available: 22, threshold: 0, windows: [ { $partial: { kind: day, used: 78, percent: 78 } }, { $partial: { kind: week } }, { $partial: { kind: period } } ] } } ], reservations: [], alerts: [] } } }
+      - request: { method: GET, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/ledger" }
+        expect:
+          status: 200
+          body:
+            entries:
+              - { $partial: { kind: allowance, credits: 500 } }
+              - { $partial: { kind: plan, source: admin } }
+              - { at: { $type: integer }, kind: reservation, source: user, credits: 0, productId: api, reason: "Reserved · Standard model request", requestId: "turn-1:0", held: 36, expiresAt: { $type: integer }, actorId: { $ref: "0.body.id" }, available: 64, id: { $regex: "^\\d{15}-0000000003-[0-9a-f]{16}$" } }
+              - { at: { $type: integer }, kind: reservation, source: api, credits: 0, productId: api, reason: "Reserved · Agent step", requestId: "srv:1", held: 50, expiresAt: { $type: integer }, actorId: rt-app-root, available: 14, id: { $regex: "^\\d{15}-0000000004-[0-9a-f]{16}$" } }
+              - { at: { $type: integer }, kind: settlement, source: user, credits: -18, productId: api, reason: Standard model request, requestId: "turn-1:0", fromAllowance: 18, fromBalance: 0, held: -36, details: { rateId: standard, inputTokens: 12000, outputTokens: 2000, reserved: 36, used: 18, uncovered: 0 }, actorId: { $ref: "0.body.id" }, available: 32, id: { $regex: "^\\d{15}-0000000005-[0-9a-f]{16}$" } }
+              - { at: { $type: integer }, kind: settlement, source: api, credits: -60, productId: api, reason: Agent step, requestId: "srv:1", fromAllowance: 60, fromBalance: 0, held: -50, details: { reserved: 50, used: 60, uncovered: 0 }, actorId: rt-app-root, available: 22, id: { $regex: "^\\d{15}-0000000006-[0-9a-f]{16}$" } }
+              - { at: { $type: integer }, kind: reservation, source: user, credits: 0, productId: api, reason: "Reserved · API credits usage", requestId: "turn-2:0", held: 10, expiresAt: { $type: integer }, actorId: { $ref: "0.body.id" }, available: 12, id: { $regex: "^\\d{15}-0000000007-[0-9a-f]{16}$" } }
+              - { at: { $type: integer }, kind: release, source: user, credits: 0, productId: api, reason: "Released · API credits usage", requestId: "turn-2:0", held: -10, actorId: { $ref: "0.body.id" }, available: 22, id: { $regex: "^\\d{15}-0000000008-[0-9a-f]{16}$" } }
+            pending: []
+            totals: { creditsIn: 500, creditsOut: 78, expired: 0, paidMinor: {}, grantedValueMinor: {}, consumed: 78 }
+            balances: [ { productId: api, allowanceLeft: 22, additionalCredits: 0, available: 22 } ]

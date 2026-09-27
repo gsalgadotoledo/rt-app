@@ -8,6 +8,9 @@ subject `subscriptions`) and `subscriptions-api` (HTTP, local mode). They build 
 `rt.local/core-go/subscriptions` (Go). The contract descriptions hold the full rules; this page
 lists the surface and what ports get wrong most often.
 
+Credit reservations (reserve, settle, release, pre-flight, usage thresholds):
+`polyglot/subscriptions-reservations.md` and `spec/contracts/subscriptions-reservations*.contract.yaml`.
+
 Stripe (`subscriptions-stripe`) is not ported yet. The ports define the `BillingProvider` and
 `CatalogPublisher` interfaces it will implement, and ship `LocalBilling`.
 

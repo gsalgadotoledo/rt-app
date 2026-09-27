@@ -67,6 +67,33 @@ await app.subscriptions.consumeUsage(userId, "api", { rateId: "standard", inputT
 
 **Rates** live in Settings → Credits. Each model or function sets credits per 1,000 input and output tokens, with an optional minimum per request. The result is rounded up to whole credits. The pack price (e.g. 1,000 credits = USD 10) sets the money value of a credit. The **credit sandbox** in Settings prices any token count for a model and previews how the charge splits for a given user, and can charge it to that user for testing. `POST /subscriptions/admin/credits/estimate` never writes.
 
+## Reserve and settle model calls
+
+For work whose cost is only known afterwards (an agent step calling a model), reserve the maximum before the call and settle the real usage after it:
+
+```ts
+const key = `${turnId}:${step}`; // stable: retries and resumed runs reuse it
+const check = await app.subscriptions.preflight(userId, "api", { estimate: { rateId: "standard", inputTokens, maxOutputTokens } });
+if (!check.fits) return offerTopUp(check.missing, check.topUp); // do not run the batch
+
+await app.subscriptions.reserve(userId, "api", { key, estimate: { rateId: "standard", inputTokens, maxOutputTokens } });
+try {
+  const result = await callModel();
+  await app.subscriptions.settle(userId, key, { inputTokens: result.usage.input, outputTokens: result.usage.output });
+} catch (error) {
+  if (!callStarted) await app.subscriptions.release(userId, key); // nothing ran: free the hold
+  throw error;
+}
+```
+
+- A reservation **holds** credits; nothing is charged until `settle`. Other charges of the user (other turns, metered endpoints) cannot spend held credits, so two turns reserving at once never overspend: one of them gets 429 `Not enough credits: N missing. …`.
+- `settle` charges the reported usage (priced with the reserved rate, or `{credits}`) and the rest of the hold returns. Usage above the reservation is charged as well; what the account cannot cover is returned as `uncovered` and is not charged, so balances never go negative.
+- Keys are idempotent: repeating `reserve`, `settle` or `release` with the same key and values returns the stored result with `replayed: true`; other values fail with 409.
+- Holds expire after `ttlMs` (default 15 minutes, up to 24 hours). Expired credits are usable at once; the release is recorded on the statement by the next reservation or by maintenance. A process that crashed after the model call can still `settle` on resume with the provider's usage, even after the TTL.
+- `usageSummary(userId)` reports each product's day, week and period windows with `percent` and `threshold` (80, 95 or 100 reached) plus `alerts`, for warnings near the limits. `preflight` adds `missing` and a `topUp` offer priced with the credit pack.
+
+The statement shows `reservation` (0 credits, the amount held), `settlement` (the charge) and `release` entries. Signed-in users have `/subscriptions/credits/{usage,preflight,reservations}` for their own reservations; a backend meters on the user's behalf through the owner endpoints `/subscriptions/admin/accounts/:id/{usage,preflight,reservations}` (admin token), which users cannot release or settle. Details: `docs/polyglot/subscriptions-reservations.md`.
+
 ## Overview
 
 Subscriptions opens on **Overview**:

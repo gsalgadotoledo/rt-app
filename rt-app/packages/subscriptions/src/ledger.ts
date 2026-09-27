@@ -14,7 +14,10 @@ export type LedgerKind =
   | "purchase" // additional credits bought (top-up)
   | "plan" // plan started, changed, renewed or assigned
   | "adjustment" // manual or programmatic correction
-  | "reset"; // courtesy reset of usage windows
+  | "reset" // courtesy reset of usage windows
+  | "reservation" // credits held for a call (0 credits; `held` > 0)
+  | "settlement" // real usage of a reservation charged (− credits); its hold removed
+  | "release"; // hold removed without a charge (released or expired)
 
 export type LedgerSource = "system" | "admin" | "billing" | "user" | "api";
 
@@ -38,6 +41,10 @@ export interface LedgerEntry {
   /** Credits available for the product right after this entry. */
   available?: number;
   details?: Record<string, string | number | boolean>;
+  /** Change of the credits held by reservations: + reserved, − settled/released/expired. */
+  held?: number;
+  /** Reservation entries: when the hold stops counting. */
+  expiresAt?: number;
 }
 
 export interface LedgerTotals {
