@@ -158,6 +158,25 @@ def feature(service: Subscriptions) -> Feature:
         assert c.actor is not None
         return c.actor
 
+    # Request bodies of the reservation endpoints: only the documented fields reach the service.
+    def amount(c: Context) -> dict[str, Any]:
+        body = _body(c)
+        return {"credits": body.get("credits"), "estimate": body.get("estimate")}
+
+    def reservation(c: Context) -> dict[str, Any]:
+        body = _body(c)
+        return {name: body.get(name) for name in ("key", "credits", "estimate", "ttlMs", "reason")}
+
+    def usage(c: Context) -> dict[str, Any]:
+        body = _body(c)
+        return {name: body.get(name) for name in ("credits", "inputTokens", "outputTokens")}
+
+    def as_user(c: Context) -> dict[str, Any]:
+        return {"source": "user", "actorId": user(c)["id"]}
+
+    def as_api(c: Context) -> dict[str, Any]:
+        return {"source": "api", "actorId": actor_id(c)}
+
     endpoints = [
         *(plan_action(action) for action in ("create", "update", "archive", "unarchive", "version")),
         personal("GET", "/subscriptions/me", lambda c: service.me(user(c)["id"])),
@@ -311,6 +330,64 @@ def feature(service: Subscriptions) -> Feature:
             "/subscriptions/admin/maintenance",
             lambda c: service.maintenance(),
             {"name": "subscriptions_maintenance", "description": "Run subscription maintenance and configured notifications.", "example": {}},
+        ),
+        # Credit reservations. Personal endpoints act on the signed-in user's own reservations
+        # (source "user"); a backend that meters model calls uses the owner endpoints (admin
+        # token), whose reservations the user cannot settle or release.
+        personal("GET", "/subscriptions/credits/usage", lambda c: service.usage_summary(user(c)["id"])),
+        personal("POST", "/subscriptions/credits/preflight", lambda c: service.preflight(user(c)["id"], _body(c).get("productId"), amount(c))),
+        personal("POST", "/subscriptions/credits/reservations", lambda c: service.reserve(user(c)["id"], _body(c).get("productId"), reservation(c), as_user(c))),
+        personal("POST", "/subscriptions/credits/reservations/:key/settle", lambda c: service.settle(user(c)["id"], c.params["key"], usage(c), as_user(c))),
+        personal("POST", "/subscriptions/credits/reservations/:key/release", lambda c: service.release(user(c)["id"], c.params["key"], as_user(c))),
+        owner(
+            "GET",
+            "/subscriptions/admin/accounts/:id/usage",
+            lambda c: service.usage_summary(c.params["id"]),
+            {
+                "name": "subscriptions_credits_usage",
+                "description": "Usage against limits for a user: per product the day/week/period windows (used, reserved, limit, percent, threshold 0|80|95|100), active reservations, alerts at 80% or more and the credit pack for a top-up. params.id user. Never writes.",
+                "example": {"params": {"id": "USER_ID"}},
+            },
+        ),
+        owner(
+            "POST",
+            "/subscriptions/admin/accounts/:id/preflight",
+            lambda c: service.preflight(c.params["id"], _body(c).get("productId"), amount(c)),
+            {
+                "name": "subscriptions_credits_preflight",
+                "description": "Check whether a batch fits before running it. Body: productId and credits, or estimate {rateId, inputTokens, maxOutputTokens}. Returns fits, reason (inactive|payment|product|credits), available, missing, windows and a topUp offer. Never writes.",
+                "example": {"params": {"id": "USER_ID"}, "body": {"productId": "api", "estimate": {"rateId": "standard", "inputTokens": 1200, "maxOutputTokens": 800}}},
+            },
+        ),
+        owner(
+            "POST",
+            "/subscriptions/admin/accounts/:id/reservations",
+            lambda c: service.reserve(c.params["id"], _body(c).get("productId"), reservation(c), as_api(c)),
+            {
+                "name": "subscriptions_credits_reserve",
+                "description": "Hold credits before a model call. Body: key (stable, e.g. turnId:step), productId, credits or estimate {rateId, inputTokens, maxOutputTokens}, optional ttlMs (default 900000) and reason. Reuse the key for retries; the same key with another amount fails with 409.",
+                "example": {"params": {"id": "USER_ID"}, "body": {"key": "turn-1:0", "productId": "api", "estimate": {"rateId": "standard", "inputTokens": 1200, "maxOutputTokens": 800}}},
+            },
+        ),
+        owner(
+            "POST",
+            "/subscriptions/admin/accounts/:id/reservations/:key/settle",
+            lambda c: service.settle(c.params["id"], c.params["key"], usage(c), as_api(c)),
+            {
+                "name": "subscriptions_credits_settle",
+                "description": "Charge the real usage of a reservation and release the rest. Body: inputTokens and outputTokens (priced with the reserved rate) or credits. Works after the reservation expired; returns uncovered credits it could not charge. Idempotent per key.",
+                "example": {"params": {"id": "USER_ID", "key": "turn-1:0"}, "body": {"inputTokens": 1200, "outputTokens": 150}},
+            },
+        ),
+        owner(
+            "POST",
+            "/subscriptions/admin/accounts/:id/reservations/:key/release",
+            lambda c: service.release(c.params["id"], c.params["key"], as_api(c)),
+            {
+                "name": "subscriptions_credits_release",
+                "description": "Release a reservation without charging it (the call did not run). Idempotent per key.",
+                "example": {"params": {"id": "USER_ID", "key": "turn-1:0"}},
+            },
         ),
     ]
     return Feature(id="subscriptions", endpoints=endpoints, admin=ADMIN)

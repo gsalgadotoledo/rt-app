@@ -7,6 +7,7 @@ docs/polyglot/subscriptions.md. Wire null means "not given" for optional argumen
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any
 
 from identity import _Clock, _init
@@ -14,6 +15,7 @@ from storage import memory_store, rows_of
 
 from rt_app import HttpError
 from rt_app._canonical import canonical
+from rt_app.conformance import snake_case
 from rt_app.subscriptions import LocalBilling, Subscriptions
 from rt_app.subscriptions.feature import MIGRATIONS
 from rt_app.web import Context, Request
@@ -54,6 +56,22 @@ class SubscriptionsFacade:
         init = _init(init)
         self._clock = _Clock(init.get("now") or _DEFAULT_NOW)
         self._store = memory_store(rows_of(init))
+        # Failure injection (fail_writes): the next transactions fail with 503 "Injected store
+        # failure", "before" committing (nothing written) or "after" (written, the reply is lost).
+        self._injected: list[str] = []
+        self._injected_lock = threading.Lock()
+        transact = self._store.transact
+
+        def failing_transact(writes: Any) -> None:
+            with self._injected_lock:
+                mode = self._injected.pop(0) if self._injected else None
+            if mode == "before":
+                raise HttpError(503, "Injected store failure")
+            transact(writes)
+            if mode == "after":
+                raise HttpError(503, "Injected store failure")
+
+        self._store.transact = failing_transact  # type: ignore[method-assign]
         self._sent: list[dict[str, Any]] = []
         self._catalog = _Catalog()
         billing = LocalBilling(self._store, self._clock.now) if init.get("billing") == "local" else None
@@ -139,6 +157,22 @@ class SubscriptionsFacade:
     def ledger(self, user_id: Any, cursor: Any = None) -> Any:
         return self.service.ledger(user_id, cursor)
 
+    # Reservations
+    def reserve(self, user_id: Any, product_id: Any, input: Any, meta: Any = None) -> Any:
+        return self.service.reserve(user_id, product_id, input, meta)
+
+    def settle(self, user_id: Any, key: Any, usage: Any, meta: Any = None) -> Any:
+        return self.service.settle(user_id, key, usage, meta)
+
+    def release(self, user_id: Any, key: Any, meta: Any = None) -> Any:
+        return self.service.release(user_id, key, meta)
+
+    def preflight(self, user_id: Any, product_id: Any, input: Any) -> Any:
+        return self.service.preflight(user_id, product_id, input)
+
+    def usage_summary(self, user_id: Any) -> Any:
+        return self.service.usage_summary(user_id)
+
     # Overview and maintenance
     def overview(self, months: Any = None) -> Any:
         return self.service.overview(12 if months is None else months)
@@ -207,6 +241,86 @@ class SubscriptionsFacade:
     def set_catalog(self, mode: Any) -> None:
         self._catalog.mode = mode
         return None
+
+    def fail_writes(self, count: Any, mode: Any) -> None:
+        """The next ``count`` transactions fail ("before" or "after" they commit)."""
+        if mode not in ("before", "after"):
+            raise ValueError('failWrites mode is "before" or "after"')
+        with self._injected_lock:
+            self._injected.extend([mode] * int(count))
+        return None
+
+    def _outcome(self, call: Any) -> dict[str, Any] | None:
+        """Run one {call, args}: None when it succeeds, else {status, message}."""
+        try:
+            getattr(self, snake_case(call["call"]))(*(call.get("args") or []))
+            return None
+        except HttpError as error:
+            return {"status": error.status, "message": error.message}
+        except Exception as error:  # noqa: BLE001 - reported like the reference (status null)
+            return {"status": None, "message": str(error)}
+
+    @staticmethod
+    def _summary(outcomes: list[dict[str, Any] | None]) -> dict[str, Any]:
+        rejected = sorted((o for o in outcomes if o is not None), key=lambda o: o["message"])
+        return {"fulfilled": len(outcomes) - len(rejected), "rejected": rejected}
+
+    def race(self, calls: Any) -> Any:
+        """Run [{call, args}] at once (one thread each): {fulfilled, rejected} sorted by message."""
+        outcomes: list[dict[str, Any] | None] = [None] * len(calls)
+        start = threading.Barrier(len(calls)) if calls else None
+
+        def run(index: int, call: Any) -> None:
+            if start is not None:
+                start.wait()
+            outcomes[index] = self._outcome(call)
+
+        threads = [threading.Thread(target=run, args=(i, call)) for i, call in enumerate(calls)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return self._summary(outcomes)
+
+    def batch(self, calls: Any) -> Any:
+        """Run [{call, args}] one after the other: {fulfilled, rejected} sorted by message."""
+        return self._summary([self._outcome(call) for call in calls])
+
+    def ledger_check(self, user_id: Any) -> Any:
+        """Statement invariants (docs/polyglot/subscriptions-reservations.md)."""
+        entries: list[Any] = []
+        cursor = None
+        while True:
+            page = self._store.list("SUB_LEDGER#" + user_id, cursor)
+            entries.extend(r["data"] for r in page["items"])
+            cursor = page.get("cursor")
+            if not cursor:
+                break
+        row = self._store.get("SUB_ACCOUNTS", user_id)
+        account = row["data"] if row else {}
+        windows = account.get("ledgerWindows") or None
+        admin = windows is not None and str(windows.get("key", "")).startswith("admin:")
+        counters = ((account.get("adminGrant") or {}).get("counters") if admin else account.get("counters")) or {}
+        credits = sum(e.get("credits", 0) for e in entries)
+        held = sum(e.get("held") or 0 for e in entries)
+        reserved = sum(h["credits"] for h in account.get("reservations") or [])
+        allowance = 0
+        for product_id, w in ((windows or {}).get("products") or {}).items():
+            counter = counters.get(product_id) or {}
+            allowance += w["allowance"] - (counter.get("week", 0) if counter.get("weekStart") == w["start"] else 0)
+        balances = list((account.get("creditBalance") or {}).values())
+        additional = sum(balances)
+        negative = any(e.get("available") is not None and e["available"] < 0 for e in entries) or any(v < 0 for v in balances)
+        return {
+            "entries": len(entries),
+            "credits": credits,
+            "held": held,
+            "reserved": reserved,
+            "allowance": allowance,
+            "additional": additional,
+            "balanced": credits == allowance + additional and held == reserved,
+            "negative": negative,
+        }
 
     def published(self) -> Any:
         return self._catalog.published

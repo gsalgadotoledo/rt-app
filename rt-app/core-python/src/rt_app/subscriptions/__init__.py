@@ -20,6 +20,14 @@ from .credits import (
 from .currency import CURRENCY_CODES, currency_decimals, currency_step, major_amount, valid_currency, valid_minor_amount
 from .local import LocalBilling
 from .plans import DEFAULTS, default_settings, plan_id_from_name, validate_metadata, validate_settings
+from .reservations import (
+    MAX_ACTIVE_RESERVATIONS,
+    RESERVATION_TTL_MS,
+    reservation_key,
+    reservations,
+    threshold_of,
+    window_usage,
+)
 from .service import BillingProvider, CatalogPublisher, Subscriptions
 from .ledger import (
     LEDGER,
@@ -72,4 +80,10 @@ __all__ = [
     "ledger_write",
     "rollover",
     "used_from",
+    "MAX_ACTIVE_RESERVATIONS",
+    "RESERVATION_TTL_MS",
+    "reservation_key",
+    "reservations",
+    "threshold_of",
+    "window_usage",
 ]
