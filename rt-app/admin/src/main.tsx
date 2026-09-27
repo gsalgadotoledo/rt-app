@@ -19,6 +19,7 @@ import ContentPanel from "@gsalgadotoledo/rt-app-content/admin";
 import AuthOverview from "@gsalgadotoledo/rt-app-auth/settings";
 import Deployments from "@gsalgadotoledo/rt-app-deployments/admin";
 import UsersPanel from "@gsalgadotoledo/rt-app-users/admin";
+import { bansTab } from "@gsalgadotoledo/rt-app-users-bans/admin";
 import TasksPanel from "@gsalgadotoledo/rt-app-tasks/admin";
 import PermissionsPanel from "@gsalgadotoledo/rt-app-acl/admin";
 import ServiceKeysPanel from "@gsalgadotoledo/rt-app-auth/service-keys";
@@ -50,6 +51,8 @@ function AdminApp({
     [base, setBase] = useState(API),
     [session, setSessionState] = useState<any>(),
     [modules, setModules] = useState<any[]>([]),
+    // Enabled module ids (GET /admin/features): optional record tabs such as users-bans.
+    [featureIds, setFeatureIds] = useState<string[]>([]),
     [error, setError] = useState("");
   const [menuOpen,setMenuOpen]=useState(false);
   const [theme,setTheme]=useState(()=>{try{return localStorage.getItem('rt-app.admin.theme')??'violet';}catch{return 'violet';}});
@@ -151,6 +154,10 @@ function AdminApp({
       void api("/admin/modules")
         .then(setModules)
         .catch((e) => setError(e.message));
+    if (session && !installer)
+      void api("/admin/features")
+        .then((ids) => setFeatureIds(Array.isArray(ids) ? ids : []))
+        .catch(() => setFeatureIds([]));
   }, [session?.sessionId ?? session?.token, installer]);
   if (startup === "loading")
     return (
@@ -270,6 +277,7 @@ function AdminApp({
                 api={moduleApi}
                 manifest={manifest}
                 user={session.user}
+                {...(manifest.component === "users" && featureIds.includes("users-bans") ? { recordTabs: [bansTab] } : {})}
               />
             </ModuleWorkspace>
           ) : (

@@ -27,6 +27,7 @@
     "@gsalgadotoledo/rt-app-subscriptions": "0.2.3",
     "@gsalgadotoledo/rt-app-tasks": "0.2.3",
     "@gsalgadotoledo/rt-app-users": "0.2.3",
+    "@gsalgadotoledo/rt-app-users-bans": "0.2.3",
     "@gsalgadotoledo/rt-app-visits": "0.2.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

@@ -4,12 +4,26 @@ export type Api = (
   method?: string,
   body?: unknown,
 ) => Promise<any>;
+/**
+ * An extra tab on the record page of a ResourcePanel, contributed by another module (for example
+ * the Bans tab of rt-app-users-bans on Users). `onChange` replaces the open record (pass the
+ * record the API returned) and reloads the list.
+ */
+export interface RecordTab {
+  id: string;
+  label: string;
+  /** Whether the tab applies to this record and signed-in user (default: always). */
+  visible?: (record: any, user: any) => boolean;
+  render: (props: { api: Api; record: any; user: any; onChange: (record: any) => void }) => React.ReactNode;
+}
 export interface PanelProps {
   api: Api;
   manifest: any;
   user: any;
+  /** Extra record tabs (after Edit, Permissions and Audit); shown for existing, non-deleted records. */
+  recordTabs?: RecordTab[];
 }
-export function ResourcePanel({ api, manifest, user }: PanelProps) {
+export function ResourcePanel({ api, manifest, user, recordTabs = [] }: PanelProps) {
   const [detailTab,setDetailTab]=useState("edit");
   const [trash,setTrash]=useState(false);
   const [confirmTrash,setConfirmTrash]=useState(false);
@@ -132,6 +146,7 @@ export function ResourcePanel({ api, manifest, user }: PanelProps) {
       setBusy(false);
     }
   }
+  const extraTabs=mode==="edit"&&selected&&!trash?recordTabs.filter(tab=>tab.visible?.(selected,user)??true):[];
   const detailTrash=mode==="edit"&&detailTab==="edit"&&selected&&!trash&&(tasks||allowed("users.delete"));
   useEffect(()=>setConfirmTrash(false),[selected?.id,mode,detailTab]);
   return (
@@ -221,6 +236,10 @@ export function ResourcePanel({ api, manifest, user }: PanelProps) {
                       <td key={f}>
                         {(users || tasks) && ["id","name","title"].includes(f) ? (
                           <button className="record-link" disabled={busy} onClick={()=>void edit(item)}>{String(item[f] ?? "—")}</button>
+                        ) : f === "banned" ? (
+                          <span className={`badge ${item[f] ? "danger" : ""}`} title={item.ban?.until ? `Until ${item.ban.until}` : undefined}>
+                            {item[f] ? (item.ban?.until ? "temporary" : "banned") : "no"}
+                          </span>
                         ) : f === "active" || f === "done" ? (
                           <span
                             className={`badge ${item[f] ? "positive" : ""}`}
@@ -281,7 +300,8 @@ export function ResourcePanel({ api, manifest, user }: PanelProps) {
         </>
       ) : (
         <div className="record-detail">
-          {mode==="edit"&&<nav className="tabs" aria-label="Record functions"><button onClick={()=>setDetailTab("edit")} className={detailTab==="edit"?"active":""}>Edit record</button>{users&&user.role==="owner"&&selected?.role!=="owner"&&!trash&&<button onClick={()=>setDetailTab("permissions")} className={detailTab==="permissions"?"active":""}>Permissions</button>}<button onClick={()=>setDetailTab("audit")} className={detailTab==="audit"?"active":""}>Audit</button></nav>}
+          {mode==="edit"&&<nav className="tabs" aria-label="Record functions"><button onClick={()=>setDetailTab("edit")} className={detailTab==="edit"?"active":""}>Edit record</button>{users&&user.role==="owner"&&selected?.role!=="owner"&&!trash&&<button onClick={()=>setDetailTab("permissions")} className={detailTab==="permissions"?"active":""}>Permissions</button>}<button onClick={()=>setDetailTab("audit")} className={detailTab==="audit"?"active":""}>Audit</button>{extraTabs.map(tab=><button key={tab.id} onClick={()=>setDetailTab(tab.id)} className={detailTab===tab.id?"active":""}>{tab.label}</button>)}</nav>}
+          {extraTabs.filter(tab=>tab.id===detailTab).map(tab=><div key={tab.id}>{tab.render({api,record:selected,user,onChange:(record:any)=>{setSelected(record);void load();}})}</div>)}
           {detailTab==="audit"&&<dl>{["createdAt","createdBy","updatedAt","updatedBy","deletedAt","deletedBy","restoredAt","restoredBy"].map(key=><div key={key}><dt>{key}</dt><dd>{selected?.[key]??"—"}</dd></div>)}</dl>}
           {detailTab==="edit"&&<form onSubmit={save}><fieldset disabled={trash||busy} style={{border:0,padding:0,margin:0}}>
             <h2>{mode === "create" ? "New record" : "Edit record"}</h2>
