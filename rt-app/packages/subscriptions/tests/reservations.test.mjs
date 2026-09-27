@@ -263,6 +263,7 @@ test("pre-flight reports fits, missing credits, blocked accounts and a top-up of
   assert.deepEqual(await service.preflight("alice", "api", { credits: 10 }), {
     productId: "api", credits: 10, fits: false, reason: "inactive", available: 0, missing: 10,
     allowanceLeft: 0, additionalCredits: 0, reserved: 0, windows: [], topUp: null,
+    costMinor: null, model: null, margin: null, degrade: null,
   });
   await service.change(alice, "starter", "plan");
   assert.equal((await service.preflight("alice", "gpu", { credits: 1 })).reason, "product");

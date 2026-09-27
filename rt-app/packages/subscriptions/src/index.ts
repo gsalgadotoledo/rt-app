@@ -3308,34 +3308,34 @@ export class Subscriptions {
     const meta = (c: Context) => ({ source: "api" as const, actorId: c.actor!.id });
     const base = "/service/subscriptions/accounts/:id";
     return [
-      { method: "GET", path: base + "/usage", resource: METER, access: "service", handle: (c) => this.usageSummary(account(c)) },
+      { method: "GET", path: base + "/usage", resource: METER, access: "service", handle: async (c) => this.usageSummary(account(c)) },
       {
         method: "POST",
         path: base + "/preflight",
         resource: METER,
         access: "service",
-        handle: (c) => this.preflight(account(c), c.request.body.productId, amountBody(c.request.body)),
+        handle: async (c) => this.preflight(account(c), c.request.body.productId, amountBody(c.request.body)),
       },
       {
         method: "POST",
         path: base + "/reservations",
         resource: METER,
         access: "service",
-        handle: (c) => this.reserve(account(c), c.request.body.productId, reserveBody(c.request.body), meta(c)),
+        handle: async (c) => this.reserve(account(c), c.request.body.productId, reserveBody(c.request.body), meta(c)),
       },
       {
         method: "POST",
         path: base + "/reservations/:key/settle",
         resource: METER,
         access: "service",
-        handle: (c) => this.settle(account(c), c.params.key, usageBody(c.request.body), meta(c)),
+        handle: async (c) => this.settle(account(c), c.params.key, usageBody(c.request.body), meta(c)),
       },
       {
         method: "POST",
         path: base + "/reservations/:key/release",
         resource: METER,
         access: "service",
-        handle: (c) => this.release(account(c), c.params.key, meta(c)),
+        handle: async (c) => this.release(account(c), c.params.key, meta(c)),
       },
       {
         method: "POST",
@@ -3343,7 +3343,7 @@ export class Subscriptions {
         resource: METER,
         access: "service",
         // Debits only: a metering key charges usage; adding credits stays with the owner.
-        handle: (c) => {
+        handle: async (c) => {
           const body = c.request.body;
           const userId = account(c);
           if (typeof body.credits === "number" && body.credits > 0) throw new HttpError(403, "Service keys can only record debits");
