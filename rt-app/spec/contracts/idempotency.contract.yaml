@@ -1,0 +1,377 @@
+contract: 1
+module: idempotency
+title: Idempotency (executor + NoSQL claim store)
+description: |
+  RTAppIdempotencyModule.execute(request, work) over NoSQLIdempotencyStore (createIdempotency).
+  A request is {scope, key, input}. Validation order: NOT_CONFIGURED (no store), INVALID_KEY
+  (scope must be a string, non-blank after JavaScript trim(), at most 512 UTF-16 units; key the
+  same with 256), INVALID_JSON (input must be JSON; a missing input is undefined and rejected,
+  null is fine). Errors are {code, message: "RT-App idempotency: <CODE>"} without status.
+
+  Fingerprint: sha256 hex of the canonical JSON of input (object keys sorted by UTF-16 code units,
+  JSON.stringify strings and numbers: 1e+21, 1e-7, -0 → 0, integers above 2^53 as float64).
+  The work receives {input: JSON.parse(canonical), idempotencyKey}; idempotencyKey is
+  "rtapp-" + sha256hex(JSON.stringify([scope, key])), stable across retries and inputs.
+  Owner: a random UUID v4 per execute call.
+
+  Claim row: pk "IDEMPOTENCY#" + scope, sk key, version 1, data {fingerprint, owner, state:
+  "pending", createdAt}, created with expected null. On a Conflict the row is read: another
+  fingerprint → conflict; completed → {state: completed, result}; uncertain → uncertain; any other
+  state → pending; a vanished row rethrows the Conflict (409). Store errors propagate unchanged and
+  the work never runs. complete/markUncertain re-read the row, need the same owner and fingerprint
+  (409 Conflict otherwise), never touch a completed row, and write version+1 with {...data, state,
+  updatedAt[, result]} expecting the read version. A failed work or failed completion marks the
+  claim uncertain (a failure there is swallowed, the claim stays pending) and throws UNCERTAIN.
+  Nothing expires, and nothing is retried.
+
+  Facade (subject idempotency): init {now: ISO, rows}. execute(request, outcome) where outcome
+  {result} is returned by the work, {error} is thrown as Error(error), and {during: [request,
+  outcome]} runs a nested execute inside the work (logged as during: {value} | {error: {code,
+  message}}). calls() lists the works that ran. claim/complete/markUncertain are the store surface.
+  Helpers: row(pk, sk), injectFaults(kind, count) (next transactions: ok | conflict | error |
+  lostAck), setNow(iso), initUnconfigured(), executeUnconfigured(request).
+subject: idempotency
+init: { now: "2026-01-02T03:04:05.678Z", rows: [] }
+cases:
+  # --- first run and replay ----------------------------------------------------------------
+  - name: the first execution runs the work once and stores a replayable result
+    steps:
+      - call: execute
+        args: [ { scope: "shop:u1:charge:v1", key: order-1, input: { currency: USD, amount: 10 } }, { result: { id: paid } } ]
+        expect: { value: { id: paid } }
+      - call: calls
+        expect:
+          value:
+            - input: { amount: 10, currency: USD }
+              idempotencyKey: rtapp-1d70ab84a2b68564ecc7595944c41ee98bb8df1f468c300f39ab1a64eeea9c85
+      - call: row
+        args: [ "IDEMPOTENCY#shop:u1:charge:v1", order-1 ]
+        expect:
+          value:
+            pk: "IDEMPOTENCY#shop:u1:charge:v1"
+            sk: order-1
+            version: 2
+            data:
+              fingerprint: 1748e5b562237637f7af0d4e3d15d118c268e47a60ed8f248142dc1c978dc6c9
+              owner: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+              state: completed
+              createdAt: "2026-01-02T03:04:05.678Z"
+              updatedAt: "2026-01-02T03:04:05.678Z"
+              result: { id: paid }
+
+  - name: a retry replays the stored result without running the work
+    tags: [ replay ]
+    steps:
+      - { call: execute, args: [ { scope: s, key: k, input: { amount: 10 } }, { result: { id: first } } ], expect: { value: { id: first } } }
+      - { call: execute, args: [ { scope: s, key: k, input: { amount: 10 } }, { result: { id: second } } ], expect: { value: { id: first } } }
+      - { call: execute, args: [ { scope: s, key: k, input: { amount: 10 } }, { error: must not run } ], expect: { value: { id: first } } }
+      - { call: calls, expect: { value: { $length: 1 } } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: { $partial: { version: 2 } } }, note: replays never write }
+
+  - name: object key order does not change the fingerprint
+    tags: [ replay, canonical ]
+    steps:
+      - { call: execute, args: [ { scope: s, key: k, input: { b: [ 2, { y: 1, x: 0 } ], a: 1 } }, { result: 1 } ], expect: { value: 1 } }
+      - { call: execute, args: [ { scope: s, key: k, input: { a: 1, b: [ 2, { x: 0, y: 1 } ] } }, { result: 2 } ], expect: { value: 1 } }
+      - { call: execute, args: [ { scope: s, key: k, input: { a: 1, b: [ { x: 0, y: 1 }, 2 ] } }, { result: 3 } ], expect: { error: { code: CONFLICT, message: "RT-App idempotency: CONFLICT" } }, note: array order matters }
+
+  - name: null results and null inputs are replayable values
+    tags: [ replay, edge ]
+    steps:
+      - { call: execute, args: [ { scope: s, key: k, input: null }, { result: null } ], expect: { value: null } }
+      - { call: execute, args: [ { scope: s, key: k, input: null }, { result: 5 } ], expect: { value: null } }
+      - { call: calls, expect: { value: { $length: 1 } } }
+      - call: row
+        args: [ "IDEMPOTENCY#s", k ]
+        expect: { value: { $partial: { data: { $partial: { state: completed, fingerprint: 74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b } } } } }
+
+  - name: results are normalized to canonical JSON before they are stored and returned
+    tags: [ canonical ]
+    steps:
+      - call: execute
+        args: [ { scope: s, key: k, input: 1 }, { result: { z: [ 1.0, -0, 1e+21 ], a: { "": "é" } } } ]
+        expect: { value: { a: { "": "é" }, z: [ 1, 0, 1e+21 ] } }
+      - call: row
+        args: [ "IDEMPOTENCY#s", k ]
+        expect: { value: { $partial: { data: { $partial: { result: { a: { "": "é" }, z: [ 1, 0, 1e+21 ] } } } } } }
+
+  - name: another input under the same key is a conflict, and nothing runs
+    tags: [ conflict ]
+    steps:
+      - { call: execute, args: [ { scope: s, key: k, input: { amount: 10 } }, { result: ok } ], expect: { value: ok } }
+      - { call: execute, args: [ { scope: s, key: k, input: { amount: 11 } }, { result: other } ], expect: { error: { code: CONFLICT, message: "RT-App idempotency: CONFLICT" } } }
+      - { call: execute, args: [ { scope: s, key: k, input: "10" }, { result: other } ], expect: { error: { code: CONFLICT } }, note: the string "10" is not the number 10 }
+      - { call: calls, expect: { value: { $length: 1 } } }
+
+  - name: scopes and keys are independent claims
+    steps:
+      - { call: execute, args: [ { scope: tenant-a, key: k, input: 1 }, { result: a } ], expect: { value: a } }
+      - { call: execute, args: [ { scope: tenant-b, key: k, input: 2 }, { result: b } ], expect: { value: b } }
+      - { call: execute, args: [ { scope: tenant-a, key: k2, input: 3 }, { result: c } ], expect: { value: c } }
+      - { call: calls, expect: { value: { $length: 3 } } }
+      - { call: row, args: [ "IDEMPOTENCY#tenant-b", k ], expect: { value: { $partial: { data: { $partial: { result: b } } } } } }
+
+  - name: the idempotency key depends on scope and key only
+    steps:
+      - { call: execute, args: [ { scope: "shop:u1:charge:v1", key: order-1, input: 1 }, { error: declined } ], expect: { error: { code: UNCERTAIN } } }
+      - { call: execute, args: [ { scope: "shop:u1:charge:v1", key: order-2, input: 1 }, { result: 1 } ], expect: { value: 1 } }
+      - call: calls
+        expect:
+          value:
+            - { input: 1, idempotencyKey: rtapp-1d70ab84a2b68564ecc7595944c41ee98bb8df1f468c300f39ab1a64eeea9c85 }
+            - { input: 1, idempotencyKey: { $regex: "^rtapp-[0-9a-f]{64}$" } }
+
+  # --- failures ------------------------------------------------------------------------------
+  - name: a failed work marks the claim uncertain and is never retried automatically
+    tags: [ uncertain ]
+    steps:
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { error: gateway timeout } ], expect: { error: { code: UNCERTAIN, message: "RT-App idempotency: UNCERTAIN" } } }
+      - call: row
+        args: [ "IDEMPOTENCY#s", k ]
+        expect:
+          value:
+            pk: "IDEMPOTENCY#s"
+            sk: k
+            version: 2
+            data:
+              fingerprint: { $regex: "^[0-9a-f]{64}$" }
+              owner: { $type: string }
+              state: uncertain
+              createdAt: "2026-01-02T03:04:05.678Z"
+              updatedAt: "2026-01-02T03:04:05.678Z"
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { result: 1 } ], expect: { error: { code: UNCERTAIN } } }
+      - { call: execute, args: [ { scope: s, key: k, input: 2 }, { result: 1 } ], expect: { error: { code: CONFLICT } }, note: the fingerprint is checked before the state }
+      - { call: calls, expect: { value: { $length: 1 } } }
+
+  - name: a failed completion marks the claim uncertain
+    tags: [ uncertain, store ]
+    steps:
+      - { call: injectFaults, args: [ ok, 1 ], expect: { value: null } }
+      - { call: injectFaults, args: [ error, 1 ], expect: { value: null } }
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { result: 1 } ], expect: { error: { code: UNCERTAIN } } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: { $partial: { version: 2, data: { $partial: { state: uncertain } } } } } }
+
+  - name: when marking uncertain also fails the claim stays pending
+    tags: [ uncertain, store ]
+    steps:
+      - { call: injectFaults, args: [ ok, 1 ], expect: { value: null } }
+      - { call: injectFaults, args: [ error, 2 ], expect: { value: null } }
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { result: 1 } ], expect: { error: { code: UNCERTAIN } } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: { $partial: { version: 1, data: { $partial: { state: pending } } } } } }
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { result: 1 } ], expect: { error: { code: PENDING, message: "RT-App idempotency: PENDING" } } }
+      - { call: calls, expect: { value: { $length: 1 } } }
+
+  - name: a completion whose acknowledgement was lost stays completed and replays
+    tags: [ uncertain, store, replay ]
+    steps:
+      - { call: injectFaults, args: [ ok, 1 ], expect: { value: null } }
+      - { call: injectFaults, args: [ lostAck, 1 ], expect: { value: null } }
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { result: { id: paid } } ], expect: { error: { code: UNCERTAIN } } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: { $partial: { version: 2, data: { $partial: { state: completed, result: { id: paid } } } } } }, note: markUncertain never overwrites a completed row }
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { error: must not run } ], expect: { value: { id: paid } } }
+
+  - name: a store failure before the claim propagates and the work never runs
+    tags: [ store ]
+    steps:
+      - { call: injectFaults, args: [ error, 1 ], expect: { value: null } }
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { result: 1 } ], expect: { error: { message: Store unavailable } } }
+      - { call: calls, expect: { value: [] } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: null } }
+
+  - name: a conflicting claim whose row vanished fails closed
+    tags: [ store, concurrency ]
+    steps:
+      - { call: injectFaults, args: [ conflict, 1 ], expect: { value: null } }
+      - { call: execute, args: [ { scope: s, key: k, input: 1 }, { result: 1 } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: calls, expect: { value: [] } }
+
+  # --- concurrency ---------------------------------------------------------------------------
+  - name: a claim in progress answers PENDING, even to the same caller
+    tags: [ concurrency ]
+    steps:
+      - call: execute
+        args: [ { scope: s, key: k, input: 1 }, { result: done, during: [ { scope: s, key: k, input: 1 }, { result: again } ] } ]
+        expect: { value: done }
+      - call: calls
+        expect: { value: [ { input: 1, idempotencyKey: { $type: string }, during: { error: { code: PENDING, message: "RT-App idempotency: PENDING" } } } ] }
+
+  - name: a claim in progress with another input answers CONFLICT
+    tags: [ concurrency, conflict ]
+    steps:
+      - call: execute
+        args: [ { scope: s, key: k, input: 1 }, { result: done, during: [ { scope: s, key: k, input: 2 }, { result: again } ] } ]
+        expect: { value: done }
+      - call: calls
+        expect: { value: [ { input: 1, idempotencyKey: { $type: string }, during: { error: { code: CONFLICT, message: "RT-App idempotency: CONFLICT" } } } ] }
+
+  - name: nested operations with other keys run normally
+    tags: [ concurrency ]
+    steps:
+      - call: execute
+        args: [ { scope: s, key: outer, input: 1 }, { result: outer, during: [ { scope: s, key: inner, input: 2 }, { result: inner } ] } ]
+        expect: { value: outer }
+      - call: calls
+        expect:
+          value:
+            - { input: 1, idempotencyKey: { $type: string }, during: { value: inner } }
+            - { input: 2, idempotencyKey: { $type: string } }
+
+  - name: claims left by other workers block execution
+    tags: [ concurrency, interop ]
+    init:
+      now: "2026-01-02T03:04:05.678Z"
+      rows:
+        - { pk: "IDEMPOTENCY#s", sk: pending, version: 1, data: { fingerprint: a8b88b82fe90a16048eb8851fe382405395cd395dafaa7ca9be90ec00f82a72b, owner: other, state: pending, createdAt: "2026-01-01T00:00:00.000Z" } }
+        - { pk: "IDEMPOTENCY#s", sk: uncertain, version: 2, data: { fingerprint: a8b88b82fe90a16048eb8851fe382405395cd395dafaa7ca9be90ec00f82a72b, owner: other, state: uncertain, createdAt: "2026-01-01T00:00:00.000Z" } }
+        - { pk: "IDEMPOTENCY#s", sk: odd, version: 1, data: { fingerprint: a8b88b82fe90a16048eb8851fe382405395cd395dafaa7ca9be90ec00f82a72b, owner: other, state: reconciling, createdAt: "2026-01-01T00:00:00.000Z" } }
+        - { pk: "IDEMPOTENCY#s", sk: done, version: 2, data: { fingerprint: a8b88b82fe90a16048eb8851fe382405395cd395dafaa7ca9be90ec00f82a72b, owner: other, state: completed, result: { receipt: r-1 }, createdAt: "2026-01-01T00:00:00.000Z" } }
+    steps:
+      - { call: execute, args: [ { scope: s, key: pending, input: { amount: 10 } }, { result: 1 } ], expect: { error: { code: PENDING } } }
+      - { call: execute, args: [ { scope: s, key: uncertain, input: { amount: 10 } }, { result: 1 } ], expect: { error: { code: UNCERTAIN } } }
+      - { call: execute, args: [ { scope: s, key: odd, input: { amount: 10 } }, { result: 1 } ], expect: { error: { code: PENDING } }, note: unknown states are pending }
+      - { call: execute, args: [ { scope: s, key: done, input: { amount: 10 } }, { result: 1 } ], expect: { value: { receipt: r-1 } }, note: a row written by another language replays }
+      - { call: execute, args: [ { scope: s, key: done, input: { amount: 11 } }, { result: 1 } ], expect: { error: { code: CONFLICT } } }
+      - { call: calls, expect: { value: [] } }
+
+  # --- validation ----------------------------------------------------------------------------
+  - name: scope and key must be non-blank strings within their limits
+    tags: [ validation, edge ]
+    steps:
+      - { call: execute, args: [ { scope: "", key: k, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY, message: "RT-App idempotency: INVALID_KEY" } } }
+      - { call: execute, args: [ { scope: s, key: "", input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { scope: " \t\n", key: k, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { scope: 5, key: k, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { scope: s, key: 5, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { scope: s, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { key: k, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { scope: { $text: { repeat: x, count: 513 } }, key: k, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { scope: s, key: { $text: { repeat: x, count: 257 } }, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: calls, expect: { value: [] } }
+      - { call: execute, args: [ { scope: { $text: { repeat: x, count: 512 } }, key: { $text: { repeat: y, count: 256 } }, input: 1 }, { result: max } ], expect: { value: max } }
+
+  - name: blank means JavaScript trim, which removes NBSP, BOM and ideographic spaces
+    tags: [ validation, unicode ]
+    steps:
+      - { call: execute, args: [ { scope: "\u00a0\ufeff\u3000\u2028", key: k, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { scope: s, key: "\u2000\u200a\u205f", input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: execute, args: [ { scope: "\u200b", key: k, input: 1 }, { result: zwsp } ], expect: { value: zwsp }, note: U+200B is not whitespace }
+      - { call: execute, args: [ { scope: "\u0085", key: k, input: 1 }, { result: nel } ], expect: { value: nel }, note: U+0085 is not trimmed }
+      - { call: execute, args: [ { scope: "\u001f", key: k, input: 1 }, { result: us } ], expect: { value: us } }
+      - { call: execute, args: [ { scope: " padded ", key: " k ", input: 1 }, { result: padded } ], expect: { value: padded } }
+      - { call: row, args: [ "IDEMPOTENCY# padded ", " k " ], expect: { value: { $partial: { version: 2 } } }, note: scope and key are stored untrimmed }
+
+  - name: lengths count UTF-16 code units
+    tags: [ validation, unicode ]
+    steps:
+      - { call: execute, args: [ { scope: { $text: { repeat: "😀", count: 257 } }, key: k, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } }, note: 514 units }
+      - { call: execute, args: [ { scope: s, key: { $text: { repeat: "😀", count: 129 } }, input: 1 }, { result: 1 } ], expect: { error: { code: INVALID_KEY } }, note: 258 units }
+      - { call: execute, args: [ { scope: { $text: { repeat: "😀", count: 256 } }, key: { $text: { repeat: "😀", count: 128 } }, input: 1 }, { result: ok } ], expect: { value: ok } }
+      - { call: execute, args: [ { scope: { $text: { repeat: "é", count: 512 } }, key: { $text: { repeat: "é", count: 256 } }, input: 1 }, { result: ok } ], expect: { value: ok }, note: not UTF-8 bytes }
+
+  - name: a missing input is not JSON, and keys are checked first
+    tags: [ validation, edge ]
+    steps:
+      - { call: execute, args: [ { scope: s, key: k }, { result: 1 } ], expect: { error: { code: INVALID_JSON, message: "RT-App idempotency: INVALID_JSON" } } }
+      - { call: execute, args: [ { scope: "", key: k }, { result: 1 } ], expect: { error: { code: INVALID_KEY } } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: null } }
+      - { call: calls, expect: { value: [] } }
+
+  - name: an executor without a store is not configured
+    tags: [ validation ]
+    steps:
+      - { call: initUnconfigured, expect: { error: { code: NOT_CONFIGURED, message: "RT-App idempotency: NOT_CONFIGURED" } } }
+      - { call: executeUnconfigured, args: [ { scope: "", key: k, input: 1 } ], expect: { error: { code: NOT_CONFIGURED } }, note: checked before the key }
+
+  # --- canonical JSON ------------------------------------------------------------------------
+  - name: numbers are canonical JavaScript numbers
+    tags: [ canonical, numbers ]
+    steps:
+      - call: execute
+        args: [ { scope: s, key: k, input: { n: 1e+21, m: 1e-7, z: -0, big: 12345678901234567000, f: 1.5 } }, { result: 1 } ]
+        expect: { value: 1 }
+      - call: row
+        args: [ "IDEMPOTENCY#s", k ]
+        expect: { value: { $partial: { data: { $partial: { fingerprint: 5c22d9c3c72f6b02112dce1f24e1819355a98e708f87c9c4ce40be7b146655d2 } } } } }
+        note: 'sha256 of {"big":12345678901234567000,"f":1.5,"m":1e-7,"n":1e+21,"z":0}'
+      - call: calls
+        expect: { value: [ { input: { n: 1e+21, m: 1e-7, z: 0, big: 12345678901234567000, f: 1.5 }, idempotencyKey: { $type: string } } ] }
+      - call: execute
+        args: [ { scope: s, key: k, input: { big: 12345678901234567000, f: 1.50, m: 1e-7, n: 1e+21, z: 0 } }, { result: 2 } ]
+        expect: { value: 1 }
+        note: the same float64 values replay
+
+  - name: object keys sort by UTF-16 code units, not code points
+    tags: [ canonical, unicode ]
+    steps:
+      - { call: execute, args: [ { scope: s, key: k, input: { "！": 1, "😀": 2, a: 3 } }, { result: 1 } ], expect: { value: 1 } }
+      - call: row
+        args: [ "IDEMPOTENCY#s", k ]
+        expect: { value: { $partial: { data: { $partial: { fingerprint: 8b720842e3e0b138369301fb28d74fa4ee3ef131494632cec3e680d1447b430a } } } } }
+        note: 'sha256 of {"a":3,"😀":2,"！":1}: U+1F600 (D83D DE00) sorts before U+FF01'
+
+  - name: the idempotency key is JSON.stringify of [scope, key] as UTF-8
+    tags: [ canonical, unicode ]
+    steps:
+      - { call: execute, args: [ { scope: "tenant/é/😀\u2028</script>&", key: "k\n\t\u0001\u007f\"\\", input: { "\u2028": "\u007f<" } }, { result: 1 } ], expect: { value: 1 } }
+      - call: calls
+        expect: { value: [ { input: { "\u2028": "\u007f<" }, idempotencyKey: rtapp-f22f9cc87fa0e9c17848ea756f5dbd21c62f78d442fd27dcee129f9f21d69859 } ] }
+        note: 'JSON.stringify escapes only ", \\ and U+0000-U+001F (\n, \t, \u0001); not U+2028, DEL, <, > or &'
+      - call: row
+        args: [ "IDEMPOTENCY#tenant/é/😀\u2028</script>&", "k\n\t\u0001\u007f\"\\" ]
+        expect: { value: { $partial: { version: 2, data: { $partial: { fingerprint: 6cbdae1e2e12ed8443855f2dfa9d89399d92ae5d0898794e7e886c3f77a2390e } } } } }
+
+  # --- store surface -------------------------------------------------------------------------
+  - name: the store elects one owner and reports the state to others
+    tags: [ store, concurrency ]
+    steps:
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: a } ], expect: { value: { state: acquired } } }
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: b } ], expect: { value: { state: pending } } }
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: g, owner: b } ], expect: { value: { state: conflict } } }
+      - call: row
+        args: [ "IDEMPOTENCY#s", k ]
+        expect: { value: { pk: "IDEMPOTENCY#s", sk: k, version: 1, data: { fingerprint: f, owner: a, state: pending, createdAt: "2026-01-02T03:04:05.678Z" } } }
+
+  - name: only the owner with the same fingerprint may complete
+    tags: [ store ]
+    steps:
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: a } ], expect: { value: { state: acquired } } }
+      - { call: complete, args: [ { scope: s, key: k, fingerprint: f, owner: b }, 1 ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: complete, args: [ { scope: s, key: k, fingerprint: g, owner: a }, 1 ], expect: { error: { status: 409 } } }
+      - { call: complete, args: [ { scope: s, key: missing, fingerprint: f, owner: a }, 1 ], expect: { error: { status: 409 } } }
+      - { call: markUncertain, args: [ { scope: s, key: k, fingerprint: f, owner: b } ], expect: { error: { status: 409 } } }
+      - { call: setNow, args: [ "2026-02-03T04:05:06.007Z" ], expect: { value: null } }
+      - { call: complete, args: [ { scope: s, key: k, fingerprint: f, owner: a }, { ok: true } ], expect: { value: null } }
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: c } ], expect: { value: { state: completed, result: { ok: true } } } }
+      - call: row
+        args: [ "IDEMPOTENCY#s", k ]
+        expect: { value: { pk: "IDEMPOTENCY#s", sk: k, version: 2, data: { fingerprint: f, owner: a, state: completed, createdAt: "2026-01-02T03:04:05.678Z", updatedAt: "2026-02-03T04:05:06.007Z", result: { ok: true } } } }
+
+  - name: completed rows are final
+    tags: [ store ]
+    steps:
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: a } ], expect: { value: { state: acquired } } }
+      - { call: complete, args: [ { scope: s, key: k, fingerprint: f, owner: a }, first ], expect: { value: null } }
+      - { call: markUncertain, args: [ { scope: s, key: k, fingerprint: f, owner: a } ], expect: { value: null } }
+      - { call: complete, args: [ { scope: s, key: k, fingerprint: f, owner: a }, second ], expect: { value: null } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: { $partial: { version: 2, data: { $partial: { state: completed, result: first } } } } } }
+      - { call: complete, args: [ { scope: s, key: k, fingerprint: f, owner: b }, third ], expect: { error: { status: 409 } }, note: the owner is checked before the state }
+
+  - name: uncertain claims can be marked again or completed by their owner
+    tags: [ store, uncertain ]
+    steps:
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: a } ], expect: { value: { state: acquired } } }
+      - { call: markUncertain, args: [ { scope: s, key: k, fingerprint: f, owner: a } ], expect: { value: null } }
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: b } ], expect: { value: { state: uncertain } } }
+      - { call: markUncertain, args: [ { scope: s, key: k, fingerprint: f, owner: a } ], expect: { value: null } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: { $partial: { version: 3, data: { $partial: { state: uncertain } } } } } }
+      - { call: complete, args: [ { scope: s, key: k, fingerprint: f, owner: a }, null ], expect: { value: null } }
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: b } ], expect: { value: { state: completed, result: null } } }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: { $partial: { version: 4 } } } }
+
+  - name: a lost race between reading and writing surfaces as a conflict
+    tags: [ store, concurrency ]
+    steps:
+      - { call: claim, args: [ { scope: s, key: k, fingerprint: f, owner: a } ], expect: { value: { state: acquired } } }
+      - { call: injectFaults, args: [ conflict, 1 ], expect: { value: null } }
+      - { call: complete, args: [ { scope: s, key: k, fingerprint: f, owner: a }, 1 ], expect: { error: { status: 409 } }, note: no retry }
+      - { call: row, args: [ "IDEMPOTENCY#s", k ], expect: { value: { $partial: { version: 1 } } } }

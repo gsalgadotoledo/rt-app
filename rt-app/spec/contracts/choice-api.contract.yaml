@@ -1,0 +1,91 @@
+contract: 1
+kind: http
+module: choice-api
+title: Choice HTTP API (local mode)
+description: |
+  POST /choice/decide (resource choice.decide, access permission, explicitGrant) served in local
+  mode, so it is mounted under /admin/app and runs as the local owner. The body is the Choice
+  input; the policy is always the default (minProbability 0.8, minMargin 0.1, calibrated only).
+
+  Every API that runs this contract composes Choice with the same local development provider
+  (id "local", never for production): when the context is an object with a "prediction" field,
+  that field is returned as the provider response ("fail" makes the provider throw); otherwise
+  every option gets 1/n as uncalibrated scores (model "local"), so the decision abstains.
+  Validation errors are 400; an invalid provider response or a provider failure is a 500
+  "Internal error" that never reveals the provider message. Bodies are limited to 16 KiB (413).
+cases:
+  - name: without a prediction the local provider abstains
+    requests:
+      - request: { method: POST, path: /admin/app/choice/decide, body: { context: Refund please, question: Which team?, options: [ { id: billing, description: Invoices }, { id: sales } ] } }
+        expect: { status: 200, body: { provider: local, model: local, semantics: uncalibrated-scores, probabilities: { billing: 0.5, sales: 0.5 }, selected: billing, accepted: false, requiresReview: true } }
+      - request: { method: POST, path: /admin/app/choice/decide, body: { question: Which team?, options: [ { id: a }, { id: b }, { id: c } ] } }
+        expect: { status: 200, body: { provider: local, model: local, semantics: uncalibrated-scores, probabilities: { a: 0.3333333333333333, b: 0.3333333333333333, c: 0.3333333333333333 }, selected: a, accepted: false, requiresReview: true } }
+
+  - name: a confident calibrated prediction is accepted
+    requests:
+      - request:
+          method: POST
+          path: /admin/app/choice/decide
+          body: { context: { prediction: { probabilities: { billing: 0.9, sales: 0.1 }, model: m1, semantics: model-probabilities, confidence: 0.7 } }, question: Which team?, options: [ { id: billing }, { id: sales } ] }
+        expect: { status: 200, body: { provider: local, probabilities: { billing: 0.9, sales: 0.1 }, confidence: 0.7, model: m1, semantics: model-probabilities, selected: billing, accepted: true, requiresReview: false } }
+
+  - name: the default policy applies over HTTP
+    tags: [ edge, numbers ]
+    requests:
+      - request:
+          method: POST
+          path: /admin/app/choice/decide
+          body: { context: { prediction: { probabilities: { a: 0.79, b: 0.21 }, model: m, semantics: model-probabilities } }, question: q, options: [ { id: a }, { id: b } ] }
+        expect: { status: 200, body: { $partial: { selected: a, accepted: false, requiresReview: true } } }
+      - request:
+          method: POST
+          path: /admin/app/choice/decide
+          body: { context: { prediction: { probabilities: { a: 0.8, b: 0.2 }, model: m, semantics: model-probabilities } }, question: q, options: [ { id: a }, { id: b } ] }
+        expect: { status: 200, body: { $partial: { selected: a, accepted: true } } }
+      - request:
+          method: POST
+          path: /admin/app/choice/decide
+          body: { context: { prediction: { probabilities: { a: 0.99, b: 0.01 }, model: m, semantics: uncalibrated-scores } }, question: q, options: [ { id: a }, { id: b } ], allowUncalibrated: true }
+        expect: { status: 200, body: { $partial: { selected: a, accepted: false } } }
+
+  - name: invalid input is 400
+    tags: [ validation ]
+    requests:
+      - { request: { method: POST, path: /admin/app/choice/decide, body: {} }, expect: { status: 400, body: { error: Invalid choice question or options } } }
+      - { request: { method: POST, path: /admin/app/choice/decide }, expect: { status: 400, body: { error: Invalid choice question or options } } }
+      - { request: { method: POST, path: /admin/app/choice/decide, body: { question: "  ", options: [ { id: a }, { id: b } ] } }, expect: { status: 400, body: { error: Invalid choice question or options } } }
+      - { request: { method: POST, path: /admin/app/choice/decide, body: { question: q, options: [ { id: a } ] } }, expect: { status: 400, body: { error: Invalid choice question or options } } }
+      - { request: { method: POST, path: /admin/app/choice/decide, body: { question: q, options: [ { id: a }, { id: a } ] } }, expect: { status: 400, body: { error: Invalid or duplicate option } } }
+      - { request: { method: POST, path: /admin/app/choice/decide, body: { question: q, options: [ { id: "a b" }, { id: c } ] } }, expect: { status: 400, body: { error: Invalid or duplicate option } } }
+      - { request: { method: POST, path: /admin/app/choice/decide, body: { question: q, options: [ { id: a, description: null }, { id: c } ] } }, expect: { status: 400, body: { error: Invalid or duplicate option } } }
+
+  - name: provider failures are private 500s
+    tags: [ provider, security ]
+    requests:
+      - request: { method: POST, path: /admin/app/choice/decide, body: { context: { prediction: fail }, question: q, options: [ { id: a }, { id: b } ] } }
+        expect: { status: 500, body: { error: Internal error } }
+      - request: { method: POST, path: /admin/app/choice/decide, body: { context: { prediction: { probabilities: { a: 0.5, b: 0.2 }, model: m, semantics: model-probabilities } }, question: q, options: [ { id: a }, { id: b } ] } }
+        expect: { status: 500, body: { error: Internal error } }
+      - request: { method: POST, path: /admin/app/choice/decide, body: { context: { prediction: null }, question: q, options: [ { id: a }, { id: b } ] } }
+        expect: { status: 500, body: { error: Internal error } }
+      - request: { method: POST, path: /admin/app/choice/decide, body: { context: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities, confidence: null } }, question: q, options: [ { id: a }, { id: b } ] } }
+        expect: { status: 500, body: { error: Internal error } }
+
+  - name: bodies must be JSON objects of at most 16 KiB
+    tags: [ edge, validation ]
+    requests:
+      - { request: { method: POST, path: /admin/app/choice/decide, raw: "{bad" }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - { request: { method: POST, path: /admin/app/choice/decide, body: [ 1 ] }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - request: { method: POST, path: /admin/app/choice/decide, body: { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: x, count: 17000 } } } }
+        expect: { status: 413, body: { error: Request body too large } }
+
+  - name: outside /admin/app the caller must be signed in
+    tags: [ security ]
+    requests:
+      - { request: { method: POST, path: /choice/decide, body: { question: q, options: [ { id: a }, { id: b } ] } }, expect: { status: 401, body: { error: Sign in } } }
+
+  - name: only POST is routed
+    tags: [ edge ]
+    requests:
+      - { request: { method: GET, path: /admin/app/choice/decide }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: PUT, path: /admin/app/choice/decide, body: {} }, expect: { status: 404, body: { error: Endpoint not found } } }

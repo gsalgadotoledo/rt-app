@@ -1,0 +1,376 @@
+contract: 1
+module: cache
+title: Cache (Cache facade over MemoryCache, NoSQLCache, FileCache and DynamoCache)
+description: |
+  `new Cache(adapter)`: get/set/delete pass through to the adapter; remember(namespace, input,
+  ttlMs, load) is cache-aside keyed by contentKey(namespace, input). Every case without an explicit
+  subject runs on every adapter; the adapter-specific rules are in cache-nosql.contract.yaml and in
+  the cache-memory cases below.
+
+  - canonical(value): JSON with object keys sorted by UTF-16 code units and JSON.stringify strings
+    and numbers (1e+21, 1e-7, -0 → 0). Non-JSON values throw "Cache requires finite, acyclic JSON
+    values" (non-plain objects: "Cache accepts plain objects only").
+  - contentKey(namespace, input) = namespace + ":" + sha256hex(utf8(canonical(input))); the namespace
+    must match ^[a-zA-Z0-9:._-]{1,100}$ (end of string only, no trailing newline) or it throws
+    "Invalid cache namespace".
+  - validateEntry(key, ttlMs): key non-empty and at most 240 UTF-16 units, ttlMs a safe integer in
+    [1, 2592000000] (30 days), else "Cache needs a key and TTL between 1 ms and 30 days".
+  - set validates the entry, then the value: the UTF-8 byte length of canonical(value) must be at
+    most 64000 ("Cache values are limited to 64 KB"). A rejected set changes nothing. Values are
+    stored as JSON.parse(canonical(value)). get and delete never validate the key.
+  - An entry expires when expires <= now (expires = now at set + ttlMs); expired entries read as
+    misses. A cached null or false is a hit.
+  - remember: contentKey, validateEntry, adapter get (a hit returns without loading), then one
+    shared in-flight load per key in this process; the loaded value is set with the TTL and
+    returned. A failed load or failed set is not cached and the next call loads again.
+  Errors are TypeErrors without status (store errors propagate unchanged).
+
+  Facade (subjects cache-memory, cache-nosql, cache-file, cache-dynamodb): init {now: epoch ms
+  (default 4102444800000), capacity? (memory), namespace? (nosql/file/dynamodb), rows? (nosql)}.
+  get(key) → {hit:false} | {hit:true, value} (wire null cannot tell a miss from a cached null);
+  set, delete → null; remember(namespace, input, ttlMs, outcome) where the loader returns
+  outcome.value or throws Error(outcome.error); loads() counts loader calls;
+  rememberConcurrently(namespace, input, ttlMs, value, count) runs count concurrent remember calls
+  whose loader takes 50 ms → {loads, results}; canonical, contentKey, validateEntry (→ null);
+  setNow(ms).
+subjects: [ cache-memory, cache-nosql, cache-file, cache-dynamodb ]
+optionalSubjects: [ cache-dynamodb ]
+init: { now: 4102444800000 }
+cases:
+  # --- get / set / delete --------------------------------------------------------------------
+  - name: missing keys are misses
+    call: get
+    args: [ missing ]
+    expect: { value: { hit: false } }
+
+  - name: every JSON value round-trips, and null and false are hits
+    steps:
+      - { call: set, args: [ "null", null, 1000 ], expect: { value: null } }
+      - { call: set, args: [ "false", false, 1000 ], expect: { value: null } }
+      - { call: set, args: [ zero, 0, 1000 ], expect: { value: null } }
+      - { call: set, args: [ empty, "", 1000 ], expect: { value: null } }
+      - { call: set, args: [ list, [], 1000 ], expect: { value: null } }
+      - { call: set, args: [ object, {}, 1000 ], expect: { value: null } }
+      - { call: set, args: [ nested, { b: [ 1.5, { d: null, c: true } ], a: "é😀" }, 1000 ], expect: { value: null } }
+      - { call: get, args: [ "null" ], expect: { value: { hit: true, value: null } } }
+      - { call: get, args: [ "false" ], expect: { value: { hit: true, value: false } } }
+      - { call: get, args: [ zero ], expect: { value: { hit: true, value: 0 } } }
+      - { call: get, args: [ empty ], expect: { value: { hit: true, value: "" } } }
+      - { call: get, args: [ list ], expect: { value: { hit: true, value: [] } } }
+      - { call: get, args: [ object ], expect: { value: { hit: true, value: {} } } }
+      - { call: get, args: [ nested ], expect: { value: { hit: true, value: { a: "é😀", b: [ 1.5, { c: true, d: null } ] } } } }
+
+  - name: numbers keep their float64 values
+    tags: [ numbers ]
+    steps:
+      - { call: set, args: [ n, [ 1e21, 0.0000001, -0, 12345678901234567890, 0.1, 9007199254740993 ], 1000 ], expect: { value: null } }
+      - { call: get, args: [ n ], expect: { value: { hit: true, value: [ 1e21, 1e-7, 0, 12345678901234567000, 0.1, 9007199254740992 ] } } }
+
+  - name: set replaces the value and the TTL
+    steps:
+      - { call: set, args: [ k, 1, 1000 ], expect: { value: null } }
+      - { call: set, args: [ k, 2, 10 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: 2 } } }
+      - { call: setNow, args: [ 4102444800010 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } }, note: the new, shorter TTL applies }
+
+  - name: delete removes a key, and deleting an absent key succeeds
+    steps:
+      - { call: set, args: [ k, v, 1000 ], expect: { value: null } }
+      - { call: delete, args: [ k ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } } }
+      - { call: delete, args: [ k ], expect: { value: null } }
+      - { call: delete, args: [ never-set ], expect: { value: null } }
+
+  - name: keys are exact strings
+    tags: [ unicode ]
+    steps:
+      - { call: set, args: [ Key, upper, 1000 ], expect: { value: null } }
+      - { call: set, args: [ " key", space, 1000 ], expect: { value: null } }
+      - { call: set, args: [ "é😀", unicode, 1000 ], expect: { value: null } }
+      - { call: get, args: [ key ], expect: { value: { hit: false } } }
+      - { call: get, args: [ Key ], expect: { value: { hit: true, value: upper } } }
+      - { call: get, args: [ " key" ], expect: { value: { hit: true, value: space } } }
+      - { call: get, args: [ "e\u0301😀" ], expect: { value: { hit: false } }, note: no Unicode normalization }
+      - { call: get, args: [ "é😀" ], expect: { value: { hit: true, value: unicode } } }
+
+  # --- expiry --------------------------------------------------------------------------------
+  - name: entries expire when now reaches set time plus TTL
+    tags: [ ttl ]
+    steps:
+      - { call: set, args: [ k, v, 100 ], expect: { value: null } }
+      - { call: setNow, args: [ 4102444800099 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: v } } }
+      - { call: setNow, args: [ 4102444800100 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } }, note: expires <= now is expired }
+      - { call: set, args: [ k, again, 1 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: again } } }
+      - { call: setNow, args: [ 4102444800101 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } }, note: the shortest TTL is 1 ms }
+
+  - name: TTLs are whole milliseconds from 1 ms to 30 days
+    tags: [ ttl, validation ]
+    steps:
+      - { call: set, args: [ k, 1, 0 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, -1 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, 1.5 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, 2592000001 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, 9007199254740992 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, "100" ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, true ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ k, 1, null ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } }, note: nothing was stored }
+      - { call: set, args: [ k, 1, 2592000000 ], expect: { value: null } }
+      - { call: set, args: [ k, 1, 1.0 ], expect: { value: null }, note: JSON cannot tell 1.0 from 1 }
+      - { call: setNow, args: [ 4105036799999 ], expect: { value: null } }
+      - { call: set, args: [ month, 1, 2592000000 ], expect: { value: null } }
+      - { call: setNow, args: [ 4107628799998 ], expect: { value: null } }
+      - { call: get, args: [ month ], expect: { value: { hit: true, value: 1 } } }
+      - { call: setNow, args: [ 4107628799999 ], expect: { value: null } }
+      - { call: get, args: [ month ], expect: { value: { hit: false } } }
+
+  # --- validation ----------------------------------------------------------------------------
+  - name: keys are non-empty and at most 240 UTF-16 units
+    tags: [ validation, unicode ]
+    steps:
+      - { call: set, args: [ "", 1, 1000 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ { $text: { repeat: k, count: 241 } }, 1, 1000 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: set, args: [ { $text: { repeat: "😀", count: 121 } }, 1, 1000 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } }, note: 242 UTF-16 units }
+      - { call: set, args: [ { $text: { repeat: k, count: 240 } }, long, 1000 ], expect: { value: null } }
+      - { call: set, args: [ { $text: { repeat: "😀", count: 120 } }, emoji, 1000 ], expect: { value: null } }
+      - { call: set, args: [ { $text: { repeat: "é", count: 240 } }, accents, 1000 ], expect: { value: null }, note: 480 UTF-8 bytes are fine }
+      - { call: get, args: [ { $text: { repeat: "😀", count: 120 } } ], expect: { value: { hit: true, value: emoji } } }
+      - { call: set, args: [ " ", space, 1000 ], expect: { value: null }, note: blank keys are allowed }
+
+  - name: get and delete do not validate keys
+    tags: [ validation, edge ]
+    steps:
+      - { call: get, args: [ "" ], expect: { value: { hit: false } } }
+      - { call: get, args: [ { $text: { repeat: k, count: 300 } } ], expect: { value: { hit: false } } }
+      - { call: delete, args: [ "" ], expect: { value: null } }
+      - { call: delete, args: [ { $text: { repeat: k, count: 300 } } ], expect: { value: null } }
+
+  - name: values are limited to 64000 UTF-8 bytes of canonical JSON
+    tags: [ validation, unicode ]
+    steps:
+      - { call: set, args: [ ascii, { $text: { repeat: x, count: 63998 } }, 1000 ], expect: { value: null }, note: 63998 characters plus two quotes }
+      - { call: set, args: [ ascii, { $text: { repeat: x, count: 63999 } }, 1000 ], expect: { error: { message: Cache values are limited to 64 KB } } }
+      - { call: get, args: [ ascii ], expect: { value: { hit: true, value: { $length: 63998 } } }, note: a rejected set keeps the previous value }
+      - { call: set, args: [ accents, { $text: { repeat: "é", count: 31999 } }, 1000 ], expect: { value: null } }
+      - { call: set, args: [ accents, { $text: { repeat: "é", count: 32000 } }, 1000 ], expect: { error: { message: Cache values are limited to 64 KB } }, note: 64002 bytes, 32002 UTF-16 units }
+      - { call: set, args: [ escapes, { $text: { repeat: "\n", count: 31999 } }, 1000 ], expect: { value: null }, note: each newline is written as two bytes }
+      - { call: set, args: [ escapes, { $text: { repeat: "\n", count: 32000 } }, 1000 ], expect: { error: { message: Cache values are limited to 64 KB } } }
+      - { call: set, args: [ "", { $text: { repeat: x, count: 70000 } }, 1000 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } }, note: the entry is checked before the value }
+
+  # --- remember ------------------------------------------------------------------------------
+  - name: remember loads on a miss and serves hits without loading
+    tags: [ remember ]
+    steps:
+      - { call: remember, args: [ "user:42", { page: 1 }, 1000, { value: [ item ] } ], expect: { value: [ item ] } }
+      - { call: remember, args: [ "user:42", { page: 1 }, 1000, { value: [ other ] } ], expect: { value: [ item ] } }
+      - { call: remember, args: [ "user:42", { page: 1 }, 1000, { error: must not load } ], expect: { value: [ item ] } }
+      - { call: loads, expect: { value: 1 } }
+
+  - name: remember keys are the namespace and the canonical input
+    tags: [ remember, canonical ]
+    steps:
+      - { call: remember, args: [ ns, { a: 1, b: [ 1, 2 ] }, 1000, { value: first } ], expect: { value: first } }
+      - { call: remember, args: [ ns, { b: [ 1, 2 ], a: 1 }, 1000, { value: second } ], expect: { value: first }, note: key order does not matter }
+      - { call: remember, args: [ ns, { a: 1, b: [ 2, 1 ] }, 1000, { value: third } ], expect: { value: third }, note: array order does matter }
+      - { call: remember, args: [ other, { a: 1, b: [ 1, 2 ] }, 1000, { value: fourth } ], expect: { value: fourth } }
+      - { call: remember, args: [ ns, "1", 1000, { value: string } ], expect: { value: string } }
+      - { call: remember, args: [ ns, 1, 1000, { value: number } ], expect: { value: number } }
+      - { call: loads, expect: { value: 5 } }
+
+  - name: remember reads what set wrote under contentKey
+    tags: [ remember, interop ]
+    steps:
+      - { call: contentKey, args: [ "tenant-1:products", { page: 1 } ], expect: { value: "tenant-1:products:70fb0185588d2e765454a7927f2792ae2b6faa2516781deb69864246e0803d05" } }
+      - { call: set, args: [ { $ref: "0.value" }, seeded, 1000 ], expect: { value: null } }
+      - { call: remember, args: [ "tenant-1:products", { page: 1 }, 1000, { value: loaded } ], expect: { value: seeded } }
+      - { call: remember, args: [ "tenant-1:products", { page: 2 }, 1000, { value: loaded } ], expect: { value: loaded } }
+      - { call: get, args: [ { $ref: "0.value" } ], expect: { value: { hit: true, value: seeded } } }
+      - { call: loads, expect: { value: 1 } }
+
+  - name: remember caches null and false
+    tags: [ remember, edge ]
+    steps:
+      - { call: remember, args: [ ns, 1, 1000, { value: null } ], expect: { value: null } }
+      - { call: remember, args: [ ns, 1, 1000, { value: loaded } ], expect: { value: null } }
+      - { call: remember, args: [ ns, 2, 1000, { value: false } ], expect: { value: false } }
+      - { call: remember, args: [ ns, 2, 1000, { value: loaded } ], expect: { value: false } }
+      - { call: loads, expect: { value: 2 } }
+
+  - name: failed loads are not cached
+    tags: [ remember ]
+    steps:
+      - { call: remember, args: [ ns, 1, 1000, { error: load failed } ], expect: { error: { message: load failed } } }
+      - { call: remember, args: [ ns, 1, 1000, { value: 7 } ], expect: { value: 7 } }
+      - { call: loads, expect: { value: 2 } }
+
+  - name: loaded values that cannot be cached fail and are not kept
+    tags: [ remember, validation ]
+    steps:
+      - { call: remember, args: [ ns, 1, 1000, { value: { $text: { repeat: x, count: 64000 } } } ], expect: { error: { message: Cache values are limited to 64 KB } } }
+      - { call: remember, args: [ ns, 1, 1000, { value: small } ], expect: { value: small } }
+      - { call: loads, expect: { value: 2 } }
+
+  - name: remember reloads after the TTL
+    tags: [ remember, ttl ]
+    steps:
+      - { call: remember, args: [ ns, 1, 100, { value: old } ], expect: { value: old } }
+      - { call: setNow, args: [ 4102444800099 ], expect: { value: null } }
+      - { call: remember, args: [ ns, 1, 100, { value: new } ], expect: { value: old } }
+      - { call: setNow, args: [ 4102444800100 ], expect: { value: null } }
+      - { call: remember, args: [ ns, 1, 100, { value: new } ], expect: { value: new } }
+      - { call: loads, expect: { value: 2 } }
+
+  - name: remember validates the namespace and TTL before loading
+    tags: [ remember, validation ]
+    steps:
+      - { call: remember, args: [ "bad namespace", 1, 1000, { value: 1 } ], expect: { error: { message: Invalid cache namespace } } }
+      - { call: remember, args: [ "", 1, 1000, { value: 1 } ], expect: { error: { message: Invalid cache namespace } } }
+      - { call: remember, args: [ ns, 1, 0, { value: 1 } ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: remember, args: [ ns, 1, 2592000001, { value: 1 } ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: loads, expect: { value: 0 } }
+
+  - name: concurrent callers share one load
+    tags: [ remember, concurrency ]
+    steps:
+      - call: rememberConcurrently
+        args: [ ns, { id: 1 }, 1000, { a: 1 }, 5 ]
+        expect: { value: { loads: 1, results: [ { a: 1 }, { a: 1 }, { a: 1 }, { a: 1 }, { a: 1 } ] } }
+      - { call: remember, args: [ ns, { id: 1 }, 1000, { value: other } ], expect: { value: { a: 1 } } }
+
+  # --- pure functions (one subject) ----------------------------------------------------------
+  - name: canonical JSON sorts keys by UTF-16 code units
+    subject: cache-memory
+    tags: [ canonical, unicode ]
+    steps:
+      - { call: canonical, args: [ [ null, false, 12, { z: 1, a: x } ] ], expect: { value: '[null,false,12,{"a":"x","z":1}]' } }
+      - { call: canonical, args: [ { "！": 1, "😀": 2, a: 3, "": 0, "\u2028": "\u007f\n\u0001" } ], expect: { value: "{\"\":0,\"a\":3,\"\u2028\":\"\u007f\\n\\u0001\",\"😀\":2,\"！\":1}" } }
+      - { call: canonical, args: [ "</script>&\"\\\t" ], expect: { value: "\"</script>&\\\"\\\\\\t\"" } }
+      - { call: canonical, args: [ {} ], expect: { value: "{}" } }
+      - { call: canonical, args: [ [] ], expect: { value: "[]" } }
+      - { call: canonical, args: [ null ], expect: { value: "null" } }
+
+  - name: canonical numbers are JavaScript Number to String
+    subject: cache-memory
+    tags: [ canonical, numbers ]
+    call: canonical
+    args: [ [ 1e21, 0.0000001, -0, 12345678901234567890, 0.1, -1.5e-10, 123e20, 9007199254740993, 1.0, 100, 1e-6, 123456789012345680000 ] ]
+    expect: { value: "[1e+21,1e-7,0,12345678901234567000,0.1,-1.5e-10,1.23e+22,9007199254740992,1,100,0.000001,123456789012345680000]" }
+
+  - name: contentKey is the namespace and the sha256 of the canonical input
+    subject: cache-memory
+    tags: [ canonical ]
+    steps:
+      - { call: contentKey, args: [ "tenant-1:products", { page: 1 } ], expect: { value: "tenant-1:products:70fb0185588d2e765454a7927f2792ae2b6faa2516781deb69864246e0803d05" } }
+      - { call: contentKey, args: [ n, { b: [ 1, { d: null, c: true } ], a: "é" } ], expect: { value: "n:419018b114d9c9219b9a1c2662a692fae509085787bd07f914579861ae91747f" } }
+      - { call: contentKey, args: [ n, { a: "é", b: [ 1, { c: true, d: null } ] } ], expect: { value: "n:419018b114d9c9219b9a1c2662a692fae509085787bd07f914579861ae91747f" } }
+
+  - name: namespaces are 1 to 100 ASCII letters, digits and ":._-"
+    subject: cache-memory
+    tags: [ validation ]
+    steps:
+      - { call: contentKey, args: [ "aZ09:._-", 1 ], expect: { value: { $regex: "^aZ09:\\._-:[0-9a-f]{64}$" } } }
+      - { call: contentKey, args: [ { $text: { repeat: n, count: 100 } }, 1 ], expect: { value: { $regex: "^n{100}:[0-9a-f]{64}$" } } }
+      - { call: contentKey, args: [ { $text: { repeat: n, count: 101 } }, 1 ], expect: { error: { message: Invalid cache namespace } } }
+      - { call: contentKey, args: [ "", 1 ], expect: { error: { message: Invalid cache namespace } } }
+      - { call: contentKey, args: [ "a/b", 1 ], expect: { error: { message: Invalid cache namespace } } }
+      - { call: contentKey, args: [ "a b", 1 ], expect: { error: { message: Invalid cache namespace } } }
+      - { call: contentKey, args: [ "é", 1 ], expect: { error: { message: Invalid cache namespace } } }
+      - { call: contentKey, args: [ "a\n", 1 ], expect: { error: { message: Invalid cache namespace } }, note: "$ matches only at the end of the string" }
+      - { call: contentKey, args: [ "\na", 1 ], expect: { error: { message: Invalid cache namespace } } }
+      - { call: contentKey, args: [ "ns#1", 1 ], expect: { error: { message: Invalid cache namespace } } }
+
+  - name: validateEntry checks the key and the TTL
+    subject: cache-memory
+    tags: [ validation ]
+    steps:
+      - { call: validateEntry, args: [ k, 1 ], expect: { value: null } }
+      - { call: validateEntry, args: [ { $text: { repeat: k, count: 240 } }, 2592000000 ], expect: { value: null } }
+      - { call: validateEntry, args: [ "", 1 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: validateEntry, args: [ k, 0 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+
+  # --- MemoryCache ---------------------------------------------------------------------------
+  - name: the least recently used entry is evicted beyond capacity
+    subject: cache-memory
+    tags: [ memory, lru ]
+    init: { now: 4102444800000, capacity: 2 }
+    steps:
+      - { call: set, args: [ a, 1, 1000 ], expect: { value: null } }
+      - { call: set, args: [ b, 2, 1000 ], expect: { value: null } }
+      - { call: get, args: [ a ], expect: { value: { hit: true, value: 1 } }, note: reading refreshes a }
+      - { call: set, args: [ c, 3, 1000 ], expect: { value: null } }
+      - { call: get, args: [ b ], expect: { value: { hit: false } } }
+      - { call: get, args: [ a ], expect: { value: { hit: true, value: 1 } } }
+      - { call: get, args: [ c ], expect: { value: { hit: true, value: 3 } } }
+
+  - name: overwriting an entry makes it the most recent
+    subject: cache-memory
+    tags: [ memory, lru ]
+    init: { now: 4102444800000, capacity: 2 }
+    steps:
+      - { call: set, args: [ a, 1, 1000 ], expect: { value: null } }
+      - { call: set, args: [ b, 2, 1000 ], expect: { value: null } }
+      - { call: set, args: [ a, 10, 1000 ], expect: { value: null } }
+      - { call: set, args: [ c, 3, 1000 ], expect: { value: null } }
+      - { call: get, args: [ b ], expect: { value: { hit: false } } }
+      - { call: get, args: [ a ], expect: { value: { hit: true, value: 10 } } }
+
+  - name: expired entries are dropped before live ones are evicted
+    subject: cache-memory
+    tags: [ memory, lru, ttl ]
+    init: { now: 4102444800000, capacity: 2 }
+    steps:
+      - { call: set, args: [ short, 1, 10 ], expect: { value: null } }
+      - { call: set, args: [ long, 2, 1000 ], expect: { value: null } }
+      - { call: setNow, args: [ 4102444800010 ], expect: { value: null } }
+      - { call: set, args: [ new, 3, 1000 ], expect: { value: null } }
+      - { call: get, args: [ long ], expect: { value: { hit: true, value: 2 } }, note: the expired entry made room }
+      - { call: get, args: [ new ], expect: { value: { hit: true, value: 3 } } }
+
+  - name: reading an expired entry deletes it
+    subject: cache-memory
+    tags: [ memory, ttl ]
+    steps:
+      - { call: set, args: [ k, v, 100 ], expect: { value: null } }
+      - { call: setNow, args: [ 4102444800100 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } } }
+      - { call: setNow, args: [ 4102444800050 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } }, note: a clock moving back does not revive it (NoSQL adapters differ) }
+
+  - name: a zero capacity is rejected
+    subject: cache-memory
+    tags: [ memory, validation ]
+    init: { capacity: 0 }
+    create: { error: { message: Invalid cache capacity } }
+
+  - name: a negative capacity is rejected
+    subject: cache-memory
+    tags: [ memory, validation ]
+    init: { capacity: -1 }
+    create: { error: { message: Invalid cache capacity } }
+
+  - name: a fractional capacity is rejected
+    subject: cache-memory
+    tags: [ memory, validation ]
+    init: { capacity: 1.5 }
+    create: { error: { message: Invalid cache capacity } }
+
+  - name: a string capacity is rejected
+    subject: cache-memory
+    tags: [ memory, validation ]
+    init: { capacity: "2" }
+    create: { error: { message: Invalid cache capacity } }
+
+  - name: a capacity of one keeps only the latest entry
+    subject: cache-memory
+    tags: [ memory, lru ]
+    init: { now: 4102444800000, capacity: 1 }
+    steps:
+      - { call: set, args: [ a, 1, 1000 ], expect: { value: null } }
+      - { call: set, args: [ b, 2, 1000 ], expect: { value: null } }
+      - { call: get, args: [ a ], expect: { value: { hit: false } } }
+      - { call: get, args: [ b ], expect: { value: { hit: true, value: 2 } } }

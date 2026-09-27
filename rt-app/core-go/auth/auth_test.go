@@ -139,7 +139,7 @@ func TestHTTPFlows(t *testing.T) {
 	if code, body := s.call(t, "GET", "/users/me", "garbage", nil); code != 401 || body["error"] != "Invalid or expired session" {
 		t.Fatalf("bad token: %d %v", code, body)
 	}
-	if code, _ := s.call(t, "GET", "/admin/app/users", token, nil); code != 403 {
+	if code, _ := s.call(t, "GET", "/users", token, nil); code != 403 {
 		t.Fatalf("users.list without the grant: %d", code)
 	}
 
@@ -147,7 +147,7 @@ func TestHTTPFlows(t *testing.T) {
 	_, ownerSession := s.call(t, "POST", "/auth/login", "", map[string]any{"email": "owner@example.test", "password": "correct horse battery"})
 	ownerToken := ownerSession["token"].(string)
 	aliceID := session["user"].(map[string]any)["id"].(string)
-	if code, body := s.call(t, "PUT", "/admin/app/acl/users/"+aliceID, ownerToken, map[string]any{"role": "user", "grants": []string{"users.list"}}); code != 200 {
+	if code, body := s.call(t, "PUT", "/acl/users/"+aliceID, ownerToken, map[string]any{"role": "user", "grants": []string{"users.list"}}); code != 200 {
 		t.Fatalf("assign: %d %v", code, body)
 	}
 	if code, _ := s.call(t, "GET", "/users/me", token, nil); code != 401 {
@@ -164,7 +164,7 @@ func TestHTTPFlows(t *testing.T) {
 		t.Fatalf("code verify: %d %v", code, session)
 	}
 	token = session["token"].(string)
-	if code, list := s.call(t, "GET", "/admin/app/users?email=ALICE", token, nil); code != 200 || len(list["items"].([]any)) != 1 {
+	if code, list := s.call(t, "GET", "/users?email=ALICE", token, nil); code != 200 || len(list["items"].([]any)) != 1 {
 		t.Fatalf("users.list with the grant: %d %v", code, list)
 	}
 
@@ -186,7 +186,7 @@ func TestHTTPFlows(t *testing.T) {
 	if code, body := s.call(t, "POST", "/auth/mfa/verify", "", map[string]any{"challengeId": pending["challengeId"], "code": totp}); code != 200 || body["token"] == nil {
 		t.Fatalf("verify: %d %v", code, body)
 	}
-	if code, body := s.call(t, "PUT", "/admin/app/auth/settings", ownerToken, map[string]any{"version": 0, "values": map[string]any{"passwordLogin": false, "emailCodeLogin": true}}); code != 409 {
+	if code, body := s.call(t, "PUT", "/auth/settings", ownerToken, map[string]any{"version": 0, "values": map[string]any{"passwordLogin": false, "emailCodeLogin": true}}); code != 409 {
 		t.Fatalf("disabling passwords with MFA on: %d %v", code, body)
 	}
 	if code, methods := s.call(t, "GET", "/auth/methods", "", nil); code != 200 || methods["provider"] != "local" || methods["passwordLogin"] != true {

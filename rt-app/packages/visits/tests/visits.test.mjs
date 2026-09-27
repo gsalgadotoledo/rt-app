@@ -28,3 +28,10 @@ test('browser geometry never reads text or form values, respects excluded elemen
  const value=visitPoint('click',{clientX:50,clientY:25,target:{closest:()=>false},password:'never'},'/',1,{width:100,height:100,scroll:0});
  assert.deepEqual(value,{type:'click',path:'/',t:1,x:50,y:25});assert.doesNotMatch(JSON.stringify(value),/password|never/);
 });
+test('an injected id generator makes tokens deterministic',async()=>{
+ const ids=['00000000-0000-4000-8000-000000000001'],visits=new Visits(memory(),'s'.repeat(64),undefined,()=>1000,()=>ids.shift());
+ const {token}=visits.start('test');
+ assert.equal(token.split('.')[0],Buffer.from('{"id":"00000000-0000-4000-8000-000000000001","startedAt":1000}').toString('base64url'));
+ await visits.ingest({token,sequence:1,points:[point]},'test');
+ assert.equal((await visits.list()).items[0].id,'00000000-0000-4000-8000-000000000001');
+});

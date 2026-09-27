@@ -66,14 +66,17 @@ class DispatchTests(unittest.TestCase):
 
         closed = make_app()
         response = self.call(closed, "GET", "/admin/app/feature-flags")
-        self.assertEqual((response.status, response.body), (401, {"error": "Sign in"}))
+        self.assertEqual((response.status, response.body), (401, {"error": "Sign in to admin"}))
 
         users = {"u": {"id": "u", "role": "user", "grants": ["reports.read"]}, "o": {"id": "o", "role": "owner"}}
         auth = make_app(authenticate=lambda r: users.get(r.headers.get("authorization", "")))
         self.assertEqual(self.call(auth, "GET", "/me", headers={"authorization": "u"}).body["id"], "u")
-        self.assertEqual(self.call(auth, "GET", "/admin/app/reports", headers={"authorization": "u"}).body, ["r"])
-        self.assertEqual(self.call(auth, "GET", "/admin/app/feature-flags", headers={"authorization": "u"}).status, 403)
-        self.assertEqual(self.call(auth, "GET", "/admin/app/feature-flags", headers={"authorization": "o"}).status, 200)
+        # Grants apply at the plain path; /admin/app only admits the admin root.
+        self.assertEqual(self.call(auth, "GET", "/reports", headers={"authorization": "u"}).body, ["r"])
+        self.assertEqual(self.call(auth, "GET", "/admin/app/reports", headers={"authorization": "o"}).status, 401)
+        root = make_app(admin_authenticate=lambda r: {"id": "rt-app-root", "role": "owner", "grants": []} if r.headers.get("authorization") == "admin" else None)
+        self.assertEqual(self.call(root, "GET", "/admin/app/feature-flags", headers={"authorization": "admin"}).status, 200)
+        self.assertEqual(self.call(root, "GET", "/admin/app/feature-flags", headers={"authorization": "x"}).status, 401)
 
     def test_errors(self):
         app = make_app()

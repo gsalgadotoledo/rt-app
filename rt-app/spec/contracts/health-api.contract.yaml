@@ -1,0 +1,50 @@
+contract: 1
+kind: http
+module: health-api
+title: Health HTTP API (local mode)
+description: |
+  The health endpoints as every backend language serves them in local mode. The example APIs
+  register one required probe, "database", that reads a row of the shared store (TypeScript:
+  store.get("SCHEMA", "users")), so the owner report is deterministic apart from `at` and
+  durationMs. Liveness and readiness are public; the report is owner-only and mounted under
+  /admin/app only. Responses are JSON with cache-control: no-store.
+cases:
+  - name: liveness and readiness are public
+    requests:
+      - request: { method: GET, path: /health/live }
+        expect: { status: 200, body: { ok: true }, headers: { content-type: { $regex: "^application/json" }, cache-control: no-store } }
+      - request: { method: GET, path: /health/ready }
+        expect: { status: 200, body: { ok: true }, headers: { cache-control: no-store } }
+
+  - name: the owner report lists the database probe
+    requests:
+      - request: { method: GET, path: /admin/app/health/report }
+        expect:
+          status: 200
+          body:
+            ok: true
+            at: { $type: iso-date }
+            checks: [{ id: database, required: true, status: up, durationMs: { $type: integer } }]
+          headers: { cache-control: no-store }
+
+  - name: the report is only served under /admin/app
+    tags: [security]
+    requests:
+      - { request: { method: GET, path: /health/report }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /admin/app/health/live }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /admin/app/health/ready }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: health routes only answer GET
+    tags: [edge]
+    requests:
+      - { request: { method: POST, path: /health/ready, body: {} }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: PUT, path: /health/live, body: {} }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: DELETE, path: /admin/app/health/report }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: trailing slashes and query strings are ignored
+    tags: [edge]
+    requests:
+      - { request: { method: GET, path: /health/live/ }, expect: { status: 200, body: { ok: true } } }
+      - { request: { method: GET, path: /health/ready, query: { verbose: "1" } }, expect: { status: 200, body: { ok: true } } }
+      - { request: { method: GET, path: /admin/app/health/report/ }, expect: { status: 200, body: { $partial: { ok: true } } } }
+      - { request: { method: GET, path: /health/live//x }, expect: { status: 404, body: { error: Endpoint not found } } }

@@ -1,0 +1,509 @@
+contract: 1
+module: visits
+title: Visit sessions (diagnostic click/scroll samples)
+description: |
+  Visits(store, secret, pages = ["/", "/about", "/services"], clock = Date.now, newId = randomUUID)
+  keeps a tiny diagnostic sample: one row {pk: "VISITS", sk: "recent"} holding at most 10 sessions
+  of at most 120 points each, replaced atomically with version-guarded writes.
+
+  - Construction: secret needs >= 32 UTF-16 code units ("Visits requires a server secret of at
+    least 32 characters"); pages: at most 30, each ^/[a-zA-Z0-9/_-]{0,79}$ with `$` the end of the
+    string ("Invalid public visit pages"). Both are plain errors (no status).
+  - Rate limit (per instance, before anything else in start and ingest): key sha256hex(ip); every
+    call first deletes entries whose window started >= 60000 ms ago; a new key when 2000 are
+    tracked → 429 "Visits busy"; otherwise the window's count is incremented and a count above 60
+    → 429 "Visit rate limit" (rejected calls count too).
+  - start(ip) → {token, maxPoints: 120, pages}. token = payload + "." + signature, payload =
+    base64url (no padding) of the UTF-8 compact JSON {"id": newId(), "startedAt": now} (keys in
+    that order), signature = base64url(HMAC-SHA256(utf8(secret), "visits:" + payload)).
+  - ingest({token, sequence, points}, ip) → {ok: true, recorded}. Checks, in order: rate; token
+    (400 "Invalid visit token": not a string, > 500 UTF-16 units, not exactly two dot-separated
+    parts, signature not 43 base64url characters or not equal (constant time) to the expected one;
+    then 400 "Expired or invalid visit token" when the payload is not base64url JSON of an object
+    with a string id and a safe-integer startedAt, startedAt > now, or now - startedAt > 1800000);
+    batch (400 "Invalid visit batch": sequence a safe integer >= 1, points an array of 1-20);
+    points (400 "Invalid visit point": type move|click|scroll|page, path one of the pages, t a
+    safe integer 0..1800000, x and y integers 0..100). Stored points keep only type, path, t, x, y.
+  - Update (up to 5 attempts on Conflict): read the row, drop sessions with startedAt <= now -
+    86400000, apply the change, write {version: old + 1 (1 when new), ttl: ceil((now + 86400000) /
+    1000), data: {sessions}} expecting the old version (null when missing). ingest: a known session
+    with sequence <= its sequence is unchanged (recorded false; the row is still rewritten);
+    otherwise the session (created as {id, startedAt, updatedAt, sequence: 0, points: []}) gets
+    sequence, updatedAt = now and points appended up to 120. Sessions are sorted by startedAt
+    descending, then id ascending (ids are lowercase UUIDs: localeCompare equals code point order),
+    and only the first 10 kept; recorded tells whether the session is among them.
+  - list() → {items: [{id, startedAt, updatedAt, sequence, events, pages}], limit: 10, maxPoints:
+    120}; events = number of points, pages = distinct point paths in first-seen order. Sessions are
+    returned in stored order. Reading rewrites the row only when a session has expired.
+  - detail(id) → the stored session, or 404 "Visit not found". remove(id) → {ok: true}, always
+    rewriting the row.
+
+  Facade (subject visits): init {secret, pages?, now, ids? (returned by newId in order, then random
+  UUIDs), rows? (seed the store)}. Methods: start, ingest, list, detail, remove; helpers
+  startEach(ips) (start once per ip) → null, row(pk, sk), setNow(iso), sign(payload) → payload +
+  "." + signature (a token for any payload).
+subject: visits
+init:
+  secret: visits-contract-secret-0123456789
+  now: "2030-01-01T00:00:00.000Z"
+  ids: ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002", "00000000-0000-4000-8000-000000000003"]
+cases:
+  # --- start ------------------------------------------------------------------
+  - name: start returns a signed token, the point limit and the public pages
+    call: start
+    args: [127.0.0.1]
+    expect:
+      value:
+        token: eyJpZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInN0YXJ0ZWRBdCI6MTg5MzQ1NjAwMDAwMH0.PfLXHltgXNxsnYwLyX4alqkZ7PY2HR4GaG8zdsHjc-U
+        maxPoints: 120
+        pages: [/, /about, /services]
+
+  - name: tokens signed by any language are valid
+    tags: [interop]
+    steps:
+      - { call: sign, args: [eyJpZCI6ImN1c3RvbS0xIiwic3RhcnRlZEF0IjoxODkzNDU2MDAwMDAwfQ], expect: { value: "eyJpZCI6ImN1c3RvbS0xIiwic3RhcnRlZEF0IjoxODkzNDU2MDAwMDAwfQ.Qt0DdLfsMmSPfICfsuvA1yOa-97eW7Cem7jJlvl9U7M" } }
+      - { call: ingest, args: [{ token: { $ref: "0.value" }, sequence: 1, points: [{ type: page, path: /about, t: 0, x: 0, y: 0 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: list, expect: { value: { items: [{ id: custom-1, startedAt: 1893456000000, updatedAt: 1893456000000, sequence: 1, events: 1, pages: [/about] }], limit: 10, maxPoints: 120 } } }
+
+  - name: custom pages are returned and enforced
+    init: { secret: visits-contract-secret-0123456789, now: "2030-01-01T00:00:00.000Z", pages: [/docs, /docs/getting_started-2] }
+    steps:
+      - { call: start, args: [a], expect: { value: { token: { $type: string }, maxPoints: 120, pages: [/docs, /docs/getting_started-2] } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: page, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: page, path: /docs/getting_started-2, t: 0, x: 0, y: 0 }] }, a], expect: { value: { ok: true, recorded: true } } }
+
+  # --- configuration ------------------------------------------------------------
+  - name: the secret needs 32 characters
+    tags: [validation, security]
+    init: { secret: visits-contract-secret-01234567, now: "2030-01-01T00:00:00.000Z" }
+    create: { error: { status: null, message: Visits requires a server secret of at least 32 characters } }
+
+  - name: secret length counts UTF-16 code units
+    tags: [validation, edge]
+    init: { secret: "🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑", now: "2030-01-01T00:00:00.000Z", ids: ["00000000-0000-4000-8000-000000000001"] }
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { token: eyJpZCI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsInN0YXJ0ZWRBdCI6MTg5MzQ1NjAwMDAwMH0.IRSN7zNHnNACN65QaK_azClbPSHzyfNEAozcuib2OKQ } } }, note: "16 emoji are 32 code units; the HMAC key is their UTF-8 bytes" }
+
+  - name: fifteen emoji and a letter are too short
+    tags: [validation, edge]
+    init: { secret: "🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑a", now: "2030-01-01T00:00:00.000Z" }
+    create: { error: { status: null, message: Visits requires a server secret of at least 32 characters } }
+
+  - name: pages must be simple absolute paths
+    tags: [validation]
+    init: { secret: visits-contract-secret-0123456789, pages: [/, about] }
+    create: { error: { status: null, message: Invalid public visit pages } }
+
+  - name: pages cannot carry queries
+    tags: [validation, security]
+    init: { secret: visits-contract-secret-0123456789, pages: ["/account?token=1"] }
+    create: { error: { status: null, message: Invalid public visit pages } }
+
+  - name: a trailing newline does not end a page path
+    tags: [validation, edge]
+    init: { secret: visits-contract-secret-0123456789, pages: ["/about\n"] }
+    create: { error: { status: null, message: Invalid public visit pages } }
+
+  - name: page paths are ASCII
+    tags: [validation, edge]
+    init: { secret: visits-contract-secret-0123456789, pages: ["/café"] }
+    create: { error: { status: null, message: Invalid public visit pages } }
+
+  - name: page paths have at most 80 characters
+    tags: [validation, edge]
+    init: { secret: visits-contract-secret-0123456789, pages: [{ $text: { repeat: "/", count: 81 } }] }
+    create: { error: { status: null, message: Invalid public visit pages } }
+
+  - name: at most 30 pages
+    tags: [validation]
+    init: { secret: visits-contract-secret-0123456789, pages: [{ $repeat: { count: 31, item: "/p{i}" } }] }
+    create: { error: { status: null, message: Invalid public visit pages } }
+
+  - name: the largest valid page list
+    tags: [edge]
+    init: { secret: visits-contract-secret-0123456789, now: "2030-01-01T00:00:00.000Z", pages: [{ $repeat: { count: 29, item: "/p{i}" } }, { $text: { repeat: "/", count: 80 } }] }
+    call: start
+    args: [a]
+    expect: { value: { $partial: { pages: { $length: 30 } } } }
+
+  - name: no pages means no valid points
+    tags: [edge]
+    init: { secret: visits-contract-secret-0123456789, now: "2030-01-01T00:00:00.000Z", pages: [] }
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { pages: [] } } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: page, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+
+  # --- ingest -------------------------------------------------------------------
+  - name: ingest stores points and list, detail and the row show them
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: setNow, args: ["2030-01-01T00:00:01.234Z"], expect: { value: null } }
+      - call: ingest
+        args:
+          - token: { $ref: "0.value.token" }
+            sequence: 1
+            points:
+              - { type: page, path: /, t: 0, x: 0, y: 0 }
+              - { type: move, path: /about, t: 1800000, x: 100, y: 100, text: secret form value }
+              - { type: scroll, path: /, t: 7, x: 50, y: 99 }
+          - a
+        expect: { value: { ok: true, recorded: true } }
+      - call: list
+        expect: { value: { items: [{ id: "00000000-0000-4000-8000-000000000001", startedAt: 1893456000000, updatedAt: 1893456001234, sequence: 1, events: 3, pages: [/, /about] }], limit: 10, maxPoints: 120 } }
+      - call: detail
+        args: ["00000000-0000-4000-8000-000000000001"]
+        expect:
+          value:
+            id: "00000000-0000-4000-8000-000000000001"
+            startedAt: 1893456000000
+            updatedAt: 1893456001234
+            sequence: 1
+            points:
+              - { type: page, path: /, t: 0, x: 0, y: 0 }
+              - { type: move, path: /about, t: 1800000, x: 100, y: 100 }
+              - { type: scroll, path: /, t: 7, x: 50, y: 99 }
+        note: extra point fields (text) are never stored
+      - call: row
+        args: [VISITS, recent]
+        expect:
+          value:
+            pk: VISITS
+            sk: recent
+            version: 1
+            ttl: 1893542402
+            data:
+              sessions:
+                - id: "00000000-0000-4000-8000-000000000001"
+                  startedAt: 1893456000000
+                  updatedAt: 1893456001234
+                  sequence: 1
+                  points:
+                    - { type: page, path: /, t: 0, x: 0, y: 0 }
+                    - { type: move, path: /about, t: 1800000, x: 100, y: 100 }
+                    - { type: scroll, path: /, t: 7, x: 50, y: 99 }
+        note: ttl = ceil((now + 86400000) / 1000)
+
+  - name: sequences only move forward
+    tags: [edge]
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 1, x: 1, y: 1 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:05.000Z"], expect: { value: null } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 2, x: 2, y: 2 }] }, a], expect: { value: { ok: true, recorded: false } } }
+      - { call: detail, args: ["00000000-0000-4000-8000-000000000001"], expect: { value: { $partial: { sequence: 1, updatedAt: 1893456000000, points: { $length: 1 } } } } }
+      - { call: row, args: [VISITS, recent], expect: { value: { $partial: { version: 2, ttl: 1893542405 } } }, note: "a replayed batch still rewrites the row" }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 3, points: [{ type: click, path: /, t: 3, x: 3, y: 3 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 2, points: [{ type: click, path: /, t: 4, x: 4, y: 4 }] }, a], expect: { value: { ok: true, recorded: false } } }
+      - { call: detail, args: ["00000000-0000-4000-8000-000000000001"], expect: { value: { $partial: { sequence: 3, updatedAt: 1893456005000, points: [{ type: click, path: /, t: 1, x: 1, y: 1 }, { type: click, path: /, t: 3, x: 3, y: 3 }] } } } }
+
+  - name: a session keeps at most 120 points
+    tags: [edge]
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ $repeat: { count: 20, item: { type: move, path: /, t: "{i}", x: 1, y: 1 } } }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 2, points: [{ $repeat: { count: 20, start: 20, item: { type: move, path: /, t: "{i}", x: 1, y: 1 } } }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 3, points: [{ $repeat: { count: 20, start: 40, item: { type: move, path: /, t: "{i}", x: 1, y: 1 } } }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 4, points: [{ $repeat: { count: 20, start: 60, item: { type: move, path: /, t: "{i}", x: 1, y: 1 } } }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 5, points: [{ $repeat: { count: 20, start: 80, item: { type: move, path: /, t: "{i}", x: 1, y: 1 } } }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 6, points: [{ $repeat: { count: 15, start: 100, item: { type: move, path: /, t: "{i}", x: 1, y: 1 } } }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 7, points: [{ $repeat: { count: 20, start: 115, item: { type: click, path: /about, t: "{i}", x: 2, y: 2 } } }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 8, points: [{ type: page, path: /services, t: 999, x: 3, y: 3 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: list, expect: { value: { $partial: { items: [{ $partial: { sequence: 8, events: 120, pages: [/, /about] } }] } } } }
+      - { call: detail, args: ["00000000-0000-4000-8000-000000000001"], expect: { value: { $partial: { points: { $length: 120 } } } } }
+
+  - name: batches need a positive safe-integer sequence and 1-20 points
+    tags: [validation]
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 0, points: [{ type: click, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: -1, points: [{ type: click, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1.5, points: [{ type: click, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: "1", points: [{ type: click, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: true, points: [{ type: click, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, points: [{ type: click, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 9007199254740992, points: [{ type: click, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1 }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: { type: click } }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ $repeat: { count: 21, item: { type: click, path: /, t: 0, x: 0, y: 0 } } }] }, a], expect: { error: { status: 400, message: Invalid visit batch } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit point } }, note: "the batch is checked before its points" }
+      - { call: row, args: [VISITS, recent], expect: { value: null } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 9007199254740991, points: [{ $repeat: { count: 20, item: { type: click, path: /, t: 0, x: 0, y: 0 } } }] }, a], expect: { value: { ok: true, recorded: true } } }
+
+  - name: points are validated one by one and reject the whole batch
+    tags: [validation]
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: 0, y: 0 }, null] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [5] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [[click, /, 0, 0, 0]] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: hover, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: Click, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: "/account?token=secret", t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /about/, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, t: 0, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: -1, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 1800001, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0.5, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: "0", x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, x: 0, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: 101, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: -1, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: 1.5, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: true, y: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: 0, y: 100.5 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: 0, y: -1 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: 0 }] }, a], expect: { error: { status: 400, message: Invalid visit point } } }
+      - { call: row, args: [VISITS, recent], expect: { value: null } }
+
+  # --- tokens -------------------------------------------------------------------
+  - name: malformed or tampered tokens are rejected
+    tags: [validation, security]
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit point } }, note: "the token of step 1 is valid" }
+      - { call: ingest, args: [{ token: x, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit token } }, note: "the token is checked before the batch" }
+      - { call: ingest, args: [{ token: "", sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: 123, sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: [a.b], sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: "e30.", sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: "e30.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: "e30.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: "e30.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa+a", sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: sign, args: [e30], expect: { value: "e30.oKO_PZng5aVVtfI5l9aRHwEmTv4wq79j_vvn2MitFG0" } }
+      - { call: ingest, args: [{ token: { $ref: "11.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } }, note: "a valid signature over {}" }
+
+  - name: tokens must have exactly two parts and a matching signature
+    tags: [validation, security]
+    steps:
+      - { call: ingest, args: [{ token: "eyJpZCI6IngiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDB9.ZqpEnkRTBxKutHvKesk9rK8EkN57ARWLz_7UiQRGS3U", sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit point } }, note: "HMAC-SHA256 over visits:<payload> with the UTF-8 secret" }
+      - { call: ingest, args: [{ token: "eyJpZCI6InkiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDB9.ZqpEnkRTBxKutHvKesk9rK8EkN57ARWLz_7UiQRGS3U", sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit token } }, note: "another payload with the same signature" }
+      - { call: ingest, args: [{ token: "eyJpZCI6IngiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDB9.ZqpEnkRTBxKutHvKesk9rK8EkN57ARWLz_7UiQRGS3U.x", sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: "eyJpZCI6IngiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDB9.ZqpEnkRTBxKutHvKesk9rK8EkN57ARWLz_7UiQRGS3Ux", sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: "eyJpZCI6IngiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDB9.GYyZ0YUHEP1WAH7aNRw1hlymtf49Zm9zQkMpuU9HY0M", sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit token } }, note: "signed with another secret" }
+      - { call: ingest, args: [{ token: "eyJpZCI6IngiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDB9==.Yh_6a20tKWi8XNw2TobycG-nnYCuygwrJY4cP5vAEnA", sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit point } }, note: "padding is signed as written and ignored when decoding (Node's lenient base64url)" }
+
+  - name: token payloads must be JSON objects with a string id and a safe-integer startedAt
+    tags: [validation]
+    steps:
+      - { call: sign, args: [bm90IGpzb24], expect: { value: "bm90IGpzb24.zyo3m1bQ56NQqowfqB2NANLWZQpVxoEG2veX2kdi2dU" } }
+      - { call: ingest, args: [{ token: { $ref: "0.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: sign, args: [eyJpZCI6NSwic3RhcnRlZEF0IjoxODkzNDU2MDAwMDAwfQ], expect: { value: "eyJpZCI6NSwic3RhcnRlZEF0IjoxODkzNDU2MDAwMDAwfQ.PeS_RdO0lApqzXYChazbc-aZrDlhvZte9isdUKhgz6c" } }
+      - { call: ingest, args: [{ token: { $ref: "2.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: sign, args: [eyJpZCI6IngiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDAuNX0], expect: { value: "eyJpZCI6IngiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDAuNX0.P6AC09E0DwHCeOSwyINo5Cv4ShaBSppaZqdSU2RvbMI" } }
+      - { call: ingest, args: [{ token: { $ref: "4.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: sign, args: [W10], expect: { value: "W10.AiyxZ3ELCTwUHMJvXZyLf-ncS9fkXWLMoF2cr1DvHjI" } }
+      - { call: ingest, args: [{ token: { $ref: "6.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: sign, args: [bnVsbA], expect: { value: "bnVsbA.GcwwevqBnPXAUgWLCiE88zu7u-e6afLKBTl69udl_rE" } }
+      - { call: ingest, args: [{ token: { $ref: "8.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: sign, args: [eyJpZCI6IngiLCJzdGFydGVkQXQiOiIxODkzNDU2MDAwMDAwIn0], expect: { value: "eyJpZCI6IngiLCJzdGFydGVkQXQiOiIxODkzNDU2MDAwMDAwIn0.Gt4L0A5JhNny31AJkl7uJTU0TGnFx6eH99vukeFIQ7g" } }
+      - { call: ingest, args: [{ token: { $ref: "10.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: sign, args: [eyJpZCI6IngiLCJzdGFydGVkQXQiOjkwMDcxOTkyNTQ3NDA5OTJ9], expect: { value: "eyJpZCI6IngiLCJzdGFydGVkQXQiOjkwMDcxOTkyNTQ3NDA5OTJ9.wF6QdKyz6kTvHB4yX8NHlEVKlbHVqcqu7C-iYXNU5N0" } }
+      - { call: ingest, args: [{ token: { $ref: "12.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: sign, args: [""], expect: { value: ".fLokP1314XB-vnaFViSe6SJxtaL_pg3_8R1gE7jzPRw" } }
+      - { call: ingest, args: [{ token: { $ref: "14.value" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: sign, args: [eyJpZCI6ImYiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDAuMH0], expect: { value: "eyJpZCI6ImYiLCJzdGFydGVkQXQiOjE4OTM0NTYwMDAwMDAuMH0.e2yDw_hXttFc9i89p6w30Xt7nUqvw7hHb7jxzR7LrUA" } }
+      - { call: ingest, args: [{ token: { $ref: "16.value" }, sequence: 1, points: [{ type: page, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { value: { ok: true, recorded: true } }, note: "1893456000000.0 is a safe integer" }
+      - { call: detail, args: [f], expect: { value: { $partial: { startedAt: 1893456000000 } } } }
+
+  - name: tokens live 30 minutes and cannot come from the future
+    tags: [edge]
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: setNow, args: ["2030-01-01T00:30:00.000Z"], expect: { value: null } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Invalid visit point } }, note: "exactly 1800000 ms old is still valid" }
+      - { call: setNow, args: ["2030-01-01T00:30:00.001Z"], expect: { value: null } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+      - { call: setNow, args: ["2029-12-31T23:59:59.999Z"], expect: { value: null } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [bad] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } } }
+
+  - name: tokens longer than 500 characters are rejected before parsing
+    tags: [validation, edge]
+    steps:
+      - { call: sign, args: [{ $text: { repeat: "e", count: 456 } }], expect: { value: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.51V9s34HQEupeUl63rWA05ejvmKjNxcffJK2puVfegw" } }
+      - { call: ingest, args: [{ token: { $ref: "0.value" }, sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Expired or invalid visit token } }, note: "456 + 1 + 43 = 500 characters" }
+      - { call: sign, args: [{ $text: { repeat: "e", count: 457 } }], expect: { value: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.VnuxPZdpr_khfiy4WWdE_gLa_SQS4c5whLCIj0nyZc4" } }
+      - { call: ingest, args: [{ token: { $ref: "2.value" }, sequence: 1, points: [] }, a], expect: { error: { status: 400, message: Invalid visit token } } }
+
+  # --- retention, ordering and expiry -------------------------------------------------
+  - name: only the 10 newest sessions are kept
+    init:
+      secret: visits-contract-secret-0123456789
+      now: "2030-01-01T00:00:00.000Z"
+      ids: [{ $repeat: { count: 11, start: 1, item: "00000000-0000-4000-8000-0000000000{i:02}" } }]
+    steps:
+      - { call: setNow, args: ["2030-01-01T00:00:00.001Z"], expect: { value: null } }
+      - { call: start, args: [ip-1], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "1.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-1], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.002Z"], expect: { value: null } }
+      - { call: start, args: [ip-2], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "4.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-2], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.003Z"], expect: { value: null } }
+      - { call: start, args: [ip-3], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "7.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-3], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.004Z"], expect: { value: null } }
+      - { call: start, args: [ip-4], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "10.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-4], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.005Z"], expect: { value: null } }
+      - { call: start, args: [ip-5], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "13.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-5], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.006Z"], expect: { value: null } }
+      - { call: start, args: [ip-6], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "16.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-6], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.007Z"], expect: { value: null } }
+      - { call: start, args: [ip-7], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "19.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-7], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.008Z"], expect: { value: null } }
+      - { call: start, args: [ip-8], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "22.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-8], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.009Z"], expect: { value: null } }
+      - { call: start, args: [ip-9], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "25.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-9], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.010Z"], expect: { value: null } }
+      - { call: start, args: [ip-10], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "28.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-10], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.011Z"], expect: { value: null } }
+      - { call: start, args: [ip-11], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "31.value.token" }, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-11], expect: { value: { ok: true, recorded: true } } }
+      - call: list
+        expect:
+          value:
+            limit: 10
+            maxPoints: 120
+            items:
+              - { id: "00000000-0000-4000-8000-000000000011", startedAt: 1893456000011, updatedAt: 1893456000011, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000010", startedAt: 1893456000010, updatedAt: 1893456000010, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000009", startedAt: 1893456000009, updatedAt: 1893456000009, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000008", startedAt: 1893456000008, updatedAt: 1893456000008, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000007", startedAt: 1893456000007, updatedAt: 1893456000007, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000006", startedAt: 1893456000006, updatedAt: 1893456000006, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000005", startedAt: 1893456000005, updatedAt: 1893456000005, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000004", startedAt: 1893456000004, updatedAt: 1893456000004, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000003", startedAt: 1893456000003, updatedAt: 1893456000003, sequence: 1, events: 1, pages: ["/"] }
+              - { id: "00000000-0000-4000-8000-000000000002", startedAt: 1893456000002, updatedAt: 1893456000002, sequence: 1, events: 1, pages: ["/"] }
+      - { call: detail, args: ["00000000-0000-4000-8000-000000000001"], expect: { error: { status: 404, message: Visit not found } } }
+      - { call: ingest, args: [{ token: { $ref: "1.value.token" }, sequence: 2, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] }, ip-1], expect: { value: { ok: true, recorded: false } }, note: "the oldest session is re-created and dropped again" }
+      - { call: list, expect: { value: { $partial: { items: { $length: 10 } } } } }
+      - { call: detail, args: ["00000000-0000-4000-8000-000000000001"], expect: { error: { status: 404, message: Visit not found } } }
+      - { call: detail, args: ["00000000-0000-4000-8000-000000000002"], expect: { value: { id: "00000000-0000-4000-8000-000000000002", startedAt: 1893456000002, updatedAt: 1893456000002, sequence: 1, points: [{ type: click, path: /, t: 5, x: 20, y: 30 }] } } }
+
+  - name: sessions started in the same millisecond are ordered by id
+    tags: [edge]
+    init: { secret: visits-contract-secret-0123456789, now: "2030-01-01T00:00:00.000Z", ids: ["00000000-0000-4000-8000-00000000000b", "00000000-0000-4000-8000-00000000000a"] }
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: page, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "1.value.token" }, sequence: 1, points: [{ type: page, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: list, expect: { value: { $partial: { items: [{ $partial: { id: "00000000-0000-4000-8000-00000000000a" } }, { $partial: { id: "00000000-0000-4000-8000-00000000000b" } }] } } } }
+
+  - name: sessions expire after 24 hours
+    steps:
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "0.value.token" }, sequence: 1, points: [{ type: page, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: setNow, args: ["2030-01-01T23:59:59.999Z"], expect: { value: null } }
+      - { call: list, expect: { value: { $partial: { items: { $length: 1 } } } } }
+      - { call: row, args: [VISITS, recent], expect: { value: { $partial: { version: 1 } } }, note: "reading does not rewrite while nothing expired" }
+      - { call: setNow, args: ["2030-01-02T00:00:00.000Z"], expect: { value: null } }
+      - { call: detail, args: ["00000000-0000-4000-8000-000000000001"], expect: { error: { status: 404, message: Visit not found } } }
+      - { call: row, args: [VISITS, recent], expect: { value: { pk: VISITS, sk: recent, version: 2, ttl: 1893628800, data: { sessions: [] } } }, note: "the expired session is removed by the read" }
+      - { call: list, expect: { value: { items: [], limit: 10, maxPoints: 120 } } }
+      - { call: row, args: [VISITS, recent], expect: { value: { $partial: { version: 2 } } } }
+
+  - name: an empty store lists nothing without writing
+    steps:
+      - { call: list, expect: { value: { items: [], limit: 10, maxPoints: 120 } } }
+      - { call: detail, args: [anything], expect: { error: { status: 404, message: Visit not found } } }
+      - { call: row, args: [VISITS, recent], expect: { value: null } }
+
+  - name: remove deletes one session and always writes
+    steps:
+      - { call: remove, args: [missing], expect: { value: { ok: true } } }
+      - { call: row, args: [VISITS, recent], expect: { value: { pk: VISITS, sk: recent, version: 1, ttl: 1893542400, data: { sessions: [] } } } }
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: ingest, args: [{ token: { $ref: "2.value.token" }, sequence: 1, points: [{ type: page, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: ingest, args: [{ token: { $ref: "3.value.token" }, sequence: 1, points: [{ type: page, path: /, t: 0, x: 0, y: 0 }] }, a], expect: { value: { ok: true, recorded: true } } }
+      - { call: remove, args: ["00000000-0000-4000-8000-000000000001"], expect: { value: { ok: true } } }
+      - { call: list, expect: { value: { $partial: { items: [{ $partial: { id: "00000000-0000-4000-8000-000000000002" } }] } } } }
+      - { call: detail, args: ["00000000-0000-4000-8000-000000000001"], expect: { error: { status: 404, message: Visit not found } } }
+      - { call: row, args: [VISITS, recent], expect: { value: { $partial: { version: 4 } } } }
+
+  - name: rows written by another implementation are read, cleaned and kept in stored order
+    tags: [interop]
+    init:
+      secret: visits-contract-secret-0123456789
+      now: "2030-01-01T00:00:00.000Z"
+      rows:
+        - pk: VISITS
+          sk: recent
+          version: 7
+          ttl: 1893542400
+          data:
+            sessions:
+              - { id: older, startedAt: 1893455000000, updatedAt: 1893455001000, sequence: 2, points: [{ type: page, path: /about, t: 0, x: 0, y: 0 }, { type: click, path: /, t: 9, x: 9, y: 9 }, { type: click, path: /about, t: 10, x: 1, y: 1 }] }
+              - { id: newer, startedAt: 1893455500000, updatedAt: 1893455500000, sequence: 1, points: [] }
+    steps:
+      - call: list
+        expect:
+          value:
+            items:
+              - { id: older, startedAt: 1893455000000, updatedAt: 1893455001000, sequence: 2, events: 3, pages: [/about, /] }
+              - { id: newer, startedAt: 1893455500000, updatedAt: 1893455500000, sequence: 1, events: 0, pages: [] }
+            limit: 10
+            maxPoints: 120
+      - { call: row, args: [VISITS, recent], expect: { value: { $partial: { version: 7 } } } }
+
+  - name: expired stored sessions are dropped on the next read
+    tags: [interop]
+    init:
+      secret: visits-contract-secret-0123456789
+      now: "2030-01-01T00:00:00.000Z"
+      rows:
+        - pk: VISITS
+          sk: recent
+          version: 3
+          data:
+            sessions:
+              - { id: kept, startedAt: 1893369600001, updatedAt: 1893369600001, sequence: 1, points: [] }
+              - { id: gone, startedAt: 1893369600000, updatedAt: 1893369600000, sequence: 1, points: [] }
+    steps:
+      - { call: list, expect: { value: { items: [{ id: kept, startedAt: 1893369600001, updatedAt: 1893369600001, sequence: 1, events: 0, pages: [] }], limit: 10, maxPoints: 120 } } }
+      - { call: row, args: [VISITS, recent], expect: { value: { pk: VISITS, sk: recent, version: 4, ttl: 1893542400, data: { sessions: [{ id: kept, startedAt: 1893369600001, updatedAt: 1893369600001, sequence: 1, points: [] }] } } } }
+
+  - name: a stored row without sessions is empty
+    tags: [interop, edge]
+    init: { secret: visits-contract-secret-0123456789, now: "2030-01-01T00:00:00.000Z", rows: [{ pk: VISITS, sk: recent, version: 1, data: {} }] }
+    steps:
+      - { call: list, expect: { value: { items: [], limit: 10, maxPoints: 120 } } }
+      - { call: remove, args: [x], expect: { value: { ok: true } } }
+      - { call: row, args: [VISITS, recent], expect: { value: { $partial: { version: 2, data: { sessions: [] } } } } }
+
+  # --- rate limits ----------------------------------------------------------------
+  - name: 60 calls per ip per minute
+    tags: [security]
+    steps:
+      - { call: startEach, args: [[{ $repeat: { count: 60, item: a } }]], expect: { value: null } }
+      - { call: start, args: [a], expect: { error: { status: 429, message: Visit rate limit } } }
+      - { call: start, args: [b], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: setNow, args: ["2030-01-01T00:00:59.999Z"], expect: { value: null } }
+      - { call: start, args: [a], expect: { error: { status: 429, message: Visit rate limit } } }
+      - { call: setNow, args: ["2030-01-01T00:01:00.000Z"], expect: { value: null } }
+      - { call: start, args: [a], expect: { value: { $partial: { maxPoints: 120 } } } }
+
+  - name: ingestion shares the limit and is limited before the token is read
+    tags: [security]
+    steps:
+      - { call: startEach, args: [[{ $repeat: { count: 59, item: c } }]], expect: { value: null } }
+      - { call: ingest, args: [{ token: x, sequence: 1, points: [] }, c], expect: { error: { status: 400, message: Invalid visit token } } }
+      - { call: ingest, args: [{ token: x, sequence: 1, points: [] }, c], expect: { error: { status: 429, message: Visit rate limit } } }
+
+  - name: at most 2000 clients are tracked at once
+    tags: [security, edge]
+    steps:
+      - { call: startEach, args: [[{ $repeat: { count: 2000, item: "10.0.{i}" } }]], expect: { value: null } }
+      - { call: start, args: [new], expect: { error: { status: 429, message: Visits busy } } }
+      - { call: start, args: ["10.0.0"], expect: { value: { $partial: { maxPoints: 120 } } } }
+      - { call: setNow, args: ["2030-01-01T00:01:00.000Z"], expect: { value: null } }
+      - { call: start, args: [new], expect: { value: { $partial: { maxPoints: 120 } } } }

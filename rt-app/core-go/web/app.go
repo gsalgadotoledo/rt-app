@@ -61,6 +61,17 @@ type Endpoint struct {
 	Access   string
 	Resource string
 	Handle   func(*Context) (any, error)
+	// ExplicitGrant requires the Resource grant even for owners (permission endpoints).
+	ExplicitGrant bool
+	// Tool opts the endpoint into CLI/MCP exposure (metadata only; HTTP stays the authority).
+	Tool *Tool
+}
+
+// Tool is the CLI/MCP description of an endpoint, as in TypeScript's ToolExposure.
+type Tool struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Example     any    `json:"example,omitempty"`
 }
 
 // Actor is the authenticated caller. Authenticators fill at least ID, Role and Grants;
@@ -305,7 +316,7 @@ func (a *App) run(r *http.Request, req Request) (any, error) {
 				return nil, err
 			}
 		}
-		if err := check(found.Endpoint, actor); err != nil {
+		if err := check(found.Endpoint, actor, strings.HasPrefix(found.Path, "/admin/")); err != nil {
 			return nil, err
 		}
 	}
@@ -323,9 +334,16 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// check enforces the endpoint's access level.
-func check(e Endpoint, actor *Actor) error {
+// check enforces the endpoint's access level. Admin routes follow the admin identity's policy
+// (TypeScript AdminIdentity.acl): only the admin root may call them.
+func check(e Endpoint, actor *Actor, admin bool) error {
 	if e.Access == Guest {
+		return nil
+	}
+	if admin {
+		if actor == nil || actor.ID != "rt-app-root" {
+			return apperr.New(http.StatusUnauthorized, "Sign in to admin")
+		}
 		return nil
 	}
 	if actor == nil {
@@ -337,7 +355,8 @@ func check(e Endpoint, actor *Actor) error {
 			return apperr.New(http.StatusForbidden, "Only the owner can perform this operation")
 		}
 	case Permission:
-		if actor.Role != "owner" && !slices.Contains(actor.Grants, e.Resource) {
+		granted := slices.Contains(actor.Grants, e.Resource)
+		if !granted && (e.ExplicitGrant || actor.Role != "owner") {
 			return apperr.New(http.StatusForbidden, "You do not have permission to access this resource")
 		}
 	}

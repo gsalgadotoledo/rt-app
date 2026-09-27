@@ -136,3 +136,10 @@ test("DynamoStore rejects the same key twice before calling DynamoDB", async () 
   const write = { row: { pk: "A", sk: "x", version: 1, data: {} }, expected: null };
   await assert.rejects(store.transact([write, write]), /Duplicate transaction key/);
 });
+
+test("numbers beyond 2^53 are doubles, like the other stores", async () => {
+  const { documentOptions } = await import("../dist/index.js");
+  assert.equal(documentOptions.marshallOptions.allowImpreciseNumbers, true);
+  assert.equal(documentOptions.unmarshallOptions.wrapNumbers("1e+21"), 1e21);
+  assert.equal(documentOptions.unmarshallOptions.wrapNumbers("9007199254740993"), 9007199254740992);
+});

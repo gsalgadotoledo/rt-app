@@ -152,6 +152,16 @@ cases:
     expect: { value: { items: { $length: 50 } } }
     note: a cursor is returned only when another row exists
 
+  - name: numbers are doubles, including values beyond 2^53
+    tags: [edge, numbers]
+    steps:
+      - call: transact
+        args: [[{ row: { pk: N, sk: n, version: 1, data: { big: 1e+21, tiny: 1e-7, max: 9007199254740992, negative: -0.5, int: 42 } }, expected: null }]]
+        expect: { value: null }
+      - call: get
+        args: [N, n]
+        expect: { value: { pk: N, sk: n, version: 1, data: { big: 1e+21, tiny: 1e-7, max: 9007199254740992, negative: -0.5, int: 42 } } }
+
   - name: invalid cursors are rejected
     tags: [edge, security]
     call: list

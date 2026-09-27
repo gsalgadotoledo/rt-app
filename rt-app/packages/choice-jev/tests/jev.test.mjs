@@ -43,5 +43,11 @@ test("official Jev envelope, response and private failure handling", async () =>
     new JevProvider("key", "m", async () => Response.json({})).predict(input),
     /Invalid Jev/,
   );
+  // Malformed bodies never echo their content; a JSON null is an invalid response, not a TypeError.
+  for (const body of ["secret-token", "null", ""])
+    await assert.rejects(
+      new JevProvider("key", "m", async () => new Response(body)).predict(input),
+      (error) => error.message === "Invalid Jev response",
+    );
   assert.equal(new JevProvider("key").id, "jev");
 });

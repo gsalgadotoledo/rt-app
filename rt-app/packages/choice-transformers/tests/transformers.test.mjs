@@ -19,12 +19,15 @@ test("maps reordered zero-shot labels without pretending calibration", async () 
   assert.equal((await p.predict(input)).semantics, "uncalibrated-scores");
   await assert.rejects(p.predict(input, AbortSignal.abort()));
   for (const result of [
+    null,
+    undefined,
     { labels: [], scores: [] },
     { labels: ["sales", "sales"], scores: [0.5, 0.5] },
     { labels: ["wrong", "sales"], scores: [1, 0] },
   ])
     await assert.rejects(
       new TransformersChoiceProvider(async () => result, "m").predict(input),
+      /Invalid classifier response/,
     );
   const c = new AbortController();
   await assert.rejects(

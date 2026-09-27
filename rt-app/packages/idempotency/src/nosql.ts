@@ -8,9 +8,24 @@ import {
   type RTAppJson,
 } from "./idempotency.js";
 
+/** Clock for createdAt/updatedAt: epoch milliseconds or a Date (the system clock by default). */
+export interface NoSQLIdempotencyOptions {
+  now?: () => number | Date;
+}
+
 /** Persistent claims shared by JSON and DynamoDB. Never expire an unresolved side effect. */
 export class NoSQLIdempotencyStore implements RTAppIdempotencyStore {
-  constructor(private readonly store: NoSQL) {}
+  private readonly now: () => number | Date;
+  constructor(
+    private readonly store: NoSQL,
+    options: NoSQLIdempotencyOptions = {},
+  ) {
+    this.now = options.now ?? Date.now;
+  }
+
+  private timestamp(): string {
+    return new Date(this.now()).toISOString();
+  }
 
   private address(claim: RTAppIdempotencyClaim) {
     return { pk: "IDEMPOTENCY#" + claim.scope, sk: claim.key };
@@ -29,7 +44,7 @@ export class NoSQLIdempotencyStore implements RTAppIdempotencyStore {
               fingerprint: claim.fingerprint,
               owner: claim.owner,
               state: "pending",
-              createdAt: new Date().toISOString(),
+              createdAt: this.timestamp(),
             },
           },
           expected: null,
@@ -85,7 +100,7 @@ export class NoSQLIdempotencyStore implements RTAppIdempotencyStore {
           data: {
             ...row.data,
             state,
-            updatedAt: new Date().toISOString(),
+            updatedAt: this.timestamp(),
             ...(state === "completed" ? { result } : {}),
           },
         },
@@ -96,9 +111,12 @@ export class NoSQLIdempotencyStore implements RTAppIdempotencyStore {
 }
 
 /** Example: createIdempotency(store).execute({scope:'tenant/orders/v1',key:'order-42',input:{}}, work). */
-export function createIdempotency(store: NoSQL): RTAppIdempotencyModule {
+export function createIdempotency(
+  store: NoSQL,
+  options: NoSQLIdempotencyOptions = {},
+): RTAppIdempotencyModule {
   const executor = new RTAppIdempotencyModule();
-  executor.store = new NoSQLIdempotencyStore(store);
+  executor.store = new NoSQLIdempotencyStore(store, options);
   executor.init();
   return executor;
 }

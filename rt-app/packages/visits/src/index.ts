@@ -36,6 +36,8 @@ export class Visits {
     private secret: string,
     private pages = ["/", "/about", "/services"],
     private clock = Date.now,
+    /** Session id generator (random UUIDs by default); tests pass a deterministic one. */
+    private newId: () => string = randomUUID,
   ) {
     if (secret.length < 32)
       throw new Error(
@@ -94,7 +96,7 @@ export class Visits {
   start(ip: string) {
     this.rate(ip);
     const payload = Buffer.from(
-      JSON.stringify({ id: randomUUID(), startedAt: this.clock() }),
+      JSON.stringify({ id: this.newId(), startedAt: this.clock() }),
     ).toString("base64url");
     return {
       token: payload + "." + this.signature(payload),

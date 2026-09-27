@@ -35,6 +35,7 @@ export class TransformersChoiceProvider implements ChoiceProvider {
     );
     signal?.throwIfAborted();
     if (
+      !result ||
       !Array.isArray(result.labels) ||
       !Array.isArray(result.scores) ||
       result.labels.length !== labels.length ||

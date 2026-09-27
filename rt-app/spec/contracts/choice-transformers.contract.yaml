@@ -1,0 +1,201 @@
+contract: 1
+module: choice-transformers
+title: Choice provider over an injected zero-shot classification pipeline
+description: |
+  TransformersChoiceProvider(pipeline, model) maps a zero-shot classifier (an NLI model such as
+  Transformers.js "zero-shot-classification") onto Choice. The pipeline is injected; the subject
+  fakes it with init.results, answered in order: {labels, scores}, null, or {error} (the pipeline
+  throws Error(error)). calls() lists what the pipeline received: {text, labels, options}.
+  decide(input, policy?) runs Choice over the provider; predictAborted(input, when) passes an
+  AbortSignal that is aborted "before" the call or "during" the pipeline call.
+
+  predict(input):
+    1. validates the input like validateChoice (400 errors; the pipeline is not called);
+    2. stops with "This operation was aborted" when the signal is already aborted;
+    3. calls pipeline(text, labels, {multi_label: false}) with
+         text   = question + "\n\n" + JSON.stringify(snapshot.context), "undefined" when the input
+                  has no context (JavaScript key order and number formatting; U+2028 and DEL are
+                  not escaped, lone surrogates are);
+         labels = one per option, in option order: id, or id + ": " + description when the
+                  description is a non-empty string;
+    4. stops with "This operation was aborted" when the signal was aborted meanwhile;
+    5. rejects the result with Error "Invalid classifier response" (no status) unless it is an
+       object whose labels and scores are arrays with one item per option, labels are distinct
+       and every label is one of the labels sent (strict string equality);
+    6. returns {model, semantics: "uncalibrated-scores", probabilities: {id: scores[index of the
+       option's label in result.labels]}}. Scores are not checked here; Choice.decide rejects
+       anything that is not a distribution. Pipeline errors propagate unchanged.
+  The model name is not validated. NLI scores are uncalibrated, so Choice abstains by default.
+subject: choice-transformers
+init:
+  model: open-model
+  results:
+    - { labels: [ sales, "billing: Invoices" ], scores: [ 0.1, 0.9 ] }
+cases:
+  - name: the provider id is transformers
+    call: id
+    args: []
+    expect: { value: transformers }
+
+  - name: reordered labels map back to option ids
+    steps:
+      - call: predict
+        args: [ { context: Refund, question: Which team?, options: [ { id: billing, description: Invoices }, { id: sales } ] } ]
+        expect: { value: { model: open-model, semantics: uncalibrated-scores, probabilities: { billing: 0.9, sales: 0.1 } } }
+      - call: calls
+        args: []
+        expect: { value: [ { text: "Which team?\n\n\"Refund\"", labels: [ "billing: Invoices", sales ], options: { multi_label: false } } ] }
+
+  - name: empty descriptions give bare labels and the question is not trimmed
+    tags: [ edge ]
+    init:
+      model: m
+      results: [ { labels: [ a, "b: B" ], scores: [ 0.25, 0.75 ] } ]
+    steps:
+      - { call: predict, args: [ { context: null, question: " Q ", options: [ { id: a, description: "" }, { id: b, description: B } ] } ], expect: { value: { model: m, semantics: uncalibrated-scores, probabilities: { a: 0.25, b: 0.75 } } } }
+      - { call: calls, args: [], expect: { value: [ { text: " Q \n\nnull", labels: [ a, "b: B" ], options: { multi_label: false } } ] } }
+
+  - name: a missing context is written undefined
+    tags: [ edge ]
+    init:
+      model: m
+      results: [ { labels: [ a, b ], scores: [ 0.5, 0.5 ] } ]
+    steps:
+      - { call: predict, args: [ { question: Q, options: [ { id: a }, { id: b } ] } ], expect: { value: { model: m, semantics: uncalibrated-scores, probabilities: { a: 0.5, b: 0.5 } } } }
+      - { call: calls, args: [], expect: { value: [ { $partial: { text: "Q\n\nundefined" } } ] } }
+
+  - name: the context is written with JSON.stringify of the snapshot
+    tags: [ edge, numbers, unicode ]
+    note: array-index keys first (numeric order), then UTF-16 order (U+1F600 sorts before U+FF01); 1e21 → 1e+21, -0 → 0; only " \ and control characters are escaped
+    init:
+      model: m
+      results: [ { labels: [ a, b ], scores: [ 0.5, 0.5 ] } ]
+    steps:
+      - call: predict
+        args: [ { question: Q, options: [ { id: a }, { id: b } ], context: { b: [ 1e21, 1e-7, 0.1, 100.0, -0, 1.5e300, 123456789012345680000, "\u0000\u001f\u0008\u000c\u000a\u000d\u0009\"\\\u007f\u2028/<>&é\ud83d\ude00" ], a: { "10": 1, "2": 2, "\uff01": 3, "😀": 4, Z: 5, "4294967295": 6, "4294967294": 7, "01": 8 } } } ]
+        expect: { value: { model: m, semantics: uncalibrated-scores, probabilities: { a: 0.5, b: 0.5 } } }
+      - call: calls
+        args: []
+        expect: { value: [ { $partial: { text: "Q\u000a\u000a{\"a\":{\"2\":2,\"10\":1,\"4294967294\":7,\"01\":8,\"4294967295\":6,\"Z\":5,\"\ud83d\ude00\":4,\"\uff01\":3},\"b\":[1e+21,1e-7,0.1,100,0,1.5e+300,123456789012345680000,\"\\u0000\\u001f\\b\\f\\n\\r\\t\\\"\\\\\u007f\u2028/<>&é\ud83d\ude00\"]}" } } ] }
+
+  - name: numeric option ids keep their option order in labels
+    tags: [ edge ]
+    init:
+      model: m
+      results: [ { labels: [ "2", "10", b ], scores: [ 0.2, 0.3, 0.5 ] } ]
+    steps:
+      - { call: predict, args: [ { question: Q, options: [ { id: b }, { id: "10" }, { id: "2" } ] } ], expect: { value: { model: m, semantics: uncalibrated-scores, probabilities: { b: 0.5, "10": 0.3, "2": 0.2 } } } }
+      - { call: calls, args: [], expect: { value: [ { $partial: { labels: [ b, "10", "2" ] } } ] } }
+
+  - name: invalid input never reaches the pipeline
+    tags: [ validation ]
+    steps:
+      - { call: predict, args: [ { question: "", options: [ { id: a }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: "a b" } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: calls, args: [], expect: { value: [] } }
+
+  - name: scores are passed through unchecked
+    tags: [ edge, numbers ]
+    init:
+      model: ""
+      results: [ { labels: [ a, b ], scores: [ 2, -1 ] } ]
+    call: predict
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { value: { model: "", semantics: uncalibrated-scores, probabilities: { a: 2, b: -1 } } }
+
+  - name: classifier results must match the labels sent
+    tags: [ provider, validation ]
+    init:
+      model: m
+      results:
+        - null
+        - { labels: [], scores: [] }
+        - { scores: [ 0.5, 0.5 ] }
+        - { labels: [ a, b ] }
+        - { labels: "ab", scores: [ 0.5, 0.5 ] }
+        - { labels: [ a, b ], scores: { a: 0.5 } }
+        - { labels: [ a, b ], scores: [ 1 ] }
+        - { labels: [ a ], scores: [ 0.5, 0.5 ] }
+        - { labels: [ a, a ], scores: [ 0.5, 0.5 ] }
+        - { labels: [ a, c ], scores: [ 0.5, 0.5 ] }
+        - { labels: [ a, b, b ], scores: [ 0.5, 0.5, 0 ] }
+        - { labels: [ a, "B" ], scores: [ 0.5, 0.5 ] }
+        - { labels: [ a, "b " ], scores: [ 0.5, 0.5 ] }
+        - { labels: [ a, 1 ], scores: [ 0.5, 0.5 ] }
+    steps:
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid classifier response } } }
+      - { call: calls, args: [], expect: { value: { $length: 14 } } }
+
+  - name: pipeline errors propagate
+    tags: [ provider ]
+    init: { model: m, results: [ { error: model not loaded } ] }
+    call: predict
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: model not loaded } }
+
+  - name: an aborted signal stops before the pipeline
+    tags: [ cancellation ]
+    steps:
+      - { call: predictAborted, args: [ { question: q, options: [ { id: billing, description: Invoices }, { id: sales } ] }, before ], expect: { error: { status: null, message: This operation was aborted } } }
+      - { call: calls, args: [], expect: { value: [] } }
+
+  - name: validation comes before the abort check
+    tags: [ cancellation, validation ]
+    call: predictAborted
+    args: [ { question: q, options: [] }, before ]
+    expect: { error: { status: 400, message: Invalid choice question or options } }
+
+  - name: an abort during inference discards the result
+    tags: [ cancellation ]
+    steps:
+      - { call: predictAborted, args: [ { question: q, options: [ { id: billing, description: Invoices }, { id: sales } ] }, during ], expect: { error: { status: null, message: This operation was aborted } } }
+      - { call: calls, args: [], expect: { value: { $length: 1 } } }
+
+  - name: an abort during inference wins over an invalid result
+    tags: [ cancellation ]
+    init: { model: m, results: [ { labels: [], scores: [] } ] }
+    call: predictAborted
+    args: [ { question: q, options: [ { id: a }, { id: b } ] }, during ]
+    expect: { error: { status: null, message: This operation was aborted } }
+
+  # --- through Choice ----------------------------------------------------------------------------
+  - name: Choice abstains on uncalibrated scores by default
+    init: { model: m, results: [ { labels: [ b, a ], scores: [ 0.01, 0.99 ] }, { labels: [ b, a ], scores: [ 0.01, 0.99 ] } ] }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { provider: transformers, model: m, semantics: uncalibrated-scores, probabilities: { a: 0.99, b: 0.01 }, selected: a, accepted: false, requiresReview: true } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { allowUncalibrated: true } ], expect: { value: { $partial: { selected: a, accepted: true, requiresReview: false } } } }
+
+  - name: Choice rejects scores that are not a distribution
+    tags: [ provider, validation ]
+    init:
+      model: m
+      results:
+        - { labels: [ a, b ], scores: [ 2, -1 ] }
+        - { labels: [ a, b ], scores: [ 0.9, 0.9 ] }
+        - { labels: [ a, b ], scores: [ "0.5", 0.5 ] }
+        - { labels: [ a, b ], scores: [ 1, 0 ] }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { allowUncalibrated: true } ], expect: { value: { $partial: { accepted: true } } } }
+
+  - name: Choice rejects an empty model name
+    tags: [ provider, validation ]
+    init: { model: "", results: [ { labels: [ a, b ], scores: [ 1, 0 ] } ] }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }

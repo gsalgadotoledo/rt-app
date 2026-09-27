@@ -13,6 +13,14 @@ import {
   type Store,
   type Write,
 } from "@gsalgadotoledo/rt-app-contracts";
+/**
+ * Document client options. Numbers are JavaScript doubles in every store: values beyond 2^53
+ * (such as 1e21) are written and read as doubles instead of failing, like memory and PostgreSQL.
+ */
+export const documentOptions = {
+  marshallOptions: { removeUndefinedValues: true, allowImpreciseNumbers: true },
+  unmarshallOptions: { wrapNumbers: (value: string) => Number(value) },
+};
 export class DynamoStore implements Store {
   readonly provider = "dynamodb";
   readonly capabilities = requiredCapabilities;
@@ -28,7 +36,7 @@ export class DynamoStore implements Store {
         maxAttempts: 3,
         requestHandler: { connectionTimeout: 2000, requestTimeout: 8000 },
       }),
-      { marshallOptions: { removeUndefinedValues: true } },
+      documentOptions,
     );
   }
   /** Read one row; absence returns undefined. Durable reads use ConsistentRead. */

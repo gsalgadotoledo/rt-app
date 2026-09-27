@@ -76,7 +76,7 @@ func TestDispatch(t *testing.T) {
 		{"GET", "/items/", "", 404, `{"error":"Endpoint not found"}`},
 		{"PUT", "/items/x", "{}", 401, `{"error":"Sign in"}`}, // also at its plain path, like TypeScript
 		{"GET", "/me", "", 401, `{"error":"Sign in"}`},
-		{"PUT", "/admin/app/items/x", "", 401, `{"error":"Sign in"}`},
+		{"PUT", "/admin/app/items/x", "", 401, `{"error":"Sign in to admin"}`},
 		{"GET", "/fail", "", 500, `{"error":"Internal error"}`},
 		{"GET", "/panic", "", 500, `{"error":"Internal error"}`},
 		{"GET", "/teapot", "", 418, `{"error":"Short and stout"}`},
@@ -115,12 +115,13 @@ func TestLocalAdminAndAccess(t *testing.T) {
 		return &Actor{ID: "m", Role: "member", Grants: []string{"grants.read"}}, nil
 	}
 	app = testApp(t, WithAdminAuthenticator(member), WithAuthenticator(member))
-	for target, status := range map[string]int{"/admin/app/grants": 200, "/me": 200} {
+	// Grants apply at plain paths; /admin/app only admits the admin root (TypeScript AdminIdentity).
+	for target, status := range map[string]int{"/grants": 200, "/me": 200, "/admin/app/grants": 401} {
 		if w := call(t, app, "GET", target, ""); w.Code != status {
 			t.Errorf("member GET %s: %d %s", target, w.Code, w.Body)
 		}
 	}
-	if w := call(t, app, "PUT", "/admin/app/items/x", ""); w.Code != 403 {
+	if w := call(t, app, "PUT", "/items/x", ""); w.Code != 403 {
 		t.Errorf("member on owner endpoint: %d %s", w.Code, w.Body)
 	}
 }

@@ -306,17 +306,18 @@ class IdentityAppTests(unittest.TestCase):
         self.assertEqual(self.call("GET", "/users/me", token=alice)[1]["email"], "alice@example.test")
         self.assertEqual(self.call("GET", "/users/me"), (401, {"error": "Sign in"}))
         self.assertEqual(self.call("GET", "/users/me", token="garbage"), (401, {"error": "Invalid or expired session"}))
-        self.assertEqual(self.call("GET", "/admin/app/users", token=alice)[0], 403)
+        self.assertEqual(self.call("GET", "/users", token=alice)[0], 403)
+        self.assertEqual(self.call("GET", "/admin/app/users", token=owner)[0], 401)  # /admin/app is for the admin root
         self.assertEqual(self.call("GET", "/users", token=owner)[0], 200)  # permission routes: plain path and /admin/app
-        listed = self.call("GET", "/admin/app/users", token=owner)[1]
+        listed = self.call("GET", "/users", token=owner)[1]
         self.assertEqual(sorted(u["id"] for u in listed["items"]), ["u-alice", "u-owner"])
-        resources = self.call("GET", "/admin/app/acl/resources", token=owner)[1]
+        resources = self.call("GET", "/acl/resources", token=owner)[1]
         self.assertIn({"resource": "users.list", "method": "GET", "path": "/admin/app/users", "access": "permission"}, resources)
-        status, view = self.call("PUT", "/admin/app/acl/users/u-alice", {"role": "user", "grants": ["users.list"]}, owner)
+        status, view = self.call("PUT", "/acl/users/u-alice", {"role": "user", "grants": ["users.list"]}, owner)
         self.assertEqual((status, view["grants"]), (200, ["users.list"]))
-        self.assertEqual(self.call("GET", "/admin/app/users", token=alice), (401, {"error": "Invalid session"}))  # revoked
+        self.assertEqual(self.call("GET", "/users", token=alice), (401, {"error": "Invalid session"}))  # revoked
         alice = self.login("alice@example.test")
-        self.assertEqual(self.call("GET", "/admin/app/users", token=alice)[0], 200)
+        self.assertEqual(self.call("GET", "/users", token=alice)[0], 200)
         self.assertEqual(self.call("GET", "/auth/methods")[1]["provider"], "local")
         self.assertEqual(self.call("POST", "/auth/logout", token=alice), (200, {"ok": True}))
         self.assertEqual(self.call("GET", "/users/me", token=alice)[0], 401)

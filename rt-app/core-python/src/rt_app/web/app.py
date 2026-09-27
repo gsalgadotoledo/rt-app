@@ -145,7 +145,9 @@ class App:
     - every endpoint is served at its path, except the admin-only ones (``admin_only``);
     - owner and permission endpoints are also served under ``/admin/app<path>``;
     - literal routes win over ``:param`` routes; params are URL-decoded (400 "Invalid URL");
-    - ``local_admin`` makes admin routes run as ``{"id": "rt-app-root", "role": "owner"}``;
+    - admin routes (``/admin/...``) only admit the admin root ``{"id": "rt-app-root"}``: the local
+      owner with ``local_admin``, or whoever ``admin_authenticate(request)`` returns (401 "Sign in
+      to admin" otherwise), like the TypeScript AdminIdentity;
     - ``authenticate(request)`` returns the actor for other protected routes (or None), e.g.
       ``auth.actor_from_request``; it may raise ``HttpError`` (401 for a bad token);
     - ``acl`` (e.g. ``rt_app.acl.ACL``) authorizes requests instead of the built-in policy;
@@ -159,12 +161,14 @@ class App:
         *,
         local_admin: bool = False,
         authenticate: Callable[[Request], Actor | None] | None = None,
+        admin_authenticate: Callable[[Request], Actor | None] | None = None,
         acl: AccessPolicy | None = None,
         fallback: Fallback | None = None,
     ) -> None:
         self.features = tuple(features)
         self.local_admin = local_admin
         self.authenticate = authenticate
+        self.admin_authenticate = admin_authenticate
         self.acl = acl
         self.fallback = fallback
         declared = [endpoint for feature in self.features for endpoint in feature.endpoints]
@@ -213,11 +217,21 @@ class App:
     def _actor(self, endpoint: Endpoint, request: Request) -> Actor | None:
         if endpoint.access == "guest":
             return None
-        if self.local_admin and endpoint.path.startswith("/admin/"):
-            return dict(LOCAL_OWNER)  # type: ignore[return-value]
+        if endpoint.path.startswith("/admin/"):
+            # The admin has its own identity (TypeScript AdminIdentity): the local root in local
+            # mode, otherwise admin_authenticate (e.g. the admin password session).
+            if self.local_admin:
+                return dict(LOCAL_OWNER)  # type: ignore[return-value]
+            return self.admin_authenticate(request) if self.admin_authenticate else None
         return self.authenticate(request) if self.authenticate else None
 
     def _check(self, endpoint: Endpoint, actor: Actor | None) -> None:
+        # Admin routes use the admin identity's policy (TypeScript AdminIdentity.acl): only the
+        # admin root may call them; roles, grants and explicit grants do not apply there.
+        if endpoint.path.startswith("/admin/"):
+            if endpoint.access != "guest" and (actor is None or actor.get("id") != "rt-app-root"):
+                raise HttpError(401, "Sign in to admin")
+            return
         if self.acl is not None:
             self.acl.check(endpoint, actor)
             return

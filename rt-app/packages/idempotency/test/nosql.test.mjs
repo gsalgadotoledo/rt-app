@@ -79,3 +79,18 @@ test('a vanished conflicting row fails closed', async () => {
   const adapter = new NoSQLIdempotencyStore({transact: async () => {throw new Conflict();}, get: async () => undefined});
   await assert.rejects(adapter.claim({scope:'s',key:'k',owner:'o',fingerprint:'f'}), Conflict);
 });
+
+test('an injected clock stamps createdAt and updatedAt', async () => {
+  const store = new MemoryStore();
+  let now = Date.UTC(2026, 0, 2, 3, 4, 5, 678);
+  const adapter = new NoSQLIdempotencyStore(store, { now: () => now });
+  const claim = { scope: 's', key: 'k', fingerprint: 'f', owner: 'o' };
+  await adapter.claim(claim);
+  assert.equal((await store.get('IDEMPOTENCY#s', 'k')).data.createdAt, '2026-01-02T03:04:05.678Z');
+  now = new Date('2026-01-03T00:00:00.000Z');
+  await adapter.complete(claim, 1);
+  assert.equal((await store.get('IDEMPOTENCY#s', 'k')).data.updatedAt, '2026-01-03T00:00:00.000Z');
+  const executor = createIdempotency(store, { now: () => 0 });
+  await executor.execute({ scope: 't', key: 'k', input: null }, async () => 2);
+  assert.equal((await store.get('IDEMPOTENCY#t', 'k')).data.createdAt, '1970-01-01T00:00:00.000Z');
+});

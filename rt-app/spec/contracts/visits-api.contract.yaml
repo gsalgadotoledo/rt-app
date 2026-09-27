@@ -1,0 +1,78 @@
+contract: 1
+kind: http
+module: visits-api
+title: Visits HTTP API (local mode)
+description: |
+  Visit capture as every backend language serves it in local mode, with the default public pages
+  ["/", "/about", "/services"] and a random server secret. POST /visits/start and POST
+  /visits/events are public (rate limited per client ip: all cases together stay well under 60
+  capture requests); GET /visits, GET /visits/:id and DELETE /visits/:id are owner-only and
+  mounted under /admin/app only. Only the case "capture, list and replay" stores sessions, so its
+  list is exact. Paths cannot reference earlier responses, so detail and delete of a stored session
+  are pinned by the module contract (visits.contract.yaml).
+cases:
+  - name: start returns a signed token
+    requests:
+      - request: { method: POST, path: /visits/start }
+        expect:
+          status: 200
+          body: { token: { $regex: "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }, maxPoints: 120, pages: [/, /about, /services] }
+          headers: { cache-control: no-store }
+
+  - name: capture, list and replay
+    requests:
+      - request: { method: POST, path: /visits/start, body: {} }
+        expect: { status: 200 }
+      - request: { method: POST, path: /visits/events, body: { token: { $ref: "0.body.token" }, sequence: 1, points: [{ type: page, path: /about, t: 0, x: 0, y: 0 }, { type: click, path: /about, t: 120, x: 50, y: 25, text: never stored }] } }
+        expect: { status: 200, body: { ok: true, recorded: true } }
+      - request: { method: POST, path: /visits/events, body: { token: { $ref: "0.body.token" }, sequence: 1, points: [{ type: click, path: /, t: 130, x: 1, y: 1 }] } }
+        expect: { status: 200, body: { ok: true, recorded: false } }
+      - request: { method: POST, path: /visits/events, body: { token: { $ref: "0.body.token" }, sequence: 2, points: [{ type: scroll, path: /services, t: 140, x: 0, y: 100 }] } }
+        expect: { status: 200, body: { ok: true, recorded: true } }
+      - request: { method: GET, path: /admin/app/visits }
+        expect:
+          status: 200
+          body:
+            items: [{ id: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }, startedAt: { $type: integer }, updatedAt: { $type: integer }, sequence: 2, events: 3, pages: [/about, /services] }]
+            limit: 10
+            maxPoints: 120
+      - request: { method: GET, path: /admin/app/visits/ }
+        expect: { status: 200, body: { $partial: { items: { $length: 1 } } } }
+
+  - name: capture input is validated
+    tags: [validation]
+    requests:
+      - request: { method: POST, path: /visits/start }
+        expect: { status: 200 }
+      - { request: { method: POST, path: /visits/events, body: {} }, expect: { status: 400, body: { error: Invalid visit token } } }
+      - { request: { method: POST, path: /visits/events, body: { token: "e30.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", sequence: 1, points: [] } }, expect: { status: 400, body: { error: Invalid visit token } } }
+      - request: { method: POST, path: /visits/events, body: { token: { $ref: "0.body.token" }, sequence: 0, points: [] } }
+        expect: { status: 400, body: { error: Invalid visit batch } }
+      - request: { method: POST, path: /visits/events, body: { token: { $ref: "0.body.token" }, sequence: 1, points: [{ type: click, path: "/account?token=secret", t: 0, x: 0, y: 0 }] } }
+        expect: { status: 400, body: { error: Invalid visit point } }
+      - request: { method: POST, path: /visits/events, body: { token: { $ref: "0.body.token" }, sequence: 1, points: [{ type: click, path: /, t: 0, x: 101, y: 0 }] } }
+        expect: { status: 400, body: { error: Invalid visit point } }
+
+  - name: capture bodies must be JSON objects
+    tags: [validation, edge]
+    requests:
+      - { request: { method: POST, path: /visits/events, body: [1] }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - { request: { method: POST, path: /visits/events, headers: { content-type: application/json }, raw: "{bad" }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - { request: { method: POST, path: /visits/start, raw: "null" }, expect: { status: 400, body: { error: Invalid JSON } } }
+
+  - name: unknown sessions
+    requests:
+      - { request: { method: GET, path: /admin/app/visits/00000000-0000-4000-8000-000000000000 }, expect: { status: 404, body: { error: Visit not found } } }
+      - { request: { method: DELETE, path: /admin/app/visits/00000000-0000-4000-8000-000000000000 }, expect: { status: 200, body: { ok: true } } }
+      - { request: { method: GET, path: "/admin/app/visits/%F0%9F%9A%80" }, expect: { status: 404, body: { error: Visit not found } } }
+      - { request: { method: GET, path: "/admin/app/visits/%E0%A4%A" }, expect: { status: 400, body: { error: Invalid URL } } }
+
+  - name: reading and deleting sessions is only served under /admin/app
+    tags: [security]
+    requests:
+      - { request: { method: GET, path: /visits }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /visits/00000000-0000-4000-8000-000000000000 }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: DELETE, path: /visits/00000000-0000-4000-8000-000000000000 }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /admin/app/visits/start }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /admin/app/visits/events, body: {} }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /visits/start }, expect: { status: 404, body: { error: Endpoint not found } } }

@@ -1,0 +1,368 @@
+contract: 1
+module: health
+title: Health checks (liveness, readiness and the owner report)
+description: |
+  HealthChecks(probes, timeoutMs = 1000, cacheMs = 10000, {now}) runs dependency probes and serves
+  three endpoints: GET /health/live and GET /health/ready (guest) and GET /health/report (owner).
+
+  - Configuration (checked when the instance is built): at most 20 probes, unique ids, timeoutMs a
+    finite number >= 1 and cacheMs a finite number >= 0 (JavaScript typeof number: "10" and true are
+    not numbers). Otherwise a plain error (no status) "Invalid health configuration".
+  - report() → {ok, at, checks:[{id, required, status, durationMs}]}. Checks keep the probe order.
+    required is false only when the probe says required: false. status is "up" when the probe
+    completes within timeoutMs and "down" when it fails or times out; failure details (messages,
+    credentials) never appear. ok is true when every required check is up. at is the clock time
+    (Date.toISOString, milliseconds, Z) when the run finished. durationMs is Math.round of the
+    elapsed monotonic time (not pinned: any integer).
+  - Probes run in parallel. A probe that times out is reported down and its abort signal
+    (context cancellation in Go, a threading.Event in Python) is triggered.
+  - Cache: the last report is reused while expires > now, where expires = now + cacheMs at the end
+    of the run (cacheMs 0 never reuses). Concurrent callers share one in-flight run.
+  - Endpoints: live → {ok: true} always; ready → {ok: true} when the (cached) report is ok,
+    otherwise 503 "Service unavailable"; report → the report (owner only; mounted under /admin/app).
+
+  Facade (subject health): init {probes: [{id, required?, behavior?}], timeoutMs?, cacheMs?, now}.
+  Scripted probe behaviors: up (default), down (fails with a secret-looking message), slow (up
+  after 50 ms), hang (never completes; records its abort signal). Methods: report(),
+  concurrentReports(n) (n parallel report() calls), live(), ready(), healthReport() (the endpoint
+  handlers), endpoints() → [{method, path, resource, access}], and helpers setProbe(id, behavior),
+  calls(id) (probe invocations), aborted(id) (the last signal was aborted), setNow(iso).
+
+  AvailabilityMonitor(checks, notify) (subject health-monitor, init as above, cacheMs defaults to 0):
+  poll() runs checks.report() and, for each check in order, notifies {service: id, status, at:
+  report.at} when the status differs from the previous poll, or on the first poll when it is down
+  (an initial "up" is silent). The state of a check is saved only after its notification succeeds;
+  a failing notification makes poll() fail with that error and leaves the remaining checks of that
+  report unprocessed, so they are retried by the next poll. Required and optional checks alert
+  alike. Facade helpers: alerts() (delivered alerts, oldest first), failNotifications(n) (the next n
+  notifications fail with "mail offline"), setProbe, setNow.
+
+  httpHealthProbe(id, url, transport) (subject health-http-probe): the URL is trusted configuration.
+  It must parse as an absolute URL (else "Invalid URL"), use http or https (case-insensitive) and
+  carry no user name or password (empty ones are fine); else "Invalid health URL". Both errors are
+  plain (no status) and raised when the probe is built. The check requests the URL without
+  following redirects and fails ("Service unavailable") unless the status is 200-299. Facade:
+  probe(id, url) → {id}; check(url, status) → null, with a transport that answers status.
+subject: health
+init: { now: "2030-01-01T00:00:00.000Z" }
+cases:
+  # --- endpoints -------------------------------------------------------------
+  - name: the feature serves live, ready and the owner report
+    call: endpoints
+    expect:
+      value:
+        - { method: GET, path: /health/live, resource: health.live, access: guest }
+        - { method: GET, path: /health/ready, resource: health.ready, access: guest }
+        - { method: GET, path: /health/report, resource: health.read, access: owner }
+
+  - name: without probes everything is ok
+    steps:
+      - { call: report, expect: { value: { ok: true, at: "2030-01-01T00:00:00.000Z", checks: [] } } }
+      - { call: live, expect: { value: { ok: true } } }
+      - { call: ready, expect: { value: { ok: true } } }
+      - { call: healthReport, expect: { value: { ok: true, at: "2030-01-01T00:00:00.000Z", checks: [] } } }
+
+  - name: a passing probe is up and required by default
+    init: { now: "2030-01-01T00:00:00.123Z", probes: [{ id: database }] }
+    steps:
+      - call: report
+        expect: { value: { ok: true, at: "2030-01-01T00:00:00.123Z", checks: [{ id: database, required: true, status: up, durationMs: { $type: integer } }] } }
+      - { call: calls, args: [database], expect: { value: 1 } }
+      - { call: aborted, args: [database], expect: { value: false } }
+
+  - name: a failing required probe makes the report not ok and readiness 503
+    tags: [security]
+    init: { now: "2030-01-01T00:00:00.000Z", probes: [{ id: database, behavior: down }, { id: cache, required: true }] }
+    steps:
+      - call: report
+        expect:
+          value:
+            ok: false
+            at: "2030-01-01T00:00:00.000Z"
+            checks:
+              - { id: database, required: true, status: down, durationMs: { $type: integer } }
+              - { id: cache, required: true, status: up, durationMs: { $type: integer } }
+        note: the report is exact, so the probe's error text (password=…) never leaks
+      - { call: ready, expect: { error: { status: 503, message: Service unavailable } } }
+      - { call: live, expect: { value: { ok: true } } }
+      - { call: healthReport, expect: { value: { $partial: { ok: false } } } }
+
+  - name: optional probes may fail without failing readiness
+    init: { now: "2030-01-01T00:00:00.000Z", probes: [{ id: search, required: false, behavior: down }, { id: database }] }
+    steps:
+      - call: report
+        expect:
+          value:
+            ok: true
+            at: "2030-01-01T00:00:00.000Z"
+            checks:
+              - { id: search, required: false, status: down, durationMs: { $type: integer } }
+              - { id: database, required: true, status: up, durationMs: { $type: integer } }
+      - { call: ready, expect: { value: { ok: true } } }
+
+  - name: checks keep the probe order and any id
+    tags: [edge]
+    init: { now: "2030-01-01T00:00:00.000Z", cacheMs: 0, probes: [{ id: z }, { id: "ü 🚀" }, { id: a }] }
+    steps:
+      - { call: report, expect: { value: { $partial: { checks: [{ $partial: { id: z } }, { $partial: { id: "ü 🚀" } }, { $partial: { id: a } }] } } } }
+
+  # --- time and caching ------------------------------------------------------
+  - name: reports are cached for cacheMs (10 s by default) using the injected clock
+    init: { now: "2030-01-01T00:00:00.000Z", probes: [{ id: database }] }
+    steps:
+      - { call: report, expect: { value: { $partial: { ok: true, at: "2030-01-01T00:00:00.000Z" } } } }
+      - { call: setProbe, args: [database, down], expect: { value: null } }
+      - { call: setNow, args: ["2030-01-01T00:00:09.999Z"], expect: { value: null } }
+      - { call: report, expect: { value: { $partial: { ok: true, at: "2030-01-01T00:00:00.000Z" } } } }
+      - { call: ready, expect: { value: { ok: true } } }
+      - { call: calls, args: [database], expect: { value: 1 } }
+      - { call: setNow, args: ["2030-01-01T00:00:10.000Z"], expect: { value: null } }
+      - { call: report, expect: { value: { $partial: { ok: false, at: "2030-01-01T00:00:10.000Z" } } } }
+      - { call: calls, args: [database], expect: { value: 2 } }
+      - { call: ready, expect: { error: { status: 503, message: Service unavailable } } }
+      - { call: calls, args: [database], expect: { value: 2 } }
+
+  - name: a clock moved backwards keeps using the cached report
+    tags: [edge]
+    init: { now: "2030-01-01T00:00:00.000Z", cacheMs: 1000, probes: [{ id: database }] }
+    steps:
+      - { call: report, expect: { value: { $partial: { at: "2030-01-01T00:00:00.000Z" } } } }
+      - { call: setNow, args: ["2029-12-31T00:00:00.000Z"], expect: { value: null } }
+      - { call: report, expect: { value: { $partial: { at: "2030-01-01T00:00:00.000Z" } } } }
+      - { call: calls, args: [database], expect: { value: 1 } }
+
+  - name: cacheMs 0 runs the probes on every report
+    init: { now: "2030-01-01T00:00:00.000Z", cacheMs: 0, probes: [{ id: database }] }
+    steps:
+      - { call: report, expect: { value: { $partial: { ok: true } } } }
+      - { call: setProbe, args: [database, down], expect: { value: null } }
+      - { call: report, expect: { value: { $partial: { ok: false } } } }
+      - { call: ready, expect: { error: { status: 503, message: Service unavailable } } }
+      - { call: setProbe, args: [database, up], expect: { value: null } }
+      - { call: ready, expect: { value: { ok: true } } }
+      - { call: calls, args: [database], expect: { value: 4 } }
+
+  - name: a small cache expires after exactly cacheMs
+    tags: [edge]
+    init: { now: "2030-01-01T00:00:00.000Z", cacheMs: 1, probes: [{ id: database }] }
+    steps:
+      - { call: report, expect: { value: { $partial: { ok: true } } } }
+      - { call: report, expect: { value: { $partial: { ok: true } } } }
+      - { call: calls, args: [database], expect: { value: 1 } }
+      - { call: setNow, args: ["2030-01-01T00:00:00.001Z"], expect: { value: null } }
+      - { call: report, expect: { value: { $partial: { at: "2030-01-01T00:00:00.001Z" } } } }
+      - { call: calls, args: [database], expect: { value: 2 } }
+
+  - name: concurrent callers share one probe run
+    tags: [concurrency]
+    init: { now: "2030-01-01T00:00:00.000Z", cacheMs: 0, probes: [{ id: database, behavior: slow }] }
+    steps:
+      - call: concurrentReports
+        args: [3]
+        expect:
+          value:
+            - { ok: true, at: "2030-01-01T00:00:00.000Z", checks: [{ id: database, required: true, status: up, durationMs: { $type: integer } }] }
+            - { ok: true, at: "2030-01-01T00:00:00.000Z", checks: [{ id: database, required: true, status: up, durationMs: { $type: integer } }] }
+            - { ok: true, at: "2030-01-01T00:00:00.000Z", checks: [{ id: database, required: true, status: up, durationMs: { $type: integer } }] }
+      - { call: calls, args: [database], expect: { value: 1 } }
+
+  # --- timeouts ----------------------------------------------------------------
+  - name: a probe that exceeds timeoutMs is down and aborted
+    tags: [edge]
+    init: { now: "2030-01-01T00:00:00.000Z", timeoutMs: 30, probes: [{ id: database, behavior: hang }, { id: cache }] }
+    steps:
+      - call: report
+        expect:
+          value:
+            ok: false
+            at: "2030-01-01T00:00:00.000Z"
+            checks:
+              - { id: database, required: true, status: down, durationMs: { $type: integer } }
+              - { id: cache, required: true, status: up, durationMs: { $type: integer } }
+      - { call: aborted, args: [database], expect: { value: true } }
+      - { call: aborted, args: [cache], expect: { value: false } }
+
+  - name: a timed-out optional probe does not fail readiness
+    init: { now: "2030-01-01T00:00:00.000Z", timeoutMs: 20, probes: [{ id: search, required: false, behavior: hang }] }
+    steps:
+      - { call: ready, expect: { value: { ok: true } } }
+      - { call: report, expect: { value: { ok: true, at: "2030-01-01T00:00:00.000Z", checks: [{ id: search, required: false, status: down, durationMs: { $type: integer } }] } } }
+      - { call: aborted, args: [search], expect: { value: true } }
+
+  - name: probes run in parallel within one timeout
+    tags: [edge]
+    init: { now: "2030-01-01T00:00:00.000Z", timeoutMs: 200, probes: [{ id: a, behavior: slow }, { id: b, behavior: slow }, { id: c, behavior: slow }, { id: d, behavior: slow }, { id: e, behavior: slow }] }
+    call: report
+    expect: { value: { $partial: { ok: true } } }
+    note: 5 slow probes (50 ms each) only fit in 200 ms when they run concurrently
+
+  # --- configuration -----------------------------------------------------------
+  - name: timeoutMs must be a finite number of at least 1
+    tags: [validation]
+    init: { timeoutMs: 0 }
+    create: { error: { status: null, message: Invalid health configuration } }
+
+  - name: fractional timeouts below 1 are invalid
+    tags: [validation, edge]
+    init: { timeoutMs: 0.5 }
+    create: { error: { status: null, message: Invalid health configuration } }
+
+  - name: fractional timeouts of at least 1 are valid
+    tags: [edge]
+    init: { timeoutMs: 1.5, now: "2030-01-01T00:00:00.000Z" }
+    call: report
+    expect: { value: { ok: true, at: "2030-01-01T00:00:00.000Z", checks: [] } }
+
+  - name: numeric strings are not numbers
+    tags: [validation, edge]
+    init: { timeoutMs: "10" }
+    create: { error: { status: null, message: Invalid health configuration } }
+
+  - name: booleans are not numbers
+    tags: [validation, edge]
+    init: { cacheMs: true }
+    create: { error: { status: null, message: Invalid health configuration } }
+
+  - name: cacheMs cannot be negative
+    tags: [validation]
+    init: { cacheMs: -1 }
+    create: { error: { status: null, message: Invalid health configuration } }
+
+  - name: the smallest valid settings
+    tags: [edge]
+    init: { timeoutMs: 1, cacheMs: 0, now: "2030-01-01T00:00:00.000Z" }
+    call: live
+    expect: { value: { ok: true } }
+
+  - name: probe ids must be unique
+    tags: [validation]
+    init: { probes: [{ id: database }, { id: database, required: false }] }
+    create: { error: { status: null, message: Invalid health configuration } }
+
+  - name: at most 20 probes
+    tags: [validation]
+    init: { probes: [{ $repeat: { count: 21, item: { id: "p{i}" } } }] }
+    create: { error: { status: null, message: Invalid health configuration } }
+
+  - name: 20 probes are allowed
+    tags: [edge]
+    init: { now: "2030-01-01T00:00:00.000Z", probes: [{ $repeat: { count: 20, item: { id: "p{i}" } } }] }
+    call: report
+    expect: { value: { ok: true, at: "2030-01-01T00:00:00.000Z", checks: { $length: 20 } } }
+
+  # --- availability monitor -----------------------------------------------------
+  - name: the monitor is silent while everything stays up
+    subject: health-monitor
+    init: { now: "2030-01-01T00:00:00.000Z", probes: [{ id: api }] }
+    steps:
+      - { call: poll, expect: { value: { ok: true, at: "2030-01-01T00:00:00.000Z", checks: [{ id: api, required: true, status: up, durationMs: { $type: integer } }] } } }
+      - { call: poll, expect: { value: { $partial: { ok: true } } } }
+      - { call: alerts, expect: { value: [] } }
+
+  - name: the monitor alerts an initial outage, then only transitions
+    subject: health-monitor
+    init: { now: "2030-01-01T00:00:00.000Z", probes: [{ id: api, behavior: down }, { id: search, required: false }] }
+    steps:
+      - { call: poll, expect: { value: { $partial: { ok: false } } } }
+      - { call: alerts, expect: { value: [{ service: api, status: down, at: "2030-01-01T00:00:00.000Z" }] } }
+      - { call: setNow, args: ["2030-01-01T00:01:00.000Z"], expect: { value: null } }
+      - { call: poll, expect: { value: { $partial: { ok: false } } } }
+      - { call: alerts, expect: { value: { $length: 1 } } }
+      - { call: setProbe, args: [api, up], expect: { value: null } }
+      - { call: setProbe, args: [search, down], expect: { value: null } }
+      - { call: setNow, args: ["2030-01-01T00:02:00.000Z"], expect: { value: null } }
+      - { call: poll, expect: { value: { $partial: { ok: true } } } }
+      - call: alerts
+        expect:
+          value:
+            - { service: api, status: down, at: "2030-01-01T00:00:00.000Z" }
+            - { service: api, status: up, at: "2030-01-01T00:02:00.000Z" }
+            - { service: search, status: down, at: "2030-01-01T00:02:00.000Z" }
+
+  - name: failed notifications are retried on the next poll
+    subject: health-monitor
+    init: { now: "2030-01-01T00:00:00.000Z", probes: [{ id: api }, { id: queue }] }
+    steps:
+      - { call: poll, expect: { value: { $partial: { ok: true } } } }
+      - { call: setProbe, args: [api, down], expect: { value: null } }
+      - { call: setProbe, args: [queue, down], expect: { value: null } }
+      - { call: failNotifications, args: [1], expect: { value: null } }
+      - { call: setNow, args: ["2030-01-01T00:00:30.000Z"], expect: { value: null } }
+      - { call: poll, expect: { error: { status: null, message: mail offline } } }
+      - { call: alerts, expect: { value: [] } }
+      - { call: setNow, args: ["2030-01-01T00:01:00.000Z"], expect: { value: null } }
+      - { call: poll, expect: { value: { $partial: { ok: false } } } }
+      - call: alerts
+        expect:
+          value:
+            - { service: api, status: down, at: "2030-01-01T00:01:00.000Z" }
+            - { service: queue, status: down, at: "2030-01-01T00:01:00.000Z" }
+      - { call: poll, expect: { value: { $partial: { ok: false } } } }
+      - { call: alerts, expect: { value: { $length: 2 } } }
+
+  - name: a failure in the middle stops the remaining checks of that poll
+    tags: [edge]
+    subject: health-monitor
+    init: { now: "2030-01-01T00:00:00.000Z", probes: [{ id: api }, { id: queue, behavior: down }, { id: mail, behavior: down }] }
+    steps:
+      - { call: failNotifications, args: [1], expect: { value: null } }
+      - { call: poll, expect: { error: { message: mail offline } } }
+      - { call: setProbe, args: [queue, up], expect: { value: null } }
+      - { call: poll, expect: { value: { $partial: { ok: false } } } }
+      - call: alerts
+        expect:
+          value:
+            - { service: mail, status: down, at: "2030-01-01T00:00:00.000Z" }
+        note: queue was never recorded as down, so its initial up is silent; api was recorded up
+
+  # --- HTTP probes -------------------------------------------------------------
+  - name: HTTP probes keep their id
+    subject: health-http-probe
+    init: {}
+    steps:
+      - { call: probe, args: [api, "https://example.test/health"], expect: { value: { id: api } } }
+      - { call: probe, args: [local, "http://127.0.0.1:8080/health/ready"], expect: { value: { id: local } } }
+      - { call: probe, args: [upper, "HTTPS://EXAMPLE.TEST/"], expect: { value: { id: upper } } }
+
+  - name: HTTP probe URLs must be http or https without credentials
+    tags: [security, validation]
+    subject: health-http-probe
+    init: {}
+    steps:
+      - { call: probe, args: [x, "ftp://example.test"], expect: { error: { status: null, message: Invalid health URL } } }
+      - { call: probe, args: [x, "file:///etc/passwd"], expect: { error: { status: null, message: Invalid health URL } } }
+      - { call: probe, args: [x, "mailto:ops@example.test"], expect: { error: { status: null, message: Invalid health URL } } }
+      - { call: probe, args: [x, "javascript:alert(1)"], expect: { error: { status: null, message: Invalid health URL } } }
+      - { call: probe, args: [x, "https://user:pass@example.test"], expect: { error: { status: null, message: Invalid health URL } } }
+      - { call: probe, args: [x, "https://:secret@example.test"], expect: { error: { status: null, message: Invalid health URL } } }
+      - { call: probe, args: [x, "https://user@example.test"], expect: { error: { status: null, message: Invalid health URL } } }
+      - { call: probe, args: [x, "https://user:@example.test"], expect: { error: { status: null, message: Invalid health URL } } }
+
+  - name: empty credentials are no credentials
+    tags: [edge]
+    subject: health-http-probe
+    init: {}
+    steps:
+      - { call: probe, args: [a, "https://@example.test"], expect: { value: { id: a } } }
+      - { call: probe, args: [b, "https://:@example.test"], expect: { value: { id: b } } }
+
+  - name: HTTP probe URLs must be absolute
+    tags: [validation]
+    subject: health-http-probe
+    init: {}
+    steps:
+      - { call: probe, args: [x, "health/ready"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: probe, args: [x, "/health/ready"], expect: { error: { status: null, message: Invalid URL } } }
+      - { call: probe, args: [x, ""], expect: { error: { status: null, message: Invalid URL } } }
+
+  - name: only 2xx responses are healthy
+    subject: health-http-probe
+    init: {}
+    steps:
+      - { call: check, args: ["https://example.test/health", 200], expect: { value: null } }
+      - { call: check, args: ["https://example.test/health", 204], expect: { value: null } }
+      - { call: check, args: ["https://example.test/health", 299], expect: { value: null } }
+      - { call: check, args: ["https://example.test/health", 199], expect: { error: { status: null, message: Service unavailable } } }
+      - { call: check, args: ["https://example.test/health", 302], expect: { error: { status: null, message: Service unavailable } } }
+      - { call: check, args: ["https://example.test/health", 404], expect: { error: { status: null, message: Service unavailable } } }
+      - { call: check, args: ["https://example.test/health", 503], expect: { error: { status: null, message: Service unavailable } } }

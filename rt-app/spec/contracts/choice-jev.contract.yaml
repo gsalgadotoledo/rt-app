@@ -1,0 +1,271 @@
+contract: 1
+module: choice-jev
+title: Choice provider for the TypeSafe Jev System One API
+description: |
+  JevProvider(apiKey, model = "jev-latest", transport, timeoutMs = 15000) sends one Choice to
+  POST https://api.typesafe.ai/v1/systemone and maps the answer. No network is used: the subject
+  fakes the transport with init.responses, answered in order: {status, json} (JSON body),
+  {status, text} (raw body) or {error} (the transport throws Error(error)). requests() lists what
+  was sent: {url, method, headers, body (parsed), text (the exact body)}. decide(input, policy?)
+  runs Choice over the provider.
+
+  Construction: apiKey and model must be non-blank after JavaScript trim(), timeoutMs a finite
+  number >= 1 (milliseconds); otherwise TypeError "Invalid Jev configuration" (no status). A null
+  model or timeoutMs takes the default. The key is not trimmed: authorization is
+  "Bearer " + apiKey. Redirects are refused (TypeScript redirect: "error"; the default Python and
+  Go transports do not follow them) and the request has a timeoutMs deadline.
+
+  predict(input) validates the input like validateChoice (400 errors, nothing sent), then sends
+  headers {authorization, content-type: application/json} and the body
+    {"model":…,"state":<context>,"questions":{"decision":{"type":"choice","instructions":<question>,
+     "criteria":{<id>: <description> or null}}}}
+  written with JSON.stringify: "state" is left out when the input has no context; the context
+  keeps the snapshot key order; criteria list array-index ids ("0".."4294967294") first in
+  ascending order, then the other ids in option order; an empty description stays "". There is
+  exactly one request per call (no retries).
+  Response: a status outside 200-299 fails with Error "Jev request failed: HTTP <status>"; the body
+  is never read or echoed. A body that is not JSON, or whose answers.decision.type is not
+  "choice", fails with Error "Invalid Jev response" (the body is never echoed). Transport errors
+  propagate. The prediction is {model: body.model, probabilities: decision.probabilities,
+  confidence: decision.confidence (absent when absent), semantics: "model-probabilities"}; Choice
+  validates it (a null confidence or a missing model is an invalid provider response).
+subject: choice-jev
+init:
+  apiKey: key-1
+  model: jev-test
+  responses:
+    - status: 200
+      json: { model: jev-2026, answers: { decision: { type: choice, probabilities: { billing: 0.95, sales: 0.05 }, confidence: 0.8 } } }
+cases:
+  # --- construction -------------------------------------------------------------------------
+  - name: the provider id is jev
+    call: id
+    args: []
+    expect: { value: jev }
+
+  - name: a blank api key is rejected
+    tags: [ validation ]
+    init: { apiKey: "", responses: [] }
+    create: { error: { status: null, message: Invalid Jev configuration } }
+
+  - name: a whitespace api key is rejected
+    tags: [ validation ]
+    init: { apiKey: " \t\u00a0", responses: [] }
+    create: { error: { status: null, message: Invalid Jev configuration } }
+
+  - name: a blank model is rejected
+    tags: [ validation ]
+    init: { apiKey: key, model: "", responses: [] }
+    create: { error: { status: null, message: Invalid Jev configuration } }
+
+  - name: a whitespace model is rejected
+    tags: [ validation ]
+    init: { apiKey: key, model: "  ", responses: [] }
+    create: { error: { status: null, message: Invalid Jev configuration } }
+
+  - name: a zero timeout is rejected
+    tags: [ validation ]
+    init: { apiKey: key, timeoutMs: 0, responses: [] }
+    create: { error: { status: null, message: Invalid Jev configuration } }
+
+  - name: a sub-millisecond timeout is rejected
+    tags: [ validation, numbers ]
+    init: { apiKey: key, timeoutMs: 0.5, responses: [] }
+    create: { error: { status: null, message: Invalid Jev configuration } }
+
+  - name: a negative timeout is rejected
+    tags: [ validation ]
+    init: { apiKey: key, timeoutMs: -1, responses: [] }
+    create: { error: { status: null, message: Invalid Jev configuration } }
+
+  - name: a string timeout is rejected
+    tags: [ validation ]
+    init: { apiKey: key, timeoutMs: "15000", responses: [] }
+    create: { error: { status: null, message: Invalid Jev configuration } }
+
+  - name: a one millisecond timeout is valid
+    tags: [ edge ]
+    init: { apiKey: key, timeoutMs: 1, responses: [] }
+    call: id
+    args: []
+    expect: { value: jev }
+
+  # --- request ------------------------------------------------------------------------------
+  - name: one choice is sent in the official envelope and mapped back
+    steps:
+      - call: predict
+        args: [ { context: Refund please, question: Which team?, options: [ { id: billing, description: Invoices }, { id: sales } ] } ]
+        expect: { value: { model: jev-2026, probabilities: { billing: 0.95, sales: 0.05 }, confidence: 0.8, semantics: model-probabilities } }
+      - call: requests
+        args: []
+        expect:
+          value:
+            - url: https://api.typesafe.ai/v1/systemone
+              method: POST
+              headers: { authorization: Bearer key-1, content-type: application/json }
+              body: { model: jev-test, state: Refund please, questions: { decision: { type: choice, instructions: Which team?, criteria: { billing: Invoices, sales: null } } } }
+              text: '{"model":"jev-test","state":"Refund please","questions":{"decision":{"type":"choice","instructions":"Which team?","criteria":{"billing":"Invoices","sales":null}}}}'
+
+  - name: the body text keeps JavaScript key order and number formatting
+    tags: [ edge, numbers ]
+    steps:
+      - call: predict
+        args: [ { context: { z: 1, a: [ 1e21, "é\n", 100.0, 0.000001, 1e-7 ], "1": true }, question: " Route? ", options: [ { id: b, description: B }, { id: "10" }, { id: "2", description: "" }, { id: a } ] } ]
+        note: predict does not check the distribution against the options (Choice.decide does)
+        expect: { value: { model: jev-2026, probabilities: { billing: 0.95, sales: 0.05 }, confidence: 0.8, semantics: model-probabilities } }
+      - call: requests
+        args: []
+        expect:
+          value:
+            - $partial:
+                text: '{"model":"jev-test","state":{"1":true,"a":[1e+21,"é\n",100,0.000001,1e-7],"z":1},"questions":{"decision":{"type":"choice","instructions":" Route? ","criteria":{"2":"","10":null,"b":"B","a":null}}}}'
+
+  - name: a missing context leaves state out, a null one is sent
+    tags: [ edge ]
+    init:
+      apiKey: key-1
+      model: jev-test
+      responses:
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 1, b: 0 } } } } }
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 1, b: 0 } } } } }
+    steps:
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { model: m, probabilities: { a: 1, b: 0 }, semantics: model-probabilities } } }
+      - { call: predict, args: [ { context: null, question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { model: m, probabilities: { a: 1, b: 0 }, semantics: model-probabilities } } }
+      - call: requests
+        args: []
+        expect:
+          value:
+            - { $partial: { text: '{"model":"jev-test","questions":{"decision":{"type":"choice","instructions":"q","criteria":{"a":null,"b":null}}}}' } }
+            - { $partial: { text: '{"model":"jev-test","state":null,"questions":{"decision":{"type":"choice","instructions":"q","criteria":{"a":null,"b":null}}}}' } }
+
+  - name: the default model is jev-latest and the key is sent as given
+    tags: [ edge ]
+    init:
+      apiKey: " key-2 "
+      model: null
+      responses:
+        - { status: 200, json: { model: jev-latest-2026, answers: { decision: { type: choice, probabilities: { a: 0.5, b: 0.5 }, confidence: 0.1 } } } }
+    steps:
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { model: jev-latest-2026, probabilities: { a: 0.5, b: 0.5 }, confidence: 0.1, semantics: model-probabilities } } }
+      - call: requests
+        args: []
+        expect: { value: [ { $partial: { headers: { authorization: "Bearer  key-2 ", content-type: application/json }, body: { $partial: { model: jev-latest } } } } ] }
+
+  - name: invalid input is rejected before any request
+    tags: [ validation ]
+    steps:
+      - { call: predict, args: [ { question: q, options: [ { id: a } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: a } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: requests, args: [], expect: { value: [] } }
+
+  # --- response -----------------------------------------------------------------------------
+  - name: any 2xx status is a success
+    tags: [ edge ]
+    init:
+      apiKey: key
+      responses:
+        - { status: 201, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 1, b: 0 } } } } }
+        - { status: 299, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 1, b: 0 } } } } }
+    steps:
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { model: m, probabilities: { a: 1, b: 0 }, semantics: model-probabilities } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { model: m, probabilities: { a: 1, b: 0 }, semantics: model-probabilities } } }
+
+  - name: HTTP failures never echo the body and are not retried
+    tags: [ provider, security ]
+    init:
+      apiKey: key
+      responses:
+        - { status: 429, text: "secret-rate-limit-details" }
+        - { status: 500, json: { error: secret } }
+        - { status: 404, text: "" }
+        - { status: 300, text: "" }
+    steps:
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: "Jev request failed: HTTP 429" } } }
+      - { call: requests, args: [], expect: { value: { $length: 1 } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: "Jev request failed: HTTP 500" } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: "Jev request failed: HTTP 404" } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: "Jev request failed: HTTP 300" } } }
+      - { call: requests, args: [], expect: { value: { $length: 4 } } }
+
+  - name: bodies that are not JSON are invalid and never echoed
+    tags: [ provider, security ]
+    init:
+      apiKey: key
+      responses:
+        - { status: 200, text: "secret-token not json" }
+        - { status: 200, text: "" }
+        - { status: 200, text: "{\"answers\":" }
+    steps:
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+
+  - name: answers must hold a choice decision
+    tags: [ provider, validation ]
+    init:
+      apiKey: key
+      responses:
+        - { status: 200, json: null }
+        - { status: 200, json: [] }
+        - { status: 200, json: "choice" }
+        - { status: 200, json: {} }
+        - { status: 200, json: { answers: null } }
+        - { status: 200, json: { answers: { decision: null } } }
+        - { status: 200, json: { answers: { decision: { type: score, probabilities: { a: 1, b: 0 } } } } }
+        - { status: 200, json: { answers: { choice: { type: choice } } } }
+    steps:
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+      - { call: predict, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid Jev response } } }
+
+  - name: transport errors propagate
+    tags: [ provider ]
+    init: { apiKey: key, responses: [ { error: connect ECONNREFUSED } ] }
+    call: predict
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: connect ECONNREFUSED } }
+
+  # --- through Choice ----------------------------------------------------------------------------
+  - name: Choice accepts a confident Jev answer
+    call: decide
+    args: [ { context: Refund please, question: Which team?, options: [ { id: billing, description: Invoices }, { id: sales } ] } ]
+    expect: { value: { provider: jev, model: jev-2026, probabilities: { billing: 0.95, sales: 0.05 }, confidence: 0.8, semantics: model-probabilities, selected: billing, accepted: true, requiresReview: false } }
+
+  - name: Choice rejects Jev answers that are not a distribution
+    tags: [ provider, validation ]
+    init:
+      apiKey: key
+      responses:
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 0.9, b: 0.9 } } } } }
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 1 } } } } }
+        - { status: 200, json: { model: m, answers: { decision: { type: choice } } } }
+        - { status: 200, json: { answers: { decision: { type: choice, probabilities: { a: 1, b: 0 } } } } }
+        - { status: 200, json: { model: 7, answers: { decision: { type: choice, probabilities: { a: 1, b: 0 } } } } }
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 1, b: 0 }, confidence: null } } } }
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 1, b: 0 }, confidence: 1.5 } } } }
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: { a: "1", b: 0 } } } } }
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: [ 1, 0 ] } } } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+
+  - name: Choice abstains on an uncertain Jev answer
+    init:
+      apiKey: key
+      responses:
+        - { status: 200, json: { model: m, answers: { decision: { type: choice, probabilities: { a: 0.6, b: 0.4 }, confidence: 0.9 } } } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { value: { provider: jev, model: m, probabilities: { a: 0.6, b: 0.4 }, confidence: 0.9, semantics: model-probabilities, selected: a, accepted: false, requiresReview: true } }

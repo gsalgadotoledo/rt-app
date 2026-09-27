@@ -12,7 +12,10 @@ export class Analytics {
     properties: Record<string, unknown> = {},
     source = "app",
   ) {
-    if (!/^[a-zA-Z][a-zA-Z0-9._-]{0,79}$/.test(name))
+    if (
+      typeof name !== "string" ||
+      !/^[a-zA-Z][a-zA-Z0-9._-]{0,79}$/.test(name)
+    )
       throw new TypeError("Use a stable analytics event name");
     return this.observer.withContext({ category: "analytics" }, () =>
       this.observer.emit("info", "analytics", source, name, properties),

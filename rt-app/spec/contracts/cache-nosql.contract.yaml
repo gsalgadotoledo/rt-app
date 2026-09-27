@@ -1,0 +1,166 @@
+contract: 1
+module: cache-nosql
+title: Cache adapters over NoSQL stores (NoSQLCache, FileCache, DynamoCache)
+description: |
+  NoSQLCache(store, namespace = "default", clock) and the adapters built on it: FileCache (a
+  JsonStore file) and DynamoCache (a DynamoStore table). The shared Cache rules are in
+  cache.contract.yaml; these cases pin the stored format other languages must read and write.
+
+  - Address: pk "CACHE#" + namespace (not validated), sk sha256hex(utf8(key)); a lone surrogate
+    is encoded as U+FFFD.
+  - set: validateEntry, canonical, 64000-byte limit, then data = {value: JSON.parse(canonical),
+    expires: now + ttlMs} is written as {pk, sk, version: old + 1 (1 when new), data, ttl:
+    ceil(expires / 1000)} expecting the version just read (null when absent).
+  - get: a hit needs a row whose data.expires > now; the value is data.value, and a row without a
+    value is a miss. Expired rows are not removed by reads (a clock moving back revives them).
+  - delete: read, then delete with the read version; nothing is written when the row is absent.
+  - set and delete retry a Conflict up to 4 attempts in total (re-reading each time) and rethrow
+    the last one; any other store error propagates at once.
+  - FileCache: {format: 1, rows: [...]} in one JSON file; the JsonStore drops CACHE# rows whose ttl
+    <= the real time in seconds on every write (the injected clock is not used for that).
+
+  Facade helpers besides cache.contract.yaml: row(pk, sk) → raw stored row | null; cache-nosql:
+  init.rows, injectFaults(kind, count) (next transactions: ok | conflict | error), transacts(),
+  useNamespace(ns); cache-file: reopen() (a second FileCache on the same file), file() → parsed file.
+subject: cache-nosql-adapters
+subjects: [ cache-nosql, cache-file, cache-dynamodb ]
+optionalSubjects: [ cache-dynamodb ]
+init: { now: 4102444800000 }
+cases:
+  - name: rows hold the canonical value, the expiry and a provider TTL in seconds
+    tags: [ interop ]
+    steps:
+      - { call: set, args: [ k, { b: 1, a: [ 2, 1e21 ] }, 1500 ], expect: { value: null } }
+      - call: row
+        args: [ "CACHE#default", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ]
+        expect: { value: { pk: "CACHE#default", sk: 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a, version: 1, data: { value: { a: [ 2, 1e21 ], b: 1 }, expires: 4102444801500 }, ttl: 4102444802 } }
+      - { call: setNow, args: [ 4102444800001 ], expect: { value: null } }
+      - { call: set, args: [ k, null, 1 ], expect: { value: null } }
+      - call: row
+        args: [ "CACHE#default", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ]
+        expect: { value: { pk: "CACHE#default", sk: 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a, version: 2, data: { value: null, expires: 4102444800002 }, ttl: 4102444801 } }
+        note: ttl rounds up
+      - { call: delete, args: [ k ], expect: { value: null } }
+      - { call: row, args: [ "CACHE#default", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ], expect: { value: null } }
+
+  - name: sort keys are the sha256 of the UTF-8 key
+    tags: [ interop, unicode ]
+    steps:
+      - { call: set, args: [ "é😀", 1, 1000 ], expect: { value: null } }
+      - { call: row, args: [ "CACHE#default", 1184d1f608158eea09d297565575892231550c403aaa913008d867a97cfd5c76 ], expect: { value: { $partial: { version: 1, data: { value: 1, expires: 4102444801000 } } } } }
+      - { call: set, args: [ "\ud800", 2, 1000 ], expect: { value: null } }
+      - { call: row, args: [ "CACHE#default", 83d544ccc223c057d2bf80d3f2a32982c32c3c0db8e2674820da5064783fb097 ], expect: { value: { $partial: { data: { value: 2, expires: 4102444801000 } } } }, note: a lone surrogate hashes as U+FFFD }
+
+  - name: the namespace is part of the partition and is not validated
+    tags: [ interop ]
+    init: { now: 4102444800000, namespace: "tenant 1/ü#x" }
+    steps:
+      - { call: set, args: [ k, 1, 1000 ], expect: { value: null } }
+      - { call: row, args: [ "CACHE#tenant 1/ü#x", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: row, args: [ "CACHE#default", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ], expect: { value: null } }
+
+  - name: expired rows stay stored until they are overwritten
+    tags: [ ttl ]
+    steps:
+      - { call: set, args: [ k, v, 100 ], expect: { value: null } }
+      - { call: setNow, args: [ 4102444800100 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } } }
+      - { call: row, args: [ "CACHE#default", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: setNow, args: [ 4102444800099 ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: v } }, note: unlike MemoryCache, reads never delete }
+      - { call: setNow, args: [ 4102444800200 ], expect: { value: null } }
+      - { call: set, args: [ k, w, 100 ], expect: { value: null } }
+      - { call: row, args: [ "CACHE#default", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ], expect: { value: { $partial: { version: 2, data: { value: w, expires: 4102444800300 } } } } }
+
+  - name: a rejected set writes nothing
+    tags: [ validation ]
+    steps:
+      - { call: set, args: [ k, { $text: { repeat: x, count: 64000 } }, 1000 ], expect: { error: { message: Cache values are limited to 64 KB } } }
+      - { call: set, args: [ k, 1, 0 ], expect: { error: { message: Cache needs a key and TTL between 1 ms and 30 days } } }
+      - { call: row, args: [ "CACHE#default", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ], expect: { value: null } }
+
+  # --- NoSQLCache over a MemoryStore -------------------------------------------------------
+  - name: rows written by another language are read
+    subject: cache-nosql
+    tags: [ interop ]
+    init:
+      now: 4102444800000
+      rows:
+        - { pk: "CACHE#default", sk: 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a, version: 7, data: { value: { from: go }, expires: 4102444800001 }, ttl: 4102444801 }
+        - { pk: "CACHE#default", sk: 1184d1f608158eea09d297565575892231550c403aaa913008d867a97cfd5c76, version: 1, data: { expires: 4102444900000 } }
+        - { pk: "CACHE#default", sk: 83d544ccc223c057d2bf80d3f2a32982c32c3c0db8e2674820da5064783fb097, version: 1, data: { value: 1 } }
+    steps:
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: { from: go } } } }
+      - { call: get, args: [ "é😀" ], expect: { value: { hit: false } }, note: a row without a value is a miss }
+      - { call: get, args: [ "\ufffd" ], expect: { value: { hit: false } }, note: a row without expires is a miss }
+      - { call: set, args: [ k, { from: node }, 1000 ], expect: { value: null } }
+      - { call: row, args: [ "CACHE#default", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ], expect: { value: { $partial: { version: 8 } } }, note: the stored version continues }
+
+  - name: conflicting writes are retried up to four attempts
+    subject: cache-nosql
+    tags: [ concurrency ]
+    steps:
+      - { call: injectFaults, args: [ conflict, 3 ], expect: { value: null } }
+      - { call: set, args: [ k, 1, 1000 ], expect: { value: null } }
+      - { call: transacts, expect: { value: 4 } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: 1 } } }
+      - { call: injectFaults, args: [ conflict, 4 ], expect: { value: null } }
+      - { call: set, args: [ k, 2, 1000 ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: transacts, expect: { value: 8 } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: 1 } } }
+      - { call: injectFaults, args: [ conflict, 1 ], expect: { value: null } }
+      - { call: delete, args: [ k ], expect: { value: null } }
+      - { call: transacts, expect: { value: 10 } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } } }
+
+  - name: store errors are not retried
+    subject: cache-nosql
+    tags: [ concurrency ]
+    steps:
+      - { call: injectFaults, args: [ error, 1 ], expect: { value: null } }
+      - { call: set, args: [ k, 1, 1000 ], expect: { error: { message: Store unavailable } } }
+      - { call: transacts, expect: { value: 1 } }
+      - { call: delete, args: [ missing ], expect: { value: null } }
+      - { call: transacts, expect: { value: 1 }, note: deleting an absent key writes nothing }
+      - { call: injectFaults, args: [ error, 1 ], expect: { value: null } }
+      - { call: remember, args: [ ns, 1, 1000, { value: loaded } ], expect: { error: { message: Store unavailable } } }
+      - { call: remember, args: [ ns, 1, 1000, { value: again } ], expect: { value: again }, note: the failed write was not cached }
+      - { call: loads, expect: { value: 2 } }
+
+  - name: namespaces share a store without sharing entries
+    subject: cache-nosql
+    steps:
+      - { call: set, args: [ k, default, 1000 ], expect: { value: null } }
+      - { call: useNamespace, args: [ other ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: false } } }
+      - { call: set, args: [ k, other, 1000 ], expect: { value: null } }
+      - { call: useNamespace, args: [ default ], expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: default } } }
+      - { call: row, args: [ "CACHE#other", 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a ], expect: { value: { $partial: { data: { value: other, expires: 4102444801000 } } } } }
+
+  # --- FileCache -----------------------------------------------------------------------------
+  - name: the cache file is shared by every instance on the same path
+    subject: cache-file
+    tags: [ file, interop ]
+    steps:
+      - { call: get, args: [ k ], expect: { value: { hit: false } } }
+      - { call: file, expect: { value: null }, note: reads do not create the file }
+      - { call: set, args: [ k, false, 60000 ], expect: { value: null } }
+      - call: file
+        expect: { value: { format: 1, rows: [ { pk: "CACHE#default", sk: 8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a, version: 1, data: { value: false, expires: 4102444860000 }, ttl: 4102444860 } ] } }
+      - { call: reopen, expect: { value: null } }
+      - { call: get, args: [ k ], expect: { value: { hit: true, value: false } } }
+      - { call: delete, args: [ k ], expect: { value: null } }
+      - { call: file, expect: { value: { format: 1, rows: [] } } }
+
+  - name: writes drop cache rows whose provider TTL passed in real time
+    subject: cache-file
+    tags: [ file, ttl ]
+    init: { now: 1000 }
+    steps:
+      - { call: set, args: [ old, 1, 1000 ], expect: { value: null } }
+      - { call: file, expect: { value: { format: 1, rows: [] } }, note: "ttl 2 (1970) <= the real time: removed by the same write" }
+      - { call: get, args: [ old ], expect: { value: { hit: false } } }
+      - { call: setNow, args: [ 4102444800000 ], expect: { value: null } }
+      - { call: set, args: [ new, 1, 1000 ], expect: { value: null } }
+      - { call: file, expect: { value: { format: 1, rows: [ { $partial: { data: { value: 1, expires: 4102444801000 }, ttl: 4102444801 } } ] } } }

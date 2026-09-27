@@ -59,8 +59,15 @@ export class JevProvider implements ChoiceProvider {
       await response.body?.cancel();
       throw new Error("Jev request failed: HTTP " + response.status);
     }
-    const data = (await response.json()) as any;
-    if (data.answers?.decision?.type !== "choice")
+    // Read first so aborts propagate; a parse error must not echo the body (it may hold secrets).
+    const text = await response.text();
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error("Invalid Jev response");
+    }
+    if (data?.answers?.decision?.type !== "choice")
       throw new Error("Invalid Jev response");
     return {
       model: data.model,

@@ -1,0 +1,105 @@
+contract: 1
+module: analytics
+title: Product analytics over the Observer
+description: |
+  Analytics(observer) adds a distinct event kind to the Observer pipeline; it has no endpoints and
+  no storage of its own. It only validates the event name and delegates, under the log context
+  {category: "analytics"} (merged over the caller's context):
+
+  - track(name, properties = {}, source = "app") → observer.emit("info", "analytics", source, name,
+    properties). name must be a string matching ^[a-zA-Z][a-zA-Z0-9._-]{0,79}$ (ASCII letters only,
+    at most 80 characters, `$` is the end of the string: a trailing newline is invalid). Otherwise a
+    plain error (no status) "Use a stable analytics event name" and nothing is emitted. Properties
+    and source are passed through unchanged: sanitizing (secret keys, e-mails, lengths) is the
+    Observer's job, pinned by its own contract.
+  - pageView(title, options) → observer.countView(title, options), options {url, apiUrl?, source?}
+    passed through unchanged (the Observer validates the URL and defaults source to "spa").
+
+  Facade (subject analytics): the observer is a spy that records every call with the context active
+  at that moment. Methods: track(name, properties?, source?) → null, pageView(title, options) →
+  null, calls() → [{method: "emit", level, kind, source, message, data, context} |
+  {method: "countView", message, options, context}].
+subject: analytics
+init: {}
+cases:
+  - name: track emits an info analytics event in the analytics category
+    steps:
+      - { call: track, args: [checkout.completed, { plan: pro, amount: 12.5 }, web], expect: { value: null } }
+      - call: calls
+        expect:
+          value:
+            - { method: emit, level: info, kind: analytics, source: web, message: checkout.completed, data: { plan: pro, amount: 12.5 }, context: { category: analytics } }
+
+  - name: properties default to {} and source to app
+    steps:
+      - { call: track, args: [signup], expect: { value: null } }
+      - { call: track, args: [signup, null, null], expect: { value: null } }
+      - call: calls
+        expect:
+          value:
+            - { method: emit, level: info, kind: analytics, source: app, message: signup, data: {}, context: { category: analytics } }
+            - { method: emit, level: info, kind: analytics, source: app, message: signup, data: {}, context: { category: analytics } }
+
+  - name: properties and source are passed through unchanged
+    tags: [edge]
+    steps:
+      - { call: track, args: [login, { password: hidden, nested: { email: a@b.test } }, "any source ü"], expect: { value: null } }
+      - call: calls
+        expect:
+          value:
+            - { method: emit, level: info, kind: analytics, source: "any source ü", message: login, data: { password: hidden, nested: { email: a@b.test } }, context: { category: analytics } }
+        note: the Observer redacts; Analytics must not drop or rewrite anything
+
+  - name: event names are stable identifiers
+    tags: [validation]
+    steps:
+      - { call: track, args: [bad name], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: [1st], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: [.hidden], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: [""], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: ["a/b"], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: ["a:b"], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: calls, expect: { value: [] } }
+
+  - name: names are ASCII only
+    tags: [validation, edge]
+    steps:
+      - { call: track, args: ["café"], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: ["\uFF41bc"], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: ["K"], expect: { value: null } }
+      - { call: track, args: ["x\u212A"], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: calls, expect: { value: [{ $partial: { message: K } }] } }
+
+  - name: a trailing newline is not the end of the name
+    tags: [validation, edge]
+    steps:
+      - { call: track, args: ["checkout\n"], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: ["check\nout"], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: calls, expect: { value: [] } }
+
+  - name: every allowed character and the 80-character limit
+    tags: [edge]
+    steps:
+      - { call: track, args: ["aZ09._-"], expect: { value: null } }
+      - { call: track, args: [{ $text: { repeat: "a", count: 80 } }], expect: { value: null } }
+      - { call: track, args: [{ $text: { repeat: "a", count: 81 } }], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: calls, expect: { value: { $length: 2 } } }
+
+  - name: names must be strings
+    tags: [validation, edge]
+    steps:
+      - { call: track, args: [null], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: [[ok]], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: [123], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: track, args: [true], expect: { error: { status: null, message: Use a stable analytics event name } } }
+      - { call: calls, expect: { value: [] } }
+
+  - name: page views are counted by the observer in the analytics category
+    steps:
+      - { call: pageView, args: [Home, { url: "/?ref=mail", source: ssr }], expect: { value: null } }
+      - { call: pageView, args: [Pricing, { url: /pricing, apiUrl: /api/prices }], expect: { value: null } }
+      - call: calls
+        expect:
+          value:
+            - { method: countView, message: Home, options: { url: "/?ref=mail", source: ssr }, context: { category: analytics } }
+            - { method: countView, message: Pricing, options: { url: /pricing, apiUrl: /api/prices }, context: { category: analytics } }

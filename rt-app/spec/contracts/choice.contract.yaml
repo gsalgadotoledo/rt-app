@@ -1,0 +1,506 @@
+contract: 1
+module: choice
+title: Choice (typed decisions with explicit abstention)
+description: |
+  Choice evaluates {context, question, options} with a provider and returns the winner with
+  explicit abstention. The subject wraps Choice around a fake provider: init.prediction is its
+  response (null/absent → invalid), init.error makes it throw Error(init.error), init.id is its id
+  ("fake" by default). calls() lists the snapshots the provider received.
+
+  validateChoice(input), checked in this order, first failure wins:
+    1. 400 "Invalid choice question or options": input not an object; question not a string,
+       blank after JavaScript trim(), or longer than 4000 UTF-16 units; options not an array or
+       with fewer than 2 or more than 255 items.
+    2. 400 "Invalid or duplicate option": an option that is not an object; id not a string
+       matching ^[a-zA-Z0-9_-]{1,80}$ (ASCII only, no trailing newline); description present
+       (null counts as present) but not a string or longer than 2000 UTF-16 units; duplicate ids
+       (case-sensitive).
+    3. 400 "Choice input too large": the canonical JSON of the whole input (object keys sorted by
+       UTF-16 code units, JavaScript number formatting, lone surrogates escaped) is longer than
+       128000 UTF-8 bytes.
+  It returns the snapshot JSON.parse(canonical(input)) handed to the provider: a deep copy with
+  keys in JavaScript order (array-index keys "0".."4294967294" ascending, then the rest in UTF-16
+  order). Extra fields are kept by TypeScript and Python and dropped by Go (not part of the
+  contract).
+
+  decide(input, policy?) validates the input, then the policy (400 "Invalid choice policy"):
+  minProbability (default 0.8) and minMargin (default 0.1) must be finite numbers in [0, 1]; a
+  null field takes its default; a non-object policy counts as {}. Then the provider is called
+  and its response checked (plain Error "Invalid choice provider response", no status):
+  probabilities has exactly one finite number in [0, 1] per option id, their sum (float64, in
+  option order) is within 0.001 of 1, model is a non-empty string, semantics is
+  "model-probabilities" or "uncalibrated-scores", confidence is absent or a finite number in
+  [0, 1] (null is invalid). Options are ranked by probability descending, stable (ties keep the
+  option order). accepted = top >= minProbability && top - second >= minMargin (float64
+  subtraction) && top > second && (semantics is model-probabilities || allowUncalibrated === true).
+  Result: {provider, probabilities, confidence?, model, semantics, selected, accepted,
+  requiresReview: !accepted}. Provider errors propagate unchanged. Cancellation is checked before
+  and after the provider call: "This operation was aborted" (no status).
+subject: choice
+init: { prediction: null }
+cases:
+  # --- validateChoice: question and options -----------------------------------------------
+  - name: a valid input returns the snapshot handed to the provider
+    call: validateChoice
+    args: [ { question: Which team?, options: [ { id: billing, description: Invoices }, { id: sales } ], context: { b: 1, a: [ 1, { y: null, x: "" } ] } } ]
+    expect: { value: { context: { a: [ 1, { x: "", y: null } ], b: 1 }, options: [ { description: Invoices, id: billing }, { id: sales } ], question: Which team? } }
+
+  - name: context may be missing, null or any JSON value
+    tags: [ edge ]
+    steps:
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { question: q, options: [ { id: a }, { id: b } ] } } }
+      - { call: validateChoice, args: [ { context: null, question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { context: null, question: q, options: [ { id: a }, { id: b } ] } } }
+      - { call: validateChoice, args: [ { context: [ 1.5, true, "x" ], question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { context: [ 1.5, true, "x" ], question: q, options: [ { id: a }, { id: b } ] } } }
+
+  - name: extra fields are not rejected
+    tags: [ edge ]
+    call: validateChoice
+    args: [ { tenant: t1, question: q, options: [ { id: a, weight: 2 }, { id: b } ] } ]
+    expect: { value: { $partial: { question: q } } }
+
+  - name: the input must be an object with a question and 2 to 255 options
+    tags: [ validation ]
+    steps:
+      - { call: validateChoice, args: [ null ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ "Which team?" ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ 5 ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ [ { id: a }, { id: b } ] ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ {} ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { options: [ { id: a }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: 5, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: q } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: q, options: { a: 1, b: 2 } } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: q, options: "ab" } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: q, options: [] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+
+  - name: blank questions use JavaScript trim
+    tags: [ edge, validation, unicode ]
+    steps:
+      - { call: validateChoice, args: [ { question: "", options: [ { id: a }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: " \t\n\r\v\f", options: [ { id: a }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: "\u00a0\ufeff\u2028\u2029\u3000\u2000\u200a\u1680", options: [ { id: a }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: "\u200b", options: [ { id: a }, { id: b } ] } ], expect: { value: { question: "\u200b", options: [ { id: a }, { id: b } ] } } }
+      - { call: validateChoice, args: [ { question: "\u0085", options: [ { id: a }, { id: b } ] } ], expect: { value: { question: "\u0085", options: [ { id: a }, { id: b } ] } } }
+      - { call: validateChoice, args: [ { question: "\u001c", options: [ { id: a }, { id: b } ] } ], expect: { value: { question: "\u001c", options: [ { id: a }, { id: b } ] } } }
+      - { call: validateChoice, args: [ { question: "  Which team?  ", options: [ { id: a }, { id: b } ] } ], expect: { value: { question: "  Which team?  ", options: [ { id: a }, { id: b } ] } } }
+
+  - name: questions allow 4000 UTF-16 code units
+    tags: [ edge, validation, unicode ]
+    steps:
+      - { call: validateChoice, args: [ { question: { $text: { repeat: q, count: 4000 } }, options: [ { id: a }, { id: b } ] } ], expect: { value: { $partial: { question: { $length: 4000 } } } } }
+      - { call: validateChoice, args: [ { question: { $text: { repeat: q, count: 4001 } }, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - note: 2000 emoji are 4000 UTF-16 code units
+        call: validateChoice
+        args: [ { question: { $text: { repeat: "😀", count: 2000 } }, options: [ { id: a }, { id: b } ] } ]
+        expect: { value: { $partial: { options: [ { id: a }, { id: b } ] } } }
+      - { call: validateChoice, args: [ { question: { $text: { repeat: "😀", count: 2001 } }, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: validateChoice, args: [ { question: { $text: { repeat: "é", count: 4000 } }, options: [ { id: a }, { id: b } ] } ], expect: { value: { $partial: { question: { $length: 4000 } } } } }
+
+  - name: up to 255 options
+    tags: [ edge, validation ]
+    steps:
+      - { call: validateChoice, args: [ { question: q, options: [ { $repeat: { count: 255, item: { id: "o{i}" } } } ] } ], expect: { value: { $partial: { options: { $length: 255 } } } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { $repeat: { count: 256, item: { id: "o{i}" } } } ] } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+
+  - name: option ids are 1 to 80 ASCII letters, digits, _ or -
+    tags: [ validation ]
+    steps:
+      - { call: validateChoice, args: [ { question: q, options: [ { id: "A-z_09" }, { id: a } ] } ], expect: { value: { question: q, options: [ { id: "A-z_09" }, { id: a } ] } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: { $text: { repeat: x, count: 80 } } }, { id: a } ] } ], expect: { value: { $partial: { question: q } } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: { $text: { repeat: x, count: 81 } } }, { id: a } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: "" }, { id: a } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: "a b" }, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: "a.b" }, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: "é" }, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: "a\n" }, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: "\na" }, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: "１" }, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: 5 }, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { description: no id }, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+
+  - name: options must be objects
+    tags: [ validation ]
+    steps:
+      - { call: validateChoice, args: [ { question: q, options: [ null, { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ a, b ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ [ a ], { id: c } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ 1, 2 ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+
+  - name: ids are unique and case-sensitive
+    tags: [ validation ]
+    steps:
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: a, description: again } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b }, { id: a } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: A } ] } ], expect: { value: { question: q, options: [ { id: a }, { id: A } ] } } }
+
+  - name: descriptions are optional strings of up to 2000 UTF-16 code units
+    tags: [ edge, validation, unicode ]
+    steps:
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a, description: "" }, { id: b } ] } ], expect: { value: { question: q, options: [ { id: a, description: "" }, { id: b } ] } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a, description: 5 }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a, description: null }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a, description: [ x ] }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a, description: { $text: { repeat: d, count: 2000 } } }, { id: b } ] } ], expect: { value: { $partial: { question: q } } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a, description: { $text: { repeat: d, count: 2001 } } }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a, description: { $text: { repeat: "😀", count: 1000 } } }, { id: b } ] } ], expect: { value: { $partial: { question: q } } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a, description: { $text: { repeat: "😀", count: 1001 } } }, { id: b } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+
+  - name: question errors come before option errors
+    tags: [ validation ]
+    call: validateChoice
+    args: [ { question: "", options: [ { id: a }, { id: a } ] } ]
+    expect: { error: { status: 400, message: Invalid choice question or options } }
+
+  - name: the canonical input may have 128000 UTF-8 bytes
+    tags: [ edge, validation ]
+    note: canonical {"context":"<x>","options":[{"id":"a"},{"id":"b"}],"question":"q"} is 63 bytes plus the context
+    steps:
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: x, count: 127937 } } } ], expect: { value: { $partial: { question: q } } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: x, count: 127938 } } } ], expect: { error: { status: 400, message: Choice input too large } } }
+
+  - name: the size limit counts UTF-8 bytes of escaped JSON
+    tags: [ edge, validation, unicode ]
+    steps:
+      - note: é is 2 UTF-8 bytes (63 + 2 × 63968 = 127999)
+        call: validateChoice
+        args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: "é", count: 63968 } } } ]
+        expect: { value: { $partial: { question: q } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: "é", count: 63969 } } } ], expect: { error: { status: 400, message: Choice input too large } } }
+      - note: a newline is written \n (2 bytes)
+        call: validateChoice
+        args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: "\n", count: 63968 } } } ]
+        expect: { value: { $partial: { question: q } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: "\n", count: 63969 } } } ], expect: { error: { status: 400, message: Choice input too large } } }
+      - note: U+0001 is written \u0001 (6 bytes); 63 + 6 × 21322 = 127995
+        call: validateChoice
+        args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: "\u0001", count: 21322 } } } ]
+        expect: { value: { $partial: { question: q } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: "\u0001", count: 21323 } } } ], expect: { error: { status: 400, message: Choice input too large } } }
+      - note: 😀 is 4 UTF-8 bytes; 63 + 4 × 31984 = 127999
+        call: validateChoice
+        args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: "😀", count: 31984 } } } ]
+        expect: { value: { $partial: { question: q } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ], context: { $text: { repeat: "😀", count: 31985 } } } ], expect: { error: { status: 400, message: Choice input too large } } }
+
+  - name: numbers count with JavaScript formatting in the size limit
+    tags: [ edge, validation, numbers ]
+    note: "[\"x…x\",1e+21,100] is N + 14 bytes (1e21 is written 1e+21, 100.0 is written 100); 61 + 127925 + 14 = 128000"
+    steps:
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ], context: [ { $text: { repeat: x, count: 127925 } }, 1e21, 100.0 ] } ], expect: { value: { $partial: { question: q } } } }
+      - { call: validateChoice, args: [ { question: q, options: [ { id: a }, { id: b } ], context: [ { $text: { repeat: x, count: 127926 } }, 1e21, 100.0 ] } ], expect: { error: { status: 400, message: Choice input too large } } }
+
+  # --- decide: selection and abstention --------------------------------------------------
+  - name: a confident calibrated answer is accepted
+    init: { prediction: { probabilities: { billing: 0.9, sales: 0.1 }, model: test, semantics: model-probabilities, confidence: 0.7 } }
+    steps:
+      - call: decide
+        args: [ { context: Refund please, question: Which team?, options: [ { id: billing, description: Invoices }, { id: sales } ] }, null ]
+        expect: { value: { provider: fake, probabilities: { billing: 0.9, sales: 0.1 }, confidence: 0.7, model: test, semantics: model-probabilities, selected: billing, accepted: true, requiresReview: false } }
+      - call: calls
+        args: []
+        expect: { value: [ { context: Refund please, question: Which team?, options: [ { id: billing, description: Invoices }, { id: sales } ] } ] }
+
+  - name: confidence is optional and kept apart from the probability
+    init: { id: custom, prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { value: { provider: custom, probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities, selected: a, accepted: true, requiresReview: false } }
+
+  - name: the highest probability wins regardless of option order
+    init: { prediction: { probabilities: { billing: 0.05, sales: 0.95 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: billing }, { id: sales } ] } ]
+    expect: { value: { $partial: { selected: sales, accepted: true, requiresReview: false } } }
+
+  - name: default thresholds are 0.8 probability and 0.1 margin, inclusive
+    tags: [ edge, numbers ]
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { $partial: { selected: a, accepted: false } } } }
+    init: { prediction: { probabilities: { a: 0.79, b: 0.21 }, model: m, semantics: model-probabilities } }
+
+  - name: probability 0.8 meets the default threshold
+    tags: [ edge, numbers ]
+    init: { prediction: { probabilities: { a: 0.8, b: 0.2 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { value: { $partial: { selected: a, accepted: true, requiresReview: false } } }
+
+  - name: the margin uses float64 subtraction (0.5 - 0.4 < 0.1)
+    tags: [ edge, numbers ]
+    init: { prediction: { probabilities: { a: 0.5, b: 0.4, c: 0.1 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b }, { id: c } ] }, { minProbability: 0.5, minMargin: 0.1 } ], expect: { value: { $partial: { selected: a, accepted: false, requiresReview: true } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b }, { id: c } ] }, { minProbability: 0.5, minMargin: 0.09999999999999998 } ], expect: { value: { $partial: { selected: a, accepted: true } } } }
+
+  - name: stricter policies abstain
+    init: { prediction: { probabilities: { a: 0.9, b: 0.1 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: 0.99 } ], expect: { value: { $partial: { selected: a, accepted: false, requiresReview: true } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minMargin: 0.81 } ], expect: { value: { $partial: { accepted: false } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minMargin: 0.8 } ], expect: { value: { $partial: { accepted: true } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: 0.9, minMargin: 0 } ], expect: { value: { $partial: { accepted: true } } } }
+
+  - name: ties never accept and keep the option order
+    tags: [ edge ]
+    init: { prediction: { probabilities: { billing: 0.5, sales: 0.5 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: billing }, { id: sales } ] }, { minProbability: 0, minMargin: 0 } ], expect: { value: { $partial: { selected: billing, accepted: false, requiresReview: true } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: sales }, { id: billing } ] }, { minProbability: 0, minMargin: 0 } ], expect: { value: { $partial: { selected: sales, accepted: false } } } }
+
+  - name: uncalibrated scores abstain unless allowUncalibrated is exactly true
+    init: { prediction: { probabilities: { a: 0.99, b: 0.01 }, model: nli, semantics: uncalibrated-scores } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { value: { provider: fake, probabilities: { a: 0.99, b: 0.01 }, model: nli, semantics: uncalibrated-scores, selected: a, accepted: false, requiresReview: true } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { allowUncalibrated: true } ], expect: { value: { $partial: { accepted: true, requiresReview: false } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { allowUncalibrated: "true" } ], expect: { value: { $partial: { accepted: false } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { allowUncalibrated: 1 } ], expect: { value: { $partial: { accepted: false } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { allowUncalibrated: true, minProbability: 1 } ], expect: { value: { $partial: { accepted: false } } } }
+
+  - name: policy thresholds are finite numbers between 0 and 1
+    tags: [ validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: -0.1 } ], expect: { error: { status: 400, message: Invalid choice policy } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: 1.1 } ], expect: { error: { status: 400, message: Invalid choice policy } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: "0.5" } ], expect: { error: { status: 400, message: Invalid choice policy } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: true } ], expect: { error: { status: 400, message: Invalid choice policy } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minMargin: -1 } ], expect: { error: { status: 400, message: Invalid choice policy } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minMargin: [ 0.1 ] } ], expect: { error: { status: 400, message: Invalid choice policy } } }
+      - { call: calls, args: [], expect: { value: [] } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: 1, minMargin: 1 } ], expect: { value: { $partial: { accepted: true } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: 0, minMargin: 0 } ], expect: { value: { $partial: { accepted: true } } } }
+
+  - name: null policy fields and non-object policies take the defaults
+    tags: [ edge ]
+    init: { prediction: { probabilities: { a: 0.85, b: 0.15 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: null, minMargin: null } ], expect: { value: { $partial: { accepted: true } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, strict ], expect: { value: { $partial: { accepted: true } } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] }, [ 0.99 ] ], expect: { value: { $partial: { accepted: true } } } }
+
+  - name: the input is validated before the policy and the provider
+    tags: [ validation ]
+    steps:
+      - { call: decide, args: [ { question: "", options: [ { id: a }, { id: b } ] }, { minProbability: 2 } ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: a } ] } ], expect: { error: { status: 400, message: Invalid or duplicate option } } }
+      - { call: calls, args: [], expect: { value: [] } }
+
+  # --- decide: provider responses ---------------------------------------------------------
+  - name: a missing response is invalid
+    tags: [ provider ]
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: the order of probability keys does not matter
+    tags: [ provider ]
+    steps:
+      - call: decide
+        args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+        expect: { value: { $partial: { selected: a } } }
+    init: { prediction: { probabilities: { b: 0.1, a: 0.9 }, model: m, semantics: model-probabilities } }
+
+  - name: missing, extra or foreign probability keys are invalid
+    tags: [ provider ]
+    init: { prediction: { probabilities: { a: 0.9, b: 0.1, c: 0 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b }, { id: c }, { id: d } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b }, { id: d } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b }, { id: c } ] } ], expect: { value: { $partial: { selected: a } } } }
+
+  - name: probabilities must be numbers between 0 and 1
+    tags: [ provider, validation ]
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+    init: { prediction: { probabilities: { a: 1.1, b: -0.1 }, model: m, semantics: model-probabilities } }
+
+  - name: string probabilities are invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: "0.9", b: 0.1 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: boolean probabilities are invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: true, b: 0 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: null probabilities are invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: null, b: 1 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: a probabilities string or number is invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: "ab", model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: "0" }, { id: "1" } ] } ], expect: { error: { status: null, message: Invalid choice provider response } } }
+
+  - name: probabilities must sum to 1 within 0.001
+    tags: [ provider, numbers, edge ]
+    init: { prediction: { probabilities: { a: 0.6, b: 0.4005 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minProbability: 0 } ]
+    expect: { value: { $partial: { selected: a, accepted: true } } }
+
+  - name: a sum of 0.999 is outside the tolerance in float64
+    tags: [ provider, numbers, edge ]
+    note: 1 - 0.999 is 0.0010000000000000009
+    init: { prediction: { probabilities: { a: 0.5, b: 0.499 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: a sum of 1.002 is invalid
+    tags: [ provider, numbers ]
+    init: { prediction: { probabilities: { a: 0.6, b: 0.402 }, model: m, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: the model must be a non-empty string
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: "", semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: a numeric model is invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: 5, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: a missing model is invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, semantics: model-probabilities } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: unknown semantics are invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: calibrated } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: missing semantics are invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: confidence above 1 is invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities, confidence: 2 } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: negative confidence is invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities, confidence: -0.1 } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: null confidence is invalid (only absent means none)
+    tags: [ provider, validation, edge ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities, confidence: null } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: string confidence is invalid
+    tags: [ provider, validation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities, confidence: "0.5" } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { error: { status: null, message: Invalid choice provider response } }
+
+  - name: confidence 0 is valid
+    tags: [ provider, edge ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities, confidence: 0 } }
+    call: decide
+    args: [ { question: q, options: [ { id: a }, { id: b } ] } ]
+    expect: { value: { provider: fake, probabilities: { a: 1, b: 0 }, confidence: 0, model: m, semantics: model-probabilities, selected: a, accepted: true, requiresReview: false } }
+
+  - name: provider errors propagate unchanged
+    tags: [ provider ]
+    init: { error: Provider down }
+    steps:
+      - { call: decide, args: [ { question: q, options: [ { id: a }, { id: b } ] } ], expect: { error: { status: null, message: Provider down } } }
+      - { call: calls, args: [], expect: { value: [ { question: q, options: [ { id: a }, { id: b } ] } ] } }
+
+  - name: the provider receives the canonical snapshot
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities } }
+    steps:
+      - call: decide
+        args: [ { options: [ { description: First, id: a }, { id: b } ], question: " q ", context: { z: [ 1e21, 0.5, 100.0 ], a: { "2": x, "10": y } } } ]
+        expect: { value: { $partial: { selected: a } } }
+      - call: calls
+        args: []
+        expect: { value: [ { context: { a: { "2": x, "10": y }, z: [ 1e21, 0.5, 100 ] }, options: [ { id: a, description: First }, { id: b } ], question: " q " } ] }
+
+  # --- cancellation -------------------------------------------------------------------------
+  - name: an aborted signal stops before the provider
+    tags: [ cancellation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decideAborted, args: [ { question: q, options: [ { id: a }, { id: b } ] }, null, before ], expect: { error: { status: null, message: This operation was aborted } } }
+      - { call: calls, args: [], expect: { value: [] } }
+
+  - name: validation errors win over an aborted signal
+    tags: [ cancellation, validation ]
+    call: decideAborted
+    args: [ { question: q, options: [] }, null, before ]
+    expect: { error: { status: 400, message: Invalid choice question or options } }
+
+  - name: policy errors win over an aborted signal
+    tags: [ cancellation, validation ]
+    call: decideAborted
+    args: [ { question: q, options: [ { id: a }, { id: b } ] }, { minMargin: 5 }, before ]
+    expect: { error: { status: 400, message: Invalid choice policy } }
+
+  - name: an abort during the provider call discards its answer
+    tags: [ cancellation ]
+    init: { prediction: { probabilities: { a: 1, b: 0 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: decideAborted, args: [ { question: q, options: [ { id: a }, { id: b } ] }, null, during ], expect: { error: { status: null, message: This operation was aborted } } }
+      - { call: calls, args: [], expect: { value: { $length: 1 } } }
+
+  # --- HTTP feature ---------------------------------------------------------------------------
+  - name: the feature exposes one explicit-grant endpoint with tool metadata
+    call: feature
+    args: []
+    expect:
+      value:
+        id: choice
+        migrations: []
+        endpoints:
+          - method: POST
+            path: /choice/decide
+            resource: choice.decide
+            access: permission
+            explicitGrant: true
+            tool:
+              name: choice_decide
+              description: Evaluate context against named options. May incur provider usage. Low-certainty decisions require review.
+              example: { body: { context: Refund please, question: Route?, options: [ { id: billing }, { id: sales } ] } }
+
+  - name: the endpoint decides the request body with the default policy
+    init: { prediction: { probabilities: { billing: 0.85, sales: 0.15 }, model: m, semantics: model-probabilities } }
+    steps:
+      - { call: handle, args: [ { context: Refund please, question: Route?, options: [ { id: billing }, { id: sales } ] } ], expect: { value: { provider: fake, probabilities: { billing: 0.85, sales: 0.15 }, model: m, semantics: model-probabilities, selected: billing, accepted: true, requiresReview: false } } }
+      - { call: handle, args: [ {} ], expect: { error: { status: 400, message: Invalid choice question or options } } }
+      - { call: handle, args: [ { question: Route?, options: [ { id: billing }, { id: sales } ], minProbability: 0.99 } ], expect: { value: { $partial: { accepted: true } } } }

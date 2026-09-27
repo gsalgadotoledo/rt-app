@@ -15,16 +15,25 @@ export interface HealthReport {
   }>;
 }
 
+export interface HealthOptions {
+  /** Clock for `at` and the cache expiry (epoch milliseconds or a Date); the system clock by default. */
+  now?: () => number | Date;
+}
+
 /** Cached, bounded probes; failures never expose provider credentials or error bodies. */
 export class HealthChecks {
   private snapshot?: HealthReport;
   private expires = 0;
   private pending?: Promise<HealthReport>;
+  private clock: () => number;
   constructor(
     private probes: HealthProbe[] = [],
     private timeoutMs = 1000,
     private cacheMs = 10000,
+    options: HealthOptions = {},
   ) {
+    const now = options.now;
+    this.clock = now ? () => +now() : Date.now;
     if (
       probes.length > 20 ||
       new Set(probes.map((probe) => probe.id)).size !== probes.length ||
@@ -37,7 +46,7 @@ export class HealthChecks {
   }
   /** Return a cloned snapshot; concurrent callers share one bounded probe run. */
   async report(): Promise<HealthReport> {
-    if (this.snapshot && this.expires > Date.now())
+    if (this.snapshot && this.expires > this.clock())
       return structuredClone(this.snapshot);
     if (!this.pending) this.pending = this.run();
     try {
@@ -79,10 +88,10 @@ export class HealthChecks {
     );
     this.snapshot = {
       ok: checks.every((check) => !check.required || check.status === "up"),
-      at: new Date().toISOString(),
+      at: new Date(this.clock()).toISOString(),
       checks,
     };
-    this.expires = Date.now() + this.cacheMs;
+    this.expires = this.clock() + this.cacheMs;
     return this.snapshot;
   }
   /** Public liveness/readiness expose only availability; dependency detail is owner-only. */

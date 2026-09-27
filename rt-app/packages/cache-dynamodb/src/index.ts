@@ -6,7 +6,8 @@ export class DynamoCache extends NoSQLCache {
     table: string,
     options: { region?: string; endpoint?: string } = {},
     namespace = "default",
+    clock: () => number = Date.now,
   ) {
-    super(new DynamoStore(table, options), namespace);
+    super(new DynamoStore(table, options), namespace, clock);
   }
 }
