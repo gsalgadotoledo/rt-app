@@ -442,3 +442,7 @@ body.rt-resizing{cursor:col-resize;user-select:none}
 .rt-project-item:has(.rt-running-badge) .rt-project-open strong{padding-right:0}
 .rt-services .rt-project-list .rt-project-item .rt-running-badge{margin-right:2px}
 @media(max-width:700px){.rt-project-item{flex-shrink:0}.rt-project-group{display:none}}
+
+/* The main area stacks above the theme effects (z-index 1) and below the sidebar (2); while a
+   modal is open it must cover the whole window, sidebar included. */
+.rt-services .rt-dashboard-main:has(.rt-modal-backdrop){z-index:20}
