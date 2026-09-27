@@ -25,6 +25,11 @@ function uptime(seconds?: number | null) {
 }
 const glyph = (d: string) => <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={d} /></svg>;
 
+/** A path as one shell word: quoted only when it needs to be (spaces, quotes, $…). */
+export function shellQuote(path: string) {
+  return /^[\w@%+=:,./-]+$/.test(path) ? path : `'${path.replace(/'/g, `'\\''`)}'`;
+}
+
 const ACTIVE = ["waiting", "starting", "running", "stopping"];
 const TRANSITION = ["waiting", "starting", "stopping"];
 /** Memory above these values (MB) turns the gauge amber, then red. */
@@ -69,6 +74,7 @@ export function ProjectPower({
   onOpenUrl,
   onBackground,
   onAdmin,
+  folder,
 }: {
   services: PowerService[];
   busy: boolean;
@@ -80,8 +86,11 @@ export function ProjectPower({
   onOpenUrl?: (id: string) => void;
   onBackground?: (id: string, enabled: boolean) => void;
   onAdmin?: (id: string) => void;
+  /** The project's folder: shown in the header with "Open in Finder" and "Copy cd command". */
+  folder?: { path: string; onReveal: () => void; onCopy: (text: string) => Promise<void> };
 }) {
   const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const long = services.filter((s) => s.kind !== "task");
   const activeCount = services.filter((s) => s.pid && ACTIVE.includes(s.state)).length;
@@ -149,6 +158,22 @@ export function ProjectPower({
               ↻ Restart all
             </button>
           </header>
+          {folder && (
+            <div className="rt-power-folder">
+              <code title={folder.path}>{folder.path.replace(/^\/Users\/[^/]+/, "~")}</code>
+              <button title="Open in Finder" aria-label="Open the project folder in Finder" onClick={folder.onReveal}>
+                {glyph("M3 7h6l2 2h10v11H3z M3 7V5h6l2 2")}
+              </button>
+              <button
+                className={copied ? "on" : undefined}
+                title={copied ? "Copied — paste it in a terminal" : `Copy "cd ${shellQuote(folder.path)}"`}
+                aria-label="Copy the cd command for this project"
+                onClick={() => void folder.onCopy(`cd ${shellQuote(folder.path)}`).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1800); }).catch(() => undefined)}
+              >
+                {copied ? glyph("M5 12l5 5 9-10") : glyph("M4 17l6-5-6-5 M12 19h8")}
+              </button>
+            </div>
+          )}
           <ul>
             {services.map((s) => {
               const running = ACTIVE.includes(s.state);

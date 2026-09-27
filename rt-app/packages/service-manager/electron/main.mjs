@@ -50,9 +50,17 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('services:action',(event,action,id)=>{trusted(event);if(!['start','stop','restart'].includes(action)||typeof id!=='string')throw new Error('Invalid action');return hub.action(action,id);});
    ipcMain.handle('services:open-url',async(event,id)=>{trusted(event);await shell.openExternal(await hub.url(id));});
    ipcMain.handle('services:select-project',async(event,path)=>{trusted(event);if(path!==undefined&&!(await hub.projects()).some(p=>p.path===path))throw new Error('Unknown project');if(!path){const selection=await dialog.showOpenDialog(window,{title:'Open RT-App project',properties:['openDirectory']});if(selection.canceled)return hub.snapshot();path=selection.filePaths[0];}return hub.select(path);});
+   ipcMain.handle('apps:list',event=>{trusted(event);return hub.projectApps();});
+   ipcMain.handle('apps:launch',(event,id,action)=>{trusted(event);return hub.launchApp(id,action);});
+   ipcMain.handle('apps:open-build',async(event,id,index)=>{trusted(event);const path=await hub.appBuild(id,index);const error=await shell.openPath(path);if(error)throw new Error(error);});
+   ipcMain.handle('project:repository',event=>{trusted(event);return hub.repository();});
+   ipcMain.handle('project:open-repository',async(event,target)=>{trusted(event);const repo=await hub.repository();if(!repo)throw new Error('This project has no git remote');const url=new URL(target==='branch'&&repo.branchUrl?repo.branchUrl:repo.url);if(url.protocol!=='https:')throw new Error('Only https links can be opened');await shell.openExternal(url.href);});
+   ipcMain.handle('insights:project',event=>{trusted(event);return hub.insights();});
+   ipcMain.handle('insights:records',(event,options)=>{trusted(event);if(!options||typeof options!=='object'||typeof options.collection!=='string')throw new Error('Invalid collection');return hub.records({collection:options.collection,offset:Number(options.offset)||0,limit:Number(options.limit)||50,search:typeof options.search==='string'?options.search.slice(0,200):''});});
    ipcMain.handle('projects:install-deps',(event,path)=>{trusted(event);return hub.installDependencies(path);});
    ipcMain.handle('projects:install-status',(event,path)=>{trusted(event);if(typeof path!=='string')throw new Error('Invalid project');return hub.installStatus(path);});
    ipcMain.handle('services:catalog',(event,action,id)=>{trusted(event);return hub.catalogAction(action,id);});
+   ipcMain.handle('services:reload-project',event=>{trusted(event);return hub.reloadProject();});
    ipcMain.handle('services:discover',event=>{trusted(event);return hub.discover();});
    ipcMain.handle('services:add-discovered',(event,id)=>{trusted(event);return hub.addDiscovered(id);});
    // Deploy panel: read-only overview; editing keys and plans happens in the admin Deployments page.

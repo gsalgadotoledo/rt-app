@@ -8,12 +8,14 @@ import {detectProject,projectName,genericServices,genericManifest,excludeFromGit
 import {LaunchAgents,agentLabel} from './launchd.mjs';
 import {MachineProcesses} from './processes.mjs';
 import {adminFor} from './admins.mjs';
+import {projectInsights,projectRecords} from './insights.mjs';
+import {detectApps,appTask,repository} from './apps.mjs';
 import {TerraformRunner,findStacks} from './terraform.mjs';
 import {ContractRunner,findConfigs,describe as describeContracts} from './contracts.mjs';
 import {createHash as hashOf} from 'node:crypto';
 import {spawn as spawnProcess} from 'node:child_process';
 const jobs=new Map();
-import {readFile,writeFile,mkdir,rename,realpath,readdir} from 'node:fs/promises';
+import {readFile,writeFile,mkdir,rename,realpath,readdir,stat} from 'node:fs/promises';
 import {homedir} from 'node:os';
 import {join,basename} from 'node:path';
 import {createServer} from 'node:net';
@@ -87,11 +89,18 @@ export class ServiceHub {
   return this.snapshot();
  }
  async projectManifest(root,settings){return manifest(root,{...this.options,sharedMail:this.global.ports,sharedEnv:Object.fromEntries((this.global.extra??[]).flatMap(s=>(s.portEnv??[]).map((key,i)=>[key,String(s.ports[i])]))),settings});}
- async ensureProject(root){const config=await this.isGeneric(root)?genericManifest((await this.genericConfig(root)).services):await this.projectManifest(root);const {started}=await ensureDaemon(root,{binary:this.options.binary,config});if(!started){const current=await read(join(root,'.rt-app/services.json'));if(JSON.stringify(current)!==JSON.stringify(config))await apply(root,config);}}
+ /** Last rt-app.settings.json modification time applied per project root (to follow edits). */
+ settingsApplied=new Map();
+ async settingsMtime(root){try{return (await stat(join(root,'rt-app.settings.json'))).mtimeMs;}catch{return 0;}}
+ async ensureProject(root){this.settingsApplied.set(root,await this.settingsMtime(root));const config=await this.isGeneric(root)?genericManifest((await this.genericConfig(root)).services):await this.projectManifest(root);const {started}=await ensureDaemon(root,{binary:this.options.binary,config});if(!started){const current=await read(join(root,'.rt-app/services.json'));if(JSON.stringify(current)!==JSON.stringify(config))await apply(root,config);}}
  async snapshot(){
   if(!this.root)return {project:'',services:[],projects:await this.withActivity(await this.projects()),catalog:[]};
   this.global=await read(join(this.home,'settings.json'),this.global);this.registry=await read(join(this.home,'projects.json'),this.registry);
   const [project,global]=await Promise.all([request(this.root,'status'),request(this.home,'status')]);
+  // rt-app.settings.json edited while the project is open (a new extra service, ports…): apply it,
+  // like reopening the project. Runs in the background so the status poll never waits for it.
+  const root=this.root,mtime=await this.settingsMtime(root);
+  if(this.settingsApplied.has(root)&&mtime!==this.settingsApplied.get(root)){this.settingsApplied.set(root,mtime);void this.exclusive(()=>this.ensureProject(root)).catch(error=>console.error(`Could not apply rt-app.settings.json: ${error.message}`));}
   const settings=await read(join(this.root,'rt-app.settings.json'),{});
   const config=await read(join(this.root,'.rt-app/services.json'),{services:[]});
   const detected=await detectProject(this.root)??{kind:'generic',runtimes:[]};
@@ -101,6 +110,38 @@ export class ServiceHub {
   const runtime=(s,list,backend)=>runtimeLabel(list.find(spec=>spec.id===s.id)??s,backend);
   return {...project,catalog:catalog.map(t=>({...t,installed:(this.global.catalogTools??[]).includes(t.id),job:jobs.get(t.id)})),projects:await this.withActivity(await this.projects(),{[this.root]:project}),globalPorts:{...this.global.ports,...extraPorts(this.global.extra)},projectPorts:detected.kind==='generic'?{}:{...defaults,...settings.local?.ports,...extraPorts(settings.services?.extra)},projectKind:detected.kind,projectRuntimes:detected.runtimes,services:[...global.services.map(s=>({...s,runtime:runtime(s,globalConfig.services),id:`global:${s.id}`,scope:'global',project:'Shared across projects',background:background.has(agentLabel(this.home,s.id)),admin:adminFor({...(globalConfig.services.find(spec=>spec.id===s.id)??{}),...s},{installed,running:pgweb?{pgweb:pgweb.url}:{}})})),...project.services.map(s=>({...s,runtime:runtime(s,config.services,settings.backend),scope:'project',project:this.registry.find(p=>p.path===this.root)?.name??basename(this.root),background:background.has(agentLabel(this.root,s.id))}))]};
  }
+ /** Electron/Tauri/React Native/Expo/Capacitor apps of the selected project (read-only detection). */
+ async projectApps(){if(!this.root)return [];const config=await read(join(this.root,'.rt-app/services.json'),{services:[]});return detectApps(this.root,config.services);}
+
+ /**
+  * Launch an app of the selected project: its supervisor service when one runs it (dev), otherwise
+  * an independent task running the app's script. Returns the service/task id for its output page.
+  */
+ async launchApp(id,action){
+  if(typeof id!=='string'||typeof action!=='string')throw new Error('Invalid app');
+  const app=(await this.projectApps()).find(a=>a.id===id);
+  if(!app)throw new Error('App no longer exists; reopen the project');
+  if(action==='dev'&&app.serviceId){await this.action('start',app.serviceId);return {id:app.serviceId};}
+  return this.exclusive(async()=>{
+   const config=await read(join(this.root,'.rt-app/services.json'),{services:[]});
+   const spec=await appTask(this.root,app,action,config.services);
+   await request(this.root,'run-command',undefined,spec);
+   return {id:spec.id};
+  });
+ }
+
+ /** Path of a packaged build (.app) of an app, re-resolved from detection (never taken from the UI). */
+ async appBuild(id,index){const app=(await this.projectApps()).find(a=>a.id===id);const build=app?.builds[Number(index)];if(!build)throw new Error('Build not found');return build.path;}
+
+ /** Web page of the selected project's git remote and current branch, or null. */
+ repository(){return this.root?repository(this.root):null;}
+
+ /** Modules, their initialization and record counts of the selected RT-App project (read-only). */
+ async insights(){if(!this.root)throw new Error('Select a project first');if(await this.isGeneric(this.root))throw new Error('Insights are available for RT-App projects (rt-app.settings.json).');return projectInsights(this.root);}
+
+ /** A page of records of one collection of the selected project (sensitive fields redacted). */
+ async records(options){if(!this.root)throw new Error('Select a project first');if(await this.isGeneric(this.root))throw new Error('Records are available for RT-App projects.');return projectRecords(this.root,options);}
+
  /**
   * Run `<npm|pnpm|yarn> install` in a known project whose dependencies are missing (e.g. created by npx and never
   * installed). Runs in the background with a bounded log; poll installStatus(path). One run per
@@ -300,6 +341,9 @@ export class ServiceHub {
  async contractHistory(id){return this.contracts.history(await this.contractConfig(id));}
  async contractAdd(path){await this.contracts.addConfig(path);return this.contractConfigs();}
  async contractRemove(id){await this.contracts.removeConfig((await this.contractConfig(id)).path);return this.contractConfigs();}
+
+ /** Re-read the open project's settings and apply them now (new services, ports…); the snapshot. */
+ reloadProject(){if(!this.root)throw new Error('Select a project first');return this.exclusive(async()=>{await this.ensureProject(this.root);}).then(()=>this.snapshot());}
 
  async discover(){if(await this.isGeneric(this.root)){const saved=await this.genericConfig(this.root);const known=new Set(saved.services.map(s=>s.id));return (await genericServices(this.root)).filter(s=>!known.has(s.id));}const settings=await read(join(this.root,'rt-app.settings.json'));const existing=new Set((settings.services?.extra??[]).map(s=>s.id));return (await discover(this.root)).filter(s=>!existing.has(s.id));}
  addDiscovered(id){return this.exclusive(async()=>{
