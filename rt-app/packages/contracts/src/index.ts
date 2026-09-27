@@ -24,7 +24,8 @@ export interface Actor {
   id: string;
   email: string;
   name: string;
-  role: "owner" | "admin" | "user";
+  /** "service": a scoped service key (grants hold its scopes); see ServiceKeys in rt-app-auth. */
+  role: "owner" | "admin" | "user" | "service";
   grants: string[];
   tokenVersion: number;
   active: boolean;
@@ -58,7 +59,11 @@ export interface Endpoint {
   method: string;
   path: string;
   resource: string;
-  access: "guest" | "authenticated" | "permission" | "owner";
+  /**
+   * "service": only scoped service keys (`Bearer rtsk_<id>.<secret>`) whose scopes include
+   * `resource`; the path must start with /service/ and is never mounted under /admin/app.
+   */
+  access: "guest" | "authenticated" | "permission" | "owner" | "service";
   /** Require an explicit grant even for application owners. Admin root uses its separate ACL. */
   explicitGrant?: boolean;
   /** Largest request body accepted, in bytes (default 16 KiB). Webhooks with large payloads raise it. */

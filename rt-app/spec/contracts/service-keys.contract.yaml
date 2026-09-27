@@ -1,0 +1,265 @@
+contract: 1
+module: service-keys
+subject: serviceKeys
+title: Service keys - scoped credentials for backends (metering without the admin password)
+description: |
+  Reference: packages/auth/src/service-keys.ts. Design and wire formats: docs/polyglot/service-keys.md.
+
+  A key is presented as `Authorization: Bearer rtsk_<id>.<secret>`: id ^[A-Za-z0-9_-]{1,64}$,
+  secret ^[A-Za-z0-9_-]{32,128}$. Only sha256hex(utf8(full token)) is stored. A key authenticates
+  ONLY endpoints with access "service" (paths under /service/) whose resource is one of its scopes.
+
+  Configured keys (init.keys, RT_APP_SERVICE_KEYS): parse(config, scopes) validates, in order per
+  entry: an array of at most 100 objects; id; exactly one of secretHash (^[0-9a-f]{64}$) or
+  secret (hashed as sha256hex("rtsk_<id>.<secret>")); scopes (1..20 strings, all in `scopes`,
+  duplicates removed); description (string up to 200 after trim, default ""); rateLimit (safe
+  integer 1..100000, default 600); ids unique. null/undefined config is []. Any failure: 400
+  "Invalid service key configuration".
+
+  create(input, actorId), in order: id (optional; string ^[A-Za-z0-9_-]{1,64}$, else 400 "Invalid
+  service key id"; default random(9)); description trimmed 1..200 (400 "A short description is
+  required"); scopes as above (400 "Invalid service key scopes"); rateLimit as above (400
+  "Invalid service key rate limit"); an id that is configured or stored -> 409 "Service key id
+  already used". token = "rtsk_" + id + "." + random(32). Writes SERVICE_KEYS/<id> {id,
+  description, scopes, rateLimit, secretHash, source: "admin", createdAt, createdBy, rotatedAt:
+  null, revokedAt: null, revokedBy: null} (version 1) and the audit row
+  SERVICE_KEY_AUDIT#<id>/pad15(at)-pad10(1) {keyId, action: "create", actorId, at, scopes,
+  rateLimit}. Returns {key: view, token}. The token is never returned again.
+
+  View: {id, description, scopes, rateLimit, source ("env" | "admin"), prefix: "rtsk_<id>.",
+  active (revokedAt null), createdAt, createdBy, rotatedAt, revokedAt, revokedBy (null for
+  configured keys), lastUsedAt (SERVICE_KEY_USE/<id>.lastUsedAt or null)}. list() -> {items:
+  configured keys in configuration order, then stored keys by id, scopes}.
+
+  rotate(id, actorId) / revoke(id, actorId): an id that is not a valid id or not stored -> 404
+  "Service key not found"; a configured id -> 409 ("Keys from the configuration are rotated in the
+  configuration" / "... are revoked by removing them from the configuration"). rotate: revoked ->
+  409 "Service key is revoked"; new secretHash, rotatedAt = now, version + 1, audit {action:
+  "rotate", actorId, at} at pad10(new version); returns {key, token}. revoke: already revoked ->
+  {key} without writing; else revokedAt = now, revokedBy = actorId, version + 1, audit {action:
+  "revoke", actorId, at}; returns {key}.
+
+  actor(authorization), in order: missing (null, "") -> 401 "Service key required"; not "Bearer
+  " + a token matching the formats -> 401 "Invalid service key"; the key (configured first, then
+  SERVICE_KEYS/<id>); sha256 of the token compared in constant time with its secretHash (64 zeros
+  when the id is unknown); unknown, different or revoked -> 401 "Invalid service key"; then the
+  per-key limit: RATE row of "service-key:<id>" (auth limits: hex(HMAC-SHA256(secret,
+  "<key>:<floor(ms/60000)>")) {count}), rateLimit per minute -> 429 "Too many attempts; wait one
+  minute"; then SERVICE_KEY_USE/<id> {lastUsedAt: now} is written when missing or at least 60000
+  ms old (a Conflict is ignored). Actor: {id: "service:<id>", role: "service", grants: scopes,
+  email: "", name: description or id, tokenVersion: 0, active: true}.
+
+  check(endpoint, actor): endpoint.access != "service" -> 403 "You do not have permission to
+  access this resource"; no actor or role != "service" -> 401 "Service key required"; resource not
+  in grants -> 403 "Service key not allowed for this resource".
+
+  Facade: random bytes are deterministic (call n returns `bytes` bytes of value n % 256 as
+  base64url without padding); authorize(authorization, endpoint) = actor then check; self(actor)
+  runs GET /service/keys/self; audit(id) lists the audit rows ({sk, ...data}); hash(token);
+  row(pk, sk); setNow(iso); endpoints(); admin().
+init:
+  now: "2026-03-01T10:00:00.000Z"
+  secret: service-keys-contract-secret-0123456789abcdef
+  scopes: [ subscriptions.meter, service-keys.self ]
+  keys:
+    - { id: agent-env, secret: envsecret-envsecret-envsecret-0123, scopes: [ subscriptions.meter ], description: Agent server (configured), rateLimit: 3 }
+    - { id: hashed, secretHash: b40150dd4834648b2f937e85c1a1aed5fe0564acf0dd096540764225bd5ed5f4, scopes: [ service-keys.self, service-keys.self ] }
+fixtures:
+  meter: &meter { access: service, resource: subscriptions.meter }
+  self: &self { access: service, resource: service-keys.self }
+  envToken: &envToken "Bearer rtsk_agent-env.envsecret-envsecret-envsecret-0123"
+  hashedToken: &hashedToken "Bearer rtsk_hashed.hashedsecret-hashedsecret-hashed-0123"
+cases:
+  - name: configured keys are validated
+    tags: [ validation ]
+    steps:
+      - { call: parse, args: [ null, [ a.b ] ], expect: { value: [] } }
+      - call: parse
+        args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b, a.b ] }, { id: k2, secretHash: b40150dd4834648b2f937e85c1a1aed5fe0564acf0dd096540764225bd5ed5f4, scopes: [ a.b ], description: "  Two  ", rateLimit: 100000 } ], [ a.b ] ]
+        expect:
+          value:
+            - { id: k1, secretHash: 6ed7cd3d42fafa583b8cc4f9e7d027d92f35f922328cd2bd3436e068b3af7405, scopes: [ a.b ], description: "", rateLimit: 600 }
+            - { id: k2, secretHash: b40150dd4834648b2f937e85c1a1aed5fe0564acf0dd096540764225bd5ed5f4, scopes: [ a.b ], description: Two, rateLimit: 100000 }
+      - { call: parse, args: [ { id: k1 }, [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ 5 ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: "k.1", secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: { $text: { repeat: k, count: 65 } }, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, scopes: [ a.b ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, secretHash: b40150dd4834648b2f937e85c1a1aed5fe0564acf0dd096540764225bd5ed5f4, scopes: [ a.b ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: too-short, scopes: [ a.b ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: "envsecret envsecret envsecret 0123", scopes: [ a.b ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secretHash: B40150DD4834648B2F937E85C1A1AED5FE0564ACF0DD096540764225BD5ED5F4, scopes: [ a.b ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ users.manage ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: a.b } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ], description: 5 } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ], description: { $text: { repeat: d, count: 201 } } } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ], rateLimit: 0 } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ], rateLimit: 1.5 } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ], rateLimit: true } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+      - { call: parse, args: [ [ { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ] }, { id: k1, secret: envsecret-envsecret-envsecret-0123, scopes: [ a.b ] } ], [ a.b ] ], expect: { error: { status: 400, message: Invalid service key configuration } } }
+
+  - name: configured keys authenticate and are listed without secrets
+    steps:
+      - call: authorize
+        args: [ *envToken, *meter ]
+        expect: { value: { id: "service:agent-env", role: service, grants: [ subscriptions.meter ], email: "", name: Agent server (configured), tokenVersion: 0, active: true } }
+      - call: authorize
+        args: [ *hashedToken, *self ]
+        expect: { value: { id: "service:hashed", role: service, grants: [ service-keys.self ], email: "", name: hashed, tokenVersion: 0, active: true } }
+      - { call: row, args: [ SERVICE_KEY_USE, agent-env ], expect: { value: { pk: SERVICE_KEY_USE, sk: agent-env, version: 1, data: { lastUsedAt: 1772359200000 } } } }
+      - { call: self, args: [ { $ref: "1.value" } ], expect: { value: { id: hashed, description: "", scopes: [ service-keys.self ], rateLimit: 600 } } }
+      - call: list
+        args: []
+        expect:
+          value:
+            items:
+              - { id: agent-env, description: Agent server (configured), scopes: [ subscriptions.meter ], rateLimit: 3, source: env, prefix: rtsk_agent-env., active: true, createdAt: null, createdBy: null, rotatedAt: null, revokedAt: null, revokedBy: null, lastUsedAt: 1772359200000 }
+              - { id: hashed, description: "", scopes: [ service-keys.self ], rateLimit: 600, source: env, prefix: rtsk_hashed., active: true, createdAt: null, createdBy: null, rotatedAt: null, revokedAt: null, revokedBy: null, lastUsedAt: 1772359200000 }
+            scopes: [ subscriptions.meter, service-keys.self ]
+      - { call: rotate, args: [ agent-env, root ], expect: { error: { status: 409, message: Keys from the configuration are rotated in the configuration } } }
+      - { call: revoke, args: [ agent-env, root ], expect: { error: { status: 409, message: Keys from the configuration are revoked by removing them from the configuration } } }
+
+  - name: bad credentials are 401 and never reveal which part failed
+    tags: [ security ]
+    steps:
+      - { call: actor, args: [ null ], expect: { error: { status: 401, message: Service key required } } }
+      - { call: actor, args: [ "" ], expect: { error: { status: 401, message: Service key required } } }
+      - { call: actor, args: [ 5 ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: actor, args: [ "rtsk_agent-env.envsecret-envsecret-envsecret-0123" ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: actor, args: [ "bearer rtsk_agent-env.envsecret-envsecret-envsecret-0123" ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: actor, args: [ "Bearer  rtsk_agent-env.envsecret-envsecret-envsecret-0123" ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: actor, args: [ "Bearer rtsk_agent-env.envsecret-envsecret-envsecret-0124" ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: actor, args: [ "Bearer rtsk_nobody.envsecret-envsecret-envsecret-0123" ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: actor, args: [ "Bearer rtsk_agent-env.short" ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: actor, args: [ "Bearer rtsk_agent-env.envsecret-envsecret-envsecret-0123 " ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x" ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: row, args: [ SERVICE_KEY_USE, agent-env ], expect: { value: null }, note: "failed attempts are not recorded as a use" }
+
+  - name: scopes decide which service endpoints a key reaches
+    tags: [ security ]
+    steps:
+      - { call: authorize, args: [ *envToken, *self ], expect: { error: { status: 403, message: Service key not allowed for this resource } } }
+      - { call: authorize, args: [ *hashedToken, *meter ], expect: { error: { status: 403, message: Service key not allowed for this resource } } }
+      - { call: authorize, args: [ *envToken, { access: owner, resource: subscriptions.meter } ], expect: { error: { status: 403, message: You do not have permission to access this resource } } }
+      - { call: authorize, args: [ *envToken, { access: permission, resource: subscriptions.meter } ], expect: { error: { status: 403, message: You do not have permission to access this resource } } }
+      - { call: check, args: [ *meter, null ], expect: { error: { status: 401, message: Service key required } } }
+      - { call: check, args: [ *meter, { id: rt-app-root, role: owner, grants: [ subscriptions.meter ] } ], expect: { error: { status: 401, message: Service key required } } }
+      - { call: check, args: [ *meter, { id: "service:x", role: service, grants: [ subscriptions.meter ] } ], expect: { value: null } }
+      - { call: check, args: [ { access: guest, resource: subscriptions.meter }, { id: "service:x", role: service, grants: [ subscriptions.meter ] } ], expect: { error: { status: 403, message: You do not have permission to access this resource } } }
+
+  - name: each key has its own per-minute limit
+    steps:
+      - { call: actor, args: [ *envToken ], expect: { value: { $partial: { id: "service:agent-env" } } } }
+      - { call: actor, args: [ *envToken ], expect: { value: { $partial: { id: "service:agent-env" } } } }
+      - { call: actor, args: [ *envToken ], expect: { value: { $partial: { id: "service:agent-env" } } } }
+      - { call: actor, args: [ *envToken ], expect: { error: { status: 429, message: Too many attempts; wait one minute } } }
+      - { call: actor, args: [ *hashedToken ], expect: { value: { $partial: { id: "service:hashed" } } }, note: "the limit is per key" }
+      - { call: setNow, args: [ "2026-03-01T10:00:59.999Z" ], expect: { value: null } }
+      - { call: actor, args: [ *envToken ], expect: { error: { status: 429, message: Too many attempts; wait one minute } } }
+      - { call: setNow, args: [ "2026-03-01T10:01:00.000Z" ], expect: { value: null } }
+      - { call: actor, args: [ *envToken ], expect: { value: { $partial: { id: "service:agent-env" } } } }
+      - { call: row, args: [ SERVICE_KEY_USE, agent-env ], expect: { value: { pk: SERVICE_KEY_USE, sk: agent-env, version: 2, data: { lastUsedAt: 1772359260000 } } }, note: "lastUsedAt is written at most once a minute" }
+      - { call: setNow, args: [ "2026-03-01T10:01:59.999Z" ], expect: { value: null } }
+      - { call: actor, args: [ *envToken ], expect: { value: { $partial: { id: "service:agent-env" } } } }
+      - { call: row, args: [ SERVICE_KEY_USE, agent-env ], expect: { value: { pk: SERVICE_KEY_USE, sk: agent-env, version: 2, data: { lastUsedAt: 1772359260000 } } } }
+
+  - name: admin-managed keys are created once, rotated and revoked immediately
+    steps:
+      - call: create
+        args: [ { description: "  Agent server  ", scopes: [ subscriptions.meter, subscriptions.meter ], rateLimit: 50 }, rt-app-root ]
+        expect:
+          value:
+            key: { id: AQEBAQEBAQEB, description: Agent server, scopes: [ subscriptions.meter ], rateLimit: 50, source: admin, prefix: rtsk_AQEBAQEBAQEB., active: true, createdAt: 1772359200000, createdBy: rt-app-root, rotatedAt: null, revokedAt: null, revokedBy: null, lastUsedAt: null }
+            token: rtsk_AQEBAQEBAQEB.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI
+      - { call: hash, args: [ rtsk_AQEBAQEBAQEB.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI ], expect: { value: { $regex: "^[0-9a-f]{64}$" } } }
+      - call: row
+        args: [ SERVICE_KEYS, AQEBAQEBAQEB ]
+        expect:
+          value:
+            pk: SERVICE_KEYS
+            sk: AQEBAQEBAQEB
+            version: 1
+            data: { id: AQEBAQEBAQEB, description: Agent server, scopes: [ subscriptions.meter ], rateLimit: 50, secretHash: { $ref: "1.value" }, source: admin, createdAt: 1772359200000, createdBy: rt-app-root, rotatedAt: null, revokedAt: null, revokedBy: null }
+      - call: authorize
+        args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] }, *meter ]
+        expect: { value: { id: "service:AQEBAQEBAQEB", role: service, grants: [ subscriptions.meter ], email: "", name: Agent server, tokenVersion: 0, active: true } }
+      - { call: setNow, args: [ "2026-03-01T11:00:00.000Z" ], expect: { value: null } }
+      - call: rotate
+        args: [ AQEBAQEBAQEB, rt-app-root ]
+        expect:
+          value:
+            key: { id: AQEBAQEBAQEB, description: Agent server, scopes: [ subscriptions.meter ], rateLimit: 50, source: admin, prefix: rtsk_AQEBAQEBAQEB., active: true, createdAt: 1772359200000, createdBy: rt-app-root, rotatedAt: 1772362800000, revokedAt: null, revokedBy: null, lastUsedAt: 1772359200000 }
+            token: rtsk_AQEBAQEBAQEB.AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] } ], expect: { error: { status: 401, message: Invalid service key } }, note: "the old token stops working at once" }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "5.value.token" } ] } ], expect: { value: { $partial: { id: "service:AQEBAQEBAQEB" } } } }
+      - call: revoke
+        args: [ AQEBAQEBAQEB, admin-2 ]
+        expect:
+          value:
+            key: { id: AQEBAQEBAQEB, description: Agent server, scopes: [ subscriptions.meter ], rateLimit: 50, source: admin, prefix: rtsk_AQEBAQEBAQEB., active: false, createdAt: 1772359200000, createdBy: rt-app-root, rotatedAt: 1772362800000, revokedAt: 1772362800000, revokedBy: admin-2, lastUsedAt: 1772362800000 }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "5.value.token" } ] } ], expect: { error: { status: 401, message: Invalid service key } }, note: "a revoked key is rejected on the next request" }
+      - { call: revoke, args: [ AQEBAQEBAQEB, admin-3 ], expect: { value: { key: { $partial: { active: false, revokedBy: admin-2 } } } }, note: "revoking again writes nothing" }
+      - { call: rotate, args: [ AQEBAQEBAQEB, rt-app-root ], expect: { error: { status: 409, message: Service key is revoked } } }
+      - { call: rotate, args: [ nobody, rt-app-root ], expect: { error: { status: 404, message: Service key not found } } }
+      - { call: revoke, args: [ "bad.id", rt-app-root ], expect: { error: { status: 404, message: Service key not found } } }
+      - call: audit
+        args: [ AQEBAQEBAQEB ]
+        expect:
+          value:
+            - { sk: 001772359200000-0000000001, keyId: AQEBAQEBAQEB, action: create, actorId: rt-app-root, at: 1772359200000, scopes: [ subscriptions.meter ], rateLimit: 50 }
+            - { sk: 001772362800000-0000000002, keyId: AQEBAQEBAQEB, action: rotate, actorId: rt-app-root, at: 1772362800000 }
+            - { sk: 001772362800000-0000000003, keyId: AQEBAQEBAQEB, action: revoke, actorId: admin-2, at: 1772362800000 }
+      - { call: row, args: [ SERVICE_KEYS, AQEBAQEBAQEB ], expect: { value: { $partial: { version: 3 } } } }
+
+  - name: creation is validated in order
+    tags: [ validation ]
+    steps:
+      - { call: create, args: [ { id: "bad id", description: "", scopes: [] }, root ], expect: { error: { status: 400, message: Invalid service key id } } }
+      - { call: create, args: [ { id: 5, description: x, scopes: [ subscriptions.meter ] }, root ], expect: { error: { status: 400, message: Invalid service key id } } }
+      - { call: create, args: [ { id: agent-2, description: "   ", scopes: [] }, root ], expect: { error: { status: 400, message: A short description is required } } }
+      - { call: create, args: [ { id: agent-2, description: 5, scopes: [] }, root ], expect: { error: { status: 400, message: A short description is required } } }
+      - { call: create, args: [ { id: agent-2, description: { $text: { repeat: d, count: 201 } }, scopes: [] }, root ], expect: { error: { status: 400, message: A short description is required } } }
+      - { call: create, args: [ { id: agent-2, description: Agent, scopes: [] }, root ], expect: { error: { status: 400, message: Invalid service key scopes } } }
+      - { call: create, args: [ { id: agent-2, description: Agent, scopes: [ subscriptions.manage ] }, root ], expect: { error: { status: 400, message: Invalid service key scopes } } }
+      - { call: create, args: [ { id: agent-2, description: Agent, scopes: { $repeat: { count: 21, item: subscriptions.meter } } }, root ], expect: { error: { status: 400, message: Invalid service key scopes } } }
+      - { call: create, args: [ { id: agent-2, description: Agent, scopes: [ subscriptions.meter ], rateLimit: 100001 }, root ], expect: { error: { status: 400, message: Invalid service key rate limit } } }
+      - { call: create, args: [ { id: agent-2, description: Agent, scopes: [ subscriptions.meter ], rateLimit: "5" }, root ], expect: { error: { status: 400, message: Invalid service key rate limit } } }
+      - { call: create, args: [ { id: agent-env, description: Agent, scopes: [ subscriptions.meter ] }, root ], expect: { error: { status: 409, message: Service key id already used } } }
+      - { call: create, args: [ { id: agent-2, description: Agent, scopes: [ subscriptions.meter ] }, root ], expect: { value: { key: { $partial: { id: agent-2, rateLimit: 600 } }, token: rtsk_agent-2.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE } }, note: "with an id only the secret is random" }
+      - { call: create, args: [ { id: agent-2, description: Agent, scopes: [ subscriptions.meter ] }, root ], expect: { error: { status: 409, message: Service key id already used } } }
+      - call: list
+        args: []
+        expect:
+          value:
+            items:
+              - { $partial: { id: agent-env, source: env } }
+              - { $partial: { id: hashed, source: env } }
+              - { id: agent-2, description: Agent, scopes: [ subscriptions.meter ], rateLimit: 600, source: admin, prefix: rtsk_agent-2., active: true, createdAt: 1772359200000, createdBy: root, rotatedAt: null, revokedAt: null, revokedBy: null, lastUsedAt: null }
+            scopes: [ subscriptions.meter, service-keys.self ]
+
+  - name: stored keys written by another implementation authenticate
+    init:
+      now: "2026-03-01T10:00:00.000Z"
+      secret: service-keys-contract-secret-0123456789abcdef
+      scopes: [ subscriptions.meter ]
+      rows:
+        - { pk: SERVICE_KEYS, sk: stored, version: 4, data: { id: stored, description: From Go, scopes: [ subscriptions.meter ], rateLimit: 2, secretHash: b40150dd4834648b2f937e85c1a1aed5fe0564acf0dd096540764225bd5ed5f4, source: admin, createdAt: 1, createdBy: root, rotatedAt: 2, revokedAt: null, revokedBy: null } }
+        - { pk: SERVICE_KEYS, sk: gone, version: 2, data: { id: gone, description: Revoked, scopes: [ subscriptions.meter ], rateLimit: 2, secretHash: b40150dd4834648b2f937e85c1a1aed5fe0564acf0dd096540764225bd5ed5f4, source: admin, createdAt: 1, createdBy: root, rotatedAt: null, revokedAt: 3, revokedBy: root } }
+    steps:
+      - { call: actor, args: [ "Bearer rtsk_stored.hashedsecret-hashedsecret-hashed-0123" ], expect: { error: { status: 401, message: Invalid service key } }, note: "the hash covers the id, so a secret moved to another id fails" }
+      - { call: actor, args: [ "Bearer rtsk_gone.hashedsecret-hashedsecret-hashed-0123" ], expect: { error: { status: 401, message: Invalid service key } } }
+      - { call: list, args: [], expect: { value: { items: [ { $partial: { id: gone, active: false, revokedAt: 3 } }, { $partial: { id: stored, active: true, rotatedAt: 2, lastUsedAt: null } } ], scopes: [ subscriptions.meter ] } } }
+
+  - name: module surface
+    steps:
+      - call: endpoints
+        args: []
+        expect:
+          value:
+            - { method: GET, path: /service-keys, access: owner, resource: service-keys.manage, tool: service_keys_list }
+            - { method: POST, path: /service-keys, access: owner, resource: service-keys.manage }
+            - { method: POST, path: "/service-keys/:id/rotate", access: owner, resource: service-keys.manage }
+            - { method: POST, path: "/service-keys/:id/revoke", access: owner, resource: service-keys.manage, tool: service_keys_revoke }
+            - { method: GET, path: /service/keys/self, access: service, resource: service-keys.self }
+      - { call: admin, args: [], expect: { value: { id: service-keys, title: Service keys, resource: service-keys.manage, path: /service-keys, component: service-keys, ownerOnly: true, fields: [], actions: [] } } }

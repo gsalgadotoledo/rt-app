@@ -1,0 +1,332 @@
+contract: 1
+module: subscriptions-limits
+subject: subscriptions
+title: Subscriptions service - short window, model caps, provider costs, margin rule and service metering
+description: |
+  Finance limits through the `subscriptions` facade (init and helpers: subscriptions-settings;
+  windows, holds and pre-flight: subscriptions-reservations). Design: docs/polyglot/subscriptions-limits.md.
+
+  Settings (validateSettings; the new fields are optional and only written when given; a JSON
+  null counts as missing). Rates: costInputPer1k / costOutputPer1k (minor units of the pack
+  currency per 1k tokens, the `rate` check: 400 "Invalid credit rate"); when either is given both
+  are written, the missing one as 0. Products: shortLimit + shortSeconds; rateCaps. Plans:
+  maxProviderCostMinor. After the plans and the credits are validated (existing order),
+  validateLimits runs per plan, per product: short window (shortLimit safe integer 0..1e9 and
+  shortSeconds safe integer 60..604800, both given: 400 "Invalid short window"); rateCaps (an
+  array of at most 20 objects, rateId one of the credit rates, windows short|day|week|period
+  safe integers 0..1e9 when given, at least one, short only when the product has a short
+  window, distinct rateIds: 400 "Invalid model cap"; entries are rewritten {rateId, short?, day?,
+  week?, period?}; an empty list is dropped); then the plan's maxProviderCostMinor (safe
+  integer 0..1e12 and plan currency == pack currency: 400 "Invalid margin rule"). planContent
+  includes maxProviderCostMinor (a change is a new plan version, like products).
+
+  Short window (from the plan as subscribed, like day/week): normalization sets counters.short =
+  0 and shortStart = now when shortStart is missing or now >= shortStart + shortSeconds s (the
+  window starts with the first use after the previous one ended), after the day/week rollover.
+  allowanceLeft also takes min with shortLimit - short. consume/settle add fromAllowance to
+  short. Windows list {kind: "short", used: short, limit: shortLimit, resetAt: shortStart +
+  shortSeconds s} first. consume's 429 names "short" first when short >= shortLimit. me().usage
+  gains shortUsed and shortResetAt. reset accepts scope "short" ("all" includes it) and resets
+  only counters that have it.
+
+  Model caps (from the CURRENT settings: the plan with the entitlement's plan id, else the
+  subscribed plan): counters[product].rates[rateId] = {short? (only with a short window), day,
+  week, period} counts the credits used at a capped rate (created on the first count); every
+  per-rate window resets with the product window of the same name (and all of them with the
+  period). Rate windows: the cap's windows (short only when the product has a short window) as
+  windowUsage(kind, used, reserved = credits of active holds with that rateId, cap, resetAt of
+  the product window). A charge overflows when used + reserved + credits > limit (first window in
+  order short, day, week, period). reserve with an estimate of a capped rate: after the credits
+  check -> 429 "Model limit reached: <rate name> <window> limit. Use another model or wait for the
+  reset."; the hold (and receipt) gain rateId. consumeUsage: the same check after consume's
+  credits check, then counts the credits. settle counts `used` (uncovered included) when the
+  reservation's estimate rate is capped. Nothing is counted for uncapped rates.
+
+  Provider cost: providerCost(rate, in, out) = round4((in / 1000) * costInputPer1k + (out / 1000)
+  * costOutputPer1k), null without costs (round4(x) = floor(x * 1e4 + 0.5) / 1e4). settle with
+  token usage and consumeUsage add it (when > 0) to account.providerCost = {totalMinor:
+  {<pack currency>: n}, periodStart (the effective entitlement's), periodMinor} (periodMinor
+  restarts when periodStart changes), and write costMinor into the entry details and the result
+  (settlement and consumeUsage) when the rate has costs.
+
+  Margin rule (CURRENT settings): with an active entitlement whose plan has
+  maxProviderCostMinor -> {currency: pack currency, costMinor: providerCost.periodMinor of this
+  period (else 0), capMinor, remainingMinor: round4(max(0, cap - cost)), percent: floor(cost *
+  100 / cap) (100 when cap is 0), threshold, resetAt: periodEnd}, else null.
+
+  usageSummary: products gain `models` (only when the product has caps: [{rateId, name (rate
+  name or null), windows}]), alerts gain model windows at >= 80 % ({productId, window, percent,
+  threshold, rateId}, after the product windows of the same product), and the result gains
+  `margin`. preflight gains: costMinor (provider cost of the estimate at maxOutputTokens, null
+  without an estimate or costs), model (a capped estimate rate: {rateId, windows, exceeded: the
+  first overflowing window or null}, else null), margin ({...margin, stepMinor: costMinor ?? 0,
+  exceeded: round4(cost + step) > cap} or null; null when blocked), fits = not blocked, missing 0
+  and no model overflow, reason blocked ?? ("credits" when missing, else "model"), and degrade:
+  with an estimate, not blocked and (missing > 0, a model overflow or margin exceeded): among
+  the other rates in settings order, those strictly cheaper than the estimate's by (cost ?? 0,
+  credits) lexicographically, whose credits fit `available`, whose own cap does not overflow and
+  whose cost fits the margin left (round4(margin cost + cost) <= cap); the least degradation
+  wins (the highest (cost ?? 0, credits), the first on ties) -> {rateId, name, credits,
+  costMinor}; none -> null.
+
+  Service metering endpoints (access "service", resource "subscriptions.meter", actor
+  {id: "service:<key>", role: "service"}): /service/subscriptions/accounts/:id/{usage, preflight,
+  reservations, reservations/:key/settle, reservations/:key/release, ledger} run the owner calls on
+  id(params.id) (400 "Invalid identifier") with source "api" and actorId = actor id. The ledger
+  endpoint records debits only: credits > 0 -> 403 "Service keys can only record debits"; the
+  body fields reaching recordCredits are requestId, productId, credits, kind, reason, details (no
+  money fields).
+fixtures:
+  alice: &alice { id: alice, email: alice@example.test, role: user }
+  service: &service { id: "service:agent", role: service, grants: [ subscriptions.meter ] }
+  starter: &starter { id: starter, name: Starter, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800 } ] }
+  pro: &pro { id: pro, name: Pro, amount: 2000, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 10000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ] }
+  max: &max { id: max, name: Max, amount: 5000, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 50000, dailyLimit: 5000, weeklyLimit: 25000, daySeconds: 86400, weekSeconds: 604800 } ] }
+  cappedProduct: &cappedProduct { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800, shortLimit: 30, shortSeconds: 18000, rateCaps: [ { rateId: advanced, day: 40, period: 100 } ] }
+  capped: &capped { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, maxProviderCostMinor: 10, products: [ *cappedProduct ] }
+  rates: &rates
+    - { id: standard, name: Standard model, inputPer1k: 1, outputPer1k: 3, minimum: 1, costInputPer1k: 0.3, costOutputPer1k: 1.5 }
+    - { id: advanced, name: Advanced model, inputPer1k: 5, outputPer1k: 15, minimum: 1, costInputPer1k: 1.5, costOutputPer1k: 7.5 }
+    - { id: lite, name: Lite model, inputPer1k: 0.5, outputPer1k: 1, minimum: 1 }
+  credits: &credits { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: *rates }
+  limited: &limited { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, *capped ], credits: *credits } }
+cases:
+  - name: finance limits are validated in order
+    tags: [ validation ]
+    steps:
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, shortLimit: 5 } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid short window } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, shortLimit: 5, shortSeconds: 59 } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid short window } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, shortLimit: -1, shortSeconds: 18000 } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid short window } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, shortLimit: 5, shortSeconds: 604801 } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid short window } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: { rateId: advanced, day: 1 } } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: [ { rateId: nope, day: 1 } ] } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: [ { rateId: advanced } ] } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: [ { rateId: advanced, short: 5 } ] } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: [ { rateId: advanced, day: 1.5 } ] } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: [ { rateId: advanced, week: true } ] } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: [ { rateId: advanced, day: 1 }, { rateId: advanced, week: 1 } ] } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: { $repeat: { count: 21, item: { rateId: advanced, day: 1 } } } } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, maxProviderCostMinor: -1, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800 } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid margin rule } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: eur, periodDays: 30, enabled: true, maxProviderCostMinor: 5, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800 } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid margin rule } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, maxProviderCostMinor: "5", products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800 } ] } ] } }, admin-1 ], expect: { error: { status: 400, message: Invalid margin rule } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max ], credits: { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: [ { id: standard, name: Standard, inputPer1k: 1, outputPer1k: 3, costInputPer1k: -1 } ] } } }, admin-1 ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max ], credits: { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: [ { id: standard, name: Standard, inputPer1k: 1, outputPer1k: 3, costOutputPer1k: 0.00001 } ] } } }, admin-1 ], expect: { error: { status: 400, message: Invalid credit rate } } }
+      - { call: saveSettings, args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: [ { rateId: advanced, day: 1 } ] } ] } ], credits: { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: [ { id: standard, name: Standard, inputPer1k: 1, outputPer1k: 3 } ] } } }, admin-1 ], expect: { error: { status: 400, message: Invalid model cap } }, note: caps are checked against the rates being saved }
+      - call: saveSettings
+        args: [ { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, maxProviderCostMinor: 0, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, shortLimit: 0, shortSeconds: 60, rateCaps: [ { period: 3, rateId: standard, day: null, extra: 1, short: 0 } ] }, { id: gpu, name: GPU, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, shortLimit: null, shortSeconds: null, rateCaps: [] } ] } ], credits: { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: [ { id: standard, name: Standard, inputPer1k: 1, outputPer1k: 3, costInputPer1k: 0.25 }, { id: advanced, name: Advanced, inputPer1k: 5, outputPer1k: 15, costInputPer1k: null, costOutputPer1k: null } ] } } }, admin-1 ]
+        expect:
+          value:
+            $partial:
+              version: 1
+              values:
+                paymentRequired: false
+                notifications: true
+                reminderDays: 3
+                plans:
+                  - { $partial: { id: starter } }
+                  - { $partial: { id: pro } }
+                  - { $partial: { id: max } }
+                  - id: capped
+                    family: capped
+                    description: ""
+                    metadata: {}
+                    name: Capped
+                    amount: 0
+                    currency: usd
+                    periodDays: 30
+                    enabled: true
+                    archived: false
+                    maxProviderCostMinor: 0
+                    products:
+                      - { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, shortLimit: 0, shortSeconds: 60, rateCaps: [ { rateId: standard, short: 0, period: 3 } ] }
+                      - { id: gpu, name: GPU, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800 }
+                    stripeManaged: false
+                    version: 0.0.1
+                credits:
+                  pack: { credits: 1000, amountMinor: 1000, currency: usd }
+                  rates:
+                    - { id: standard, name: Standard, inputPer1k: 1, outputPer1k: 3, minimum: 0, costInputPer1k: 0.25, costOutputPer1k: 0 }
+                    - { id: advanced, name: Advanced, inputPer1k: 5, outputPer1k: 15, minimum: 0 }
+
+  - name: the short window starts with the first use and limits the allowance
+    steps:
+      - { call: saveSettings, args: [ *limited, admin-1 ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: change, args: [ *alice, capped, plan-1 ], expect: { value: { ok: true } } }
+      - { call: consume, args: [ alice, api, 20, u1 ], expect: { value: { requestId: u1, productId: api, credits: 20, fromAllowance: 20, fromBalance: 0, at: 1767225600000, replayed: false } } }
+      - { call: consume, args: [ alice, api, 15, u2 ], expect: { error: { status: 429, message: Subscription period limit reached. Add credits or wait for the reset. } }, note: the message names the first window that is fully used (reference behavior) }
+      - { call: consume, args: [ alice, api, 10, u3 ], expect: { value: { $partial: { credits: 10, fromAllowance: 10 } } } }
+      - { call: consume, args: [ alice, api, 1, u4 ], expect: { error: { status: 429, message: Subscription short limit reached. Add credits or wait for the reset. } } }
+      - call: usageSummary
+        args: [ alice ]
+        expect:
+          value:
+            userId: alice
+            active: true
+            products:
+              - productId: api
+                name: API credits
+                allowanceLeft: 0
+                additionalCredits: 0
+                reserved: 0
+                available: 0
+                threshold: 100
+                windows:
+                  - { kind: short, used: 30, reserved: 0, limit: 30, remaining: 0, percent: 100, threshold: 100, resetAt: 1767243600000 }
+                  - { kind: day, used: 30, reserved: 0, limit: 100, remaining: 70, percent: 30, threshold: 0, resetAt: 1767312000000 }
+                  - { kind: week, used: 30, reserved: 0, limit: 500, remaining: 470, percent: 6, threshold: 0, resetAt: 1767830400000 }
+                  - { kind: period, used: 30, reserved: 0, limit: 1000, remaining: 970, percent: 3, threshold: 0, resetAt: 1769817600000 }
+                models:
+                  - rateId: advanced
+                    name: Advanced model
+                    windows:
+                      - { kind: day, used: 0, reserved: 0, limit: 40, remaining: 40, percent: 0, threshold: 0, resetAt: 1767312000000 }
+                      - { kind: period, used: 0, reserved: 0, limit: 100, remaining: 100, percent: 0, threshold: 0, resetAt: 1769817600000 }
+            reservations: []
+            alerts: [ { productId: api, window: short, percent: 100, threshold: 100 } ]
+            pack: { credits: 1000, amountMinor: 1000, currency: usd }
+            margin: { currency: usd, costMinor: 0, capMinor: 10, remainingMinor: 10, percent: 0, threshold: 0, resetAt: 1769817600000 }
+      - { call: me, args: [ alice ], expect: { value: { $partial: { usage: [ { $partial: { dayUsed: 30, shortUsed: 30, shortResetAt: 1767243600000 } } ] } } } }
+      - { call: preflight, args: [ alice, api, { credits: 1 } ], expect: { value: { $partial: { fits: false, reason: credits, available: 0, missing: 1, costMinor: null, model: null, degrade: null, margin: { currency: usd, costMinor: 0, capMinor: 10, remainingMinor: 10, percent: 0, threshold: 0, resetAt: 1769817600000, stepMinor: 0, exceeded: false } } } } }
+      - { call: setNow, args: [ "2026-01-01T04:59:59.999Z" ], expect: { value: null } }
+      - { call: consume, args: [ alice, api, 1, u5 ], expect: { error: { status: 429, message: Subscription short limit reached. Add credits or wait for the reset. } } }
+      - { call: setNow, args: [ "2026-01-01T06:00:00.000Z" ], expect: { value: null } }
+      - { call: usageSummary, args: [ alice ], expect: { value: { $partial: { products: [ { $partial: { available: 30, windows: [ { kind: short, used: 0, reserved: 0, limit: 30, remaining: 30, percent: 0, threshold: 0, resetAt: 1767265200000 }, { $partial: { kind: day, used: 30 } }, { $partial: { kind: week } }, { $partial: { kind: period } } ] } } ] } } }, note: "an idle window reads as starting now" }
+      - { call: setNow, args: [ "2026-01-01T07:00:00.000Z" ], expect: { value: null } }
+      - { call: consume, args: [ alice, api, 25, u6 ], expect: { value: { $partial: { fromAllowance: 25 } } } }
+      - { call: row, args: [ SUB_ACCOUNTS, alice ], expect: { value: { $partial: { data: { $partial: { counters: { api: { period: 55, day: 55, week: 55, dayStart: 1767225600000, weekStart: 1767225600000, short: 25, shortStart: 1767250800000 } } } } } } }, note: "the window started with the first use at 07:00" }
+      - { call: ledgerCheck, args: [ alice ], expect: { value: { $partial: { balanced: true, negative: false } } } }
+      - { call: reset, args: [ alice, { requestId: r1, scope: short, reason: Courtesy }, admin-1 ], expect: { value: { ok: true } } }
+      - { call: row, args: [ SUB_ACCOUNTS, alice ], expect: { value: { $partial: { data: { $partial: { counters: { api: { period: 55, day: 55, week: 55, dayStart: 1767225600000, weekStart: 1767225600000, short: 0, shortStart: 1767250800000 } } } } } } } }
+      - { call: reset, args: [ alice, { requestId: r2, scope: hour, reason: Courtesy }, admin-1 ], expect: { error: { status: 400, message: Invalid reset scope } } }
+
+  - name: model caps limit one rate per window and are read live from the settings
+    steps:
+      - { call: saveSettings, args: [ *limited, admin-1 ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: change, args: [ *alice, capped, plan-1 ], expect: { value: { ok: true } } }
+      - call: reserve
+        args: [ alice, api, { key: "t1:0", estimate: { rateId: advanced, inputTokens: 2000, maxOutputTokens: 1000 } } ]
+        expect: { value: { key: "t1:0", productId: api, credits: 25, status: active, at: 1767225600000, expiresAt: 1767226500000, available: 5, replayed: false } }
+        note: 25 of the 30-credit short window
+      - { call: row, args: [ SUB_ACCOUNTS, alice ], expect: { value: { $partial: { data: { $partial: { reservations: [ { key: "t1:0", productId: api, credits: 25, at: 1767225600000, expiresAt: 1767226500000, rateId: advanced } ] } } } } } }
+      - { call: setNow, args: [ "2026-01-01T05:30:00.000Z" ], expect: { value: null } }
+      - call: settle
+        args: [ alice, "t1:0", { inputTokens: 2000, outputTokens: 500 } ]
+        expect: { value: { key: "t1:0", productId: api, reserved: 25, used: 18, credits: 18, fromAllowance: 18, fromBalance: 0, uncovered: 0, expired: true, status: settled, at: 1767245400000, available: 12, valueMinor: 18, currency: usd, usage: { inputTokens: 2000, outputTokens: 500 }, costMinor: 6.75, replayed: false } }
+        note: settled after the hold expired; the provider cost is the full usage
+      - { call: setNow, args: [ "2026-01-01T11:00:00.000Z" ], expect: { value: null } }
+      - call: reserve
+        args: [ alice, api, { key: "t2:0", estimate: { rateId: advanced, inputTokens: 2000, maxOutputTokens: 1000 } } ]
+        expect: { error: { status: 429, message: "Model limit reached: Advanced model day limit. Use another model or wait for the reset." } }
+        note: the short window is free again (30 available), but 18 used + 25 > 40 on the advanced day cap
+      - call: preflight
+        args: [ alice, api, { estimate: { rateId: advanced, inputTokens: 2000, maxOutputTokens: 1000 } } ]
+        expect:
+          value:
+            productId: api
+            credits: 25
+            fits: false
+            reason: model
+            available: 30
+            missing: 0
+            allowanceLeft: 30
+            additionalCredits: 0
+            reserved: 0
+            windows:
+              - { kind: short, used: 0, reserved: 0, limit: 30, remaining: 30, percent: 0, threshold: 0, resetAt: 1767283200000 }
+              - { kind: day, used: 18, reserved: 0, limit: 100, remaining: 82, percent: 18, threshold: 0, resetAt: 1767312000000 }
+              - { kind: week, used: 18, reserved: 0, limit: 500, remaining: 482, percent: 3, threshold: 0, resetAt: 1767830400000 }
+              - { kind: period, used: 18, reserved: 0, limit: 1000, remaining: 982, percent: 1, threshold: 0, resetAt: 1769817600000 }
+            topUp: null
+            costMinor: 10.5
+            model:
+              rateId: advanced
+              windows:
+                - { kind: day, used: 18, reserved: 0, limit: 40, remaining: 22, percent: 45, threshold: 0, resetAt: 1767312000000 }
+                - { kind: period, used: 18, reserved: 0, limit: 100, remaining: 82, percent: 18, threshold: 0, resetAt: 1769817600000 }
+              exceeded: day
+            margin: { currency: usd, costMinor: 6.75, capMinor: 10, remainingMinor: 3.25, percent: 67, threshold: 0, resetAt: 1769817600000, stepMinor: 10.5, exceeded: true }
+            degrade: { rateId: standard, name: Standard model, credits: 5, costMinor: 2.1 }
+        note: standard and lite both fit; the least degradation (standard) is recommended
+      - call: preflight
+        args: [ alice, api, { estimate: { rateId: standard, inputTokens: 2000, maxOutputTokens: 1000 } } ]
+        expect: { value: { $partial: { credits: 5, fits: true, reason: null, costMinor: 2.1, model: null, margin: { $partial: { stepMinor: 2.1, exceeded: false } }, degrade: null } } }
+      - call: preflight
+        args: [ alice, api, { estimate: { rateId: standard, inputTokens: 20000, maxOutputTokens: 1000 } } ]
+        expect: { value: { $partial: { credits: 23, fits: true, reason: null, costMinor: 7.5, margin: { $partial: { exceeded: true } }, degrade: { rateId: lite, name: Lite model, credits: 11, costMinor: null } } } }
+        note: the margin rule is advisory (fits stays true); a rate without costs counts as cost 0
+      - call: preflight
+        args: [ alice, api, { estimate: { rateId: standard, inputTokens: 40000, maxOutputTokens: 0 } } ]
+        expect: { value: { $partial: { credits: 40, fits: false, reason: credits, missing: 10, degrade: { rateId: lite, name: Lite model, credits: 20, costMinor: null } } } }
+      - call: preflight
+        args: [ alice, api, { estimate: { rateId: lite, inputTokens: 80000, maxOutputTokens: 0 } } ]
+        expect: { value: { $partial: { credits: 40, fits: false, reason: credits, costMinor: null, degrade: null } } }
+        note: nothing is cheaper than the cheapest rate
+      - { call: consumeUsage, args: [ alice, api, { rateId: advanced, inputTokens: 4000, outputTokens: 0 }, cu-1 ], expect: { value: { requestId: cu-1, productId: api, credits: 20, fromAllowance: 20, fromBalance: 0, at: 1767265200000, replayed: false, valueMinor: 20, currency: usd, costMinor: 6 } } }
+      - { call: consumeUsage, args: [ alice, api, { rateId: advanced, inputTokens: 1000, outputTokens: 0 }, cu-2 ], expect: { error: { status: 429, message: "Model limit reached: Advanced model day limit. Use another model or wait for the reset." } }, note: "38 used + 5 > 40" }
+      - { call: consumeUsage, args: [ alice, api, { rateId: standard, inputTokens: 1000, outputTokens: 0 }, cu-3 ], expect: { value: { $partial: { credits: 1, costMinor: 0.3 } } }, note: "uncapped rates are never limited or counted" }
+      - call: row
+        args: [ SUB_ACCOUNTS, alice ]
+        expect:
+          value:
+            $partial:
+              data:
+                $partial:
+                  counters: { api: { period: 39, day: 39, week: 39, dayStart: 1767225600000, weekStart: 1767225600000, short: 21, shortStart: 1767265200000, rates: { advanced: { short: 20, day: 38, week: 38, period: 38 } } } }
+                  providerCost: { totalMinor: { usd: 13.05 }, periodStart: 1767225600000, periodMinor: 13.05 }
+                  reservations: []
+      - call: usageSummary
+        args: [ alice ]
+        expect:
+          value:
+            $partial:
+              products:
+                - $partial:
+                    models:
+                      - rateId: advanced
+                        name: Advanced model
+                        windows:
+                          - { kind: day, used: 38, reserved: 0, limit: 40, remaining: 2, percent: 95, threshold: 95, resetAt: 1767312000000 }
+                          - { kind: period, used: 38, reserved: 0, limit: 100, remaining: 62, percent: 38, threshold: 0, resetAt: 1769817600000 }
+              alerts: [ { productId: api, window: day, percent: 95, threshold: 95, rateId: advanced } ]
+              margin: { currency: usd, costMinor: 13.05, capMinor: 10, remainingMinor: 0, percent: 130, threshold: 100, resetAt: 1769817600000 }
+      - call: saveSettings
+        args: [ { version: 1, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, maxProviderCostMinor: 100, products: [ { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800, shortLimit: 30, shortSeconds: 18000, rateCaps: [ { rateId: advanced, short: 40, day: 60 } ] } ] } ], credits: *credits } }, admin-1 ]
+        expect: { value: { $partial: { version: 2 } } }
+      - { call: consumeUsage, args: [ alice, api, { rateId: advanced, inputTokens: 1000, outputTokens: 0 }, cu-2 ], expect: { value: { $partial: { credits: 5, costMinor: 1.5 } } }, note: "the new caps apply at once to the current subscriber" }
+      - { call: usageSummary, args: [ alice ], expect: { value: { $partial: { products: [ { $partial: { models: [ { rateId: advanced, name: Advanced model, windows: [ { kind: short, used: 25, reserved: 0, limit: 40, remaining: 15, percent: 62, threshold: 0, resetAt: 1767283200000 }, { kind: day, used: 43, reserved: 0, limit: 60, remaining: 17, percent: 71, threshold: 0, resetAt: 1767312000000 } ] } ] } } ], margin: { $partial: { costMinor: 14.55, capMinor: 100, percent: 14 } } } } }, note: "per-model counters keep every window, so a cap added later starts from real usage" }
+      - { call: setNow, args: [ "2026-01-02T00:00:00.000Z" ], expect: { value: null } }
+      - { call: row, args: [ SUB_ACCOUNTS, alice ], expect: { value: { $partial: { data: { $partial: { counters: { $partial: { api: { $partial: { rates: { advanced: { short: 25, day: 43, week: 43, period: 43 } } } } } } } } } } } }
+      - { call: usageSummary, args: [ alice ], expect: { value: { $partial: { products: [ { $partial: { models: [ { rateId: advanced, name: Advanced model, windows: [ { kind: short, used: 0, reserved: 0, limit: 40, remaining: 40, percent: 0, threshold: 0, resetAt: 1767330000000 }, { kind: day, used: 0, reserved: 0, limit: 60, remaining: 60, percent: 0, threshold: 0, resetAt: 1767398400000 } ] } ] } } ] } } }, note: "the day and short windows reset the per-model counters with them" }
+      - { call: reserve, args: [ alice, api, { key: "t3:0", credits: 5 } ], expect: { value: { $partial: { credits: 5 } } } }
+      - { call: row, args: [ SUB_ACCOUNTS, alice ], expect: { value: { $partial: { data: { $partial: { counters: { api: { period: 44, day: 0, week: 44, dayStart: 1767312000000, weekStart: 1767225600000, short: 0, shortStart: 1767312000000, rates: { advanced: { short: 0, day: 0, week: 43, period: 43 } } } }, reservations: [ { key: "t3:0", productId: api, credits: 5, at: 1767312000000, expiresAt: 1767312900000 } ] } } } } }, note: "holds of plain credits carry no rate" }
+      - { call: ledgerCheck, args: [ alice ], expect: { value: { $partial: { balanced: true, negative: false } } } }
+
+  - name: service metering endpoints act on the account in the path
+    tags: [ security ]
+    steps:
+      - { call: saveSettings, args: [ *limited, admin-1 ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: change, args: [ *alice, capped, plan-1 ], expect: { value: { ok: true } } }
+      - { call: call, args: [ GET, /service/subscriptions/accounts/alice/usage, null, *service ], expect: { value: { $partial: { userId: alice, active: true } } } }
+      - { call: call, args: [ GET, "/service/subscriptions/accounts/bad%20id/usage", null, *service ], expect: { error: { status: 400, message: Invalid identifier } } }
+      - { call: call, args: [ POST, /service/subscriptions/accounts/alice/preflight, { body: { productId: api, credits: 5 } }, *service ], expect: { value: { $partial: { fits: true, available: 30 } } } }
+      - { call: call, args: [ POST, /service/subscriptions/accounts/alice/reservations, { body: { key: "s:1", productId: api, credits: 10, reason: Agent step, extra: 1 } }, *service ], expect: { value: { key: "s:1", productId: api, credits: 10, status: active, at: 1767225600000, expiresAt: 1767226500000, available: 20, replayed: false } } }
+      - { call: row, args: [ "SUB_RESERVATION#alice", "s:1" ], expect: { value: { $partial: { data: { key: "s:1", productId: api, credits: 10, at: 1767225600000, expiresAt: 1767226500000, status: active, available: 20, reason: Agent step, source: api, actorId: "service:agent" } } } } }
+      - { call: call, args: [ POST, "/service/subscriptions/accounts/alice/reservations/s:1/settle", { body: { credits: 4 } }, *service ], expect: { value: { $partial: { credits: 4, status: settled } } } }
+      - { call: call, args: [ POST, /service/subscriptions/accounts/alice/reservations, { body: { key: "s:2", productId: api, credits: 3 } }, *service ], expect: { value: { $partial: { credits: 3 } } } }
+      - { call: call, args: [ POST, "/service/subscriptions/accounts/alice/reservations/s:2/release", null, *service ], expect: { value: { key: "s:2", productId: api, credits: 3, status: released, releasedAt: 1767225600000, replayed: false } } }
+      - { call: call, args: [ POST, /service/subscriptions/accounts/alice/ledger, { body: { requestId: led-1, productId: api, credits: 100, kind: purchase, reason: Top-up, amountMinor: 1000, currency: usd } }, *service ], expect: { error: { status: 403, message: Service keys can only record debits } } }
+      - { call: call, args: [ POST, /service/subscriptions/accounts/alice/ledger, { body: { requestId: led-2, productId: api, credits: -2, reason: Tool call, amountMinor: 5, currency: usd, details: { tool: search } } }, *service ], expect: { value: { requestId: led-2, productId: api, credits: 2, fromAllowance: 2, fromBalance: 0, at: 1767225600000, replayed: false } } }
+      - { call: call, args: [ POST, /service/subscriptions/accounts/alice/ledger, { body: { requestId: led-3, productId: api, credits: 0, reason: Nothing } }, *service ], expect: { error: { status: 400, message: Credits must be a non-zero integer } } }
+      - call: ledger
+        args: [ alice ]
+        expect:
+          value:
+            $partial:
+              entries:
+                - { $partial: { kind: allowance } }
+                - { $partial: { kind: plan } }
+                - { $partial: { kind: reservation, source: api, actorId: "service:agent", requestId: "s:1", held: 10 } }
+                - { $partial: { kind: settlement, source: api, actorId: "service:agent", credits: -4 } }
+                - { $partial: { kind: reservation, source: api, actorId: "service:agent", requestId: "s:2" } }
+                - { $partial: { kind: release, source: api, actorId: "service:agent", held: -3 } }
+                - { kind: usage, source: api, credits: -2, productId: api, reason: Tool call, requestId: led-2, fromAllowance: 2, fromBalance: 0, actorId: "service:agent", details: { tool: search }, available: 24, id: { $type: string }, at: 1767225600000 }

@@ -6,6 +6,8 @@ import {
   Conflict,
   schemaMigration,
   type Actor,
+  type Context,
+  type Endpoint,
   type Feature,
 } from "@gsalgadotoledo/rt-app-contracts";
 import type { NoSQL, Row, Write } from "@gsalgadotoledo/rt-app-nosql";
@@ -32,6 +34,7 @@ import {
   sameUsage,
   settleUsage,
   windowUsage,
+  thresholdOf,
   type Hold,
   type ReservationMeta,
   type ReserveInput,
@@ -46,7 +49,24 @@ export interface Product {
   weeklyLimit: number;
   daySeconds: number;
   weekSeconds: number;
+  /** Optional short window (e.g. 5 hours): at most `shortLimit` plan credits per `shortSeconds`. */
+  shortLimit?: number;
+  shortSeconds?: number;
+  /** Optional per-model caps (credits of one rate per window); read live from the settings. */
+  rateCaps?: RateCap[];
 }
+/**
+ * Credits of one rate (model) a user may spend per window, all sources included. Windows are
+ * the product's: short (needs the product's short window), day, week and period.
+ */
+export interface RateCap {
+  rateId: string;
+  short?: number;
+  day?: number;
+  week?: number;
+  period?: number;
+}
+export const CAP_WINDOWS = ["short", "day", "week", "period"] as const;
 export interface Plan {
   id: string;
   name: string;
@@ -63,6 +83,11 @@ export interface Plan {
   products: Product[];
   enabled: boolean;
   archived?: boolean;
+  /**
+   * Margin rule: the most provider cost (minor units of the credit pack currency, which must be
+   * the plan currency) one user of this plan should cause per period. Read live from settings.
+   */
+  maxProviderCostMinor?: number;
 }
 /** Credits charged per model/function; decimals allowed (e.g. 0.25 credits per 1k tokens). */
 export interface CreditRate {
@@ -72,6 +97,12 @@ export interface CreditRate {
   outputPer1k: number;
   /** Minimum credits charged per request. */
   minimum: number;
+  /**
+   * What the provider charges us, in minor units of the pack currency per 1k tokens (up to 4
+   * decimals). Optional: rates without it cost 0 in the unit economics and margin rules.
+   */
+  costInputPer1k?: number;
+  costOutputPer1k?: number;
 }
 export interface CreditSettings {
   /** Price of a top-up pack; also the money value of one credit (amountMinor / credits). */
@@ -235,6 +266,9 @@ export function validateCredits(input: any): CreditSettings {
     inputPer1k: rate(r.inputPer1k),
     outputPer1k: rate(r.outputPer1k),
     minimum: integer(r.minimum ?? 0),
+    ...(r.costInputPer1k != null || r.costOutputPer1k != null
+      ? { costInputPer1k: rate(r.costInputPer1k ?? 0), costOutputPer1k: rate(r.costOutputPer1k ?? 0) }
+      : {}),
   }));
   if (rates.some((r) => !r.name) || new Set(rates.map((r) => r.id)).size !== rates.length)
     throw new HttpError(400, "Duplicate or unnamed credit rates");
@@ -274,6 +308,7 @@ function planContent(p: Plan) {
     periodDays: p.periodDays,
     products: p.products,
     metadata: p.metadata ?? {},
+    maxProviderCostMinor: p.maxProviderCostMinor,
   };
 }
 export function validateSettings(input: any): Settings {
@@ -300,6 +335,7 @@ export function validateSettings(input: any): Settings {
     periodDays: integer(p.periodDays, 1, 366),
     enabled: p.enabled === true && p.archived !== true,
     archived: p.archived === true,
+    ...(p.maxProviderCostMinor != null ? { maxProviderCostMinor: p.maxProviderCostMinor } : {}),
     ...(p.stripePriceId ? { stripePriceId: id(p.stripePriceId) } : {}),
     products:
       Array.isArray(p.products) &&
@@ -313,6 +349,9 @@ export function validateSettings(input: any): Settings {
             weeklyLimit: integer(x.weeklyLimit),
             daySeconds: integer(x.daySeconds, 60, 86400 * 31),
             weekSeconds: integer(x.weekSeconds, 60, 86400 * 366),
+            // Validated by `validateLimits` once the credit rates are known.
+            ...(x.shortLimit != null || x.shortSeconds != null ? { shortLimit: x.shortLimit, shortSeconds: x.shortSeconds } : {}),
+            ...(x.rateCaps != null ? { rateCaps: x.rateCaps } : {}),
           }))
         : (() => {
             throw new HttpError(400, "A plan needs products");
@@ -331,15 +370,74 @@ export function validateSettings(input: any): Settings {
     )
   )
     throw new HttpError(400, "Duplicate or unnamed plans/products");
+  const reminderDays = integer(input.reminderDays, 0, 30);
+  // Settings saved before credit rates existed keep working with the defaults.
+  const credits = validateCredits(input.credits ?? defaults.credits);
+  validateLimits(plans, credits);
   return {
     paymentRequired: input.paymentRequired,
     notifications: input.notifications,
-    reminderDays: integer(input.reminderDays, 0, 30),
+    reminderDays,
     plans,
-    // Settings saved before credit rates existed keep working with the defaults.
-    credits: validateCredits(input.credits ?? defaults.credits),
+    credits,
   };
 }
+
+const capValue = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= 1e9;
+
+/**
+ * Finance limits, checked after the rates (in plan, then product order): the short window
+ * (shortLimit 0..1e9 and shortSeconds 60..604800, both or neither: 400 "Invalid short window"),
+ * model caps (at most 20, known and distinct rate ids, windows short|day|week|period as
+ * integers 0..1e9, at least one, short only with a short window: 400 "Invalid model cap"; an
+ * empty list is dropped) and the margin rule (maxProviderCostMinor integer 0..1e12 and the plan
+ * currency equal to the credit pack currency: 400 "Invalid margin rule"). Mutates `plans`.
+ */
+function validateLimits(plans: Plan[], credits: CreditSettings) {
+  for (const plan of plans) {
+    for (const product of plan.products) {
+      if (product.shortLimit !== undefined || product.shortSeconds !== undefined) {
+        const seconds = product.shortSeconds;
+        if (!capValue(product.shortLimit) || !Number.isSafeInteger(seconds) || seconds! < 60 || seconds! > 604800)
+          throw new HttpError(400, "Invalid short window");
+      }
+      if (product.rateCaps !== undefined) {
+        const raw: any = product.rateCaps;
+        if (!Array.isArray(raw) || raw.length > 20) throw new HttpError(400, "Invalid model cap");
+        const caps: RateCap[] = raw.map((c: any) => {
+          if (!c || typeof c !== "object" || Array.isArray(c) || !credits.rates.some((r) => r.id === c.rateId))
+            throw new HttpError(400, "Invalid model cap");
+          const cap: RateCap = { rateId: c.rateId };
+          for (const w of CAP_WINDOWS) {
+            if (c[w] === undefined || c[w] === null) continue;
+            if (!capValue(c[w]) || (w === "short" && product.shortSeconds === undefined)) throw new HttpError(400, "Invalid model cap");
+            cap[w] = c[w];
+          }
+          if (Object.keys(cap).length < 2) throw new HttpError(400, "Invalid model cap");
+          return cap;
+        });
+        if (new Set(caps.map((c) => c.rateId)).size !== caps.length) throw new HttpError(400, "Invalid model cap");
+        if (caps.length) product.rateCaps = caps;
+        else delete product.rateCaps;
+      }
+    }
+    if (plan.maxProviderCostMinor !== undefined) {
+      const max: unknown = plan.maxProviderCostMinor;
+      if (!Number.isSafeInteger(max) || (max as number) < 0 || (max as number) > 1e12 || plan.currency !== credits.pack.currency)
+        throw new HttpError(400, "Invalid margin rule");
+    }
+  }
+}
+
+/** Ledger `details` from a request: at most 20 entries, keys cut to 40, strings cut to 200. */
+const ledgerDetails = (details: any) =>
+  details && typeof details === "object" && !Array.isArray(details)
+    ? Object.fromEntries(
+        Object.entries(details)
+          .slice(0, 20)
+          .map(([k, v]) => [String(k).slice(0, 40), typeof v === "number" || typeof v === "boolean" ? v : String(v).slice(0, 200)]),
+      )
+    : undefined;
 
 /** Request bodies of the reservation endpoints: only the documented fields reach the service. */
 const amountBody = (body: any) => ({ credits: body.credits, estimate: body.estimate });
@@ -351,6 +449,33 @@ const reserveBody = (body: any): ReserveInput => ({
   reason: body.reason,
 });
 const usageBody = (body: any) => ({ credits: body.credits, inputTokens: body.inputTokens, outputTokens: body.outputTokens }) as SettleUsage;
+
+/** Zero one window of every per-model counter (`counters[productId].rates[rateId][window]`). */
+function resetRateWindow(c: any, window: string) {
+  for (const r of Object.values(c.rates ?? {}) as any[]) if (r[window] !== undefined) r[window] = 0;
+}
+/** Math.round to 4 decimals: provider costs are kept in minor units with 4 decimals. */
+const round4 = (x: number) => Math.round(x * 1e4) / 1e4;
+
+/** Credits of token usage at a rate: rounded up (tolerating float noise), at least the minimum. */
+export function rateCredits(rate: CreditRate, inputTokens: number, outputTokens: number) {
+  const exact = (inputTokens / 1000) * rate.inputPer1k + (outputTokens / 1000) * rate.outputPer1k;
+  return { exact, credits: Math.max(rate.minimum, Math.ceil(Math.round(exact * 1e6) / 1e6)) };
+}
+
+/** Provider cost of token usage at a rate (minor units, 4 decimals); null when the rate has none. */
+export function providerCost(rate: CreditRate, inputTokens: number, outputTokens: number): number | null {
+  if (rate.costInputPer1k === undefined) return null;
+  return round4((inputTokens / 1000) * rate.costInputPer1k + (outputTokens / 1000) * (rate.costOutputPer1k ?? 0));
+}
+
+/** The first window a charge of `credits` would overflow (used + reserved + credits > limit), or null. */
+export function exceededWindow(windows: { kind: string; used: number; reserved: number; limit: number }[], credits: number) {
+  return windows.find((w) => w.used + w.reserved + credits > w.limit)?.kind ?? null;
+}
+
+const modelLimit = (rateName: string, window: string) =>
+  new HttpError(429, `Model limit reached: ${rateName} ${window} limit. Use another model or wait for the reset.`);
 
 const DAY = 86400000;
 const dayKey = (at: number) => new Date(at).toISOString().slice(0, 10);
@@ -618,7 +743,15 @@ export class Subscriptions {
           c[field] +=
             Math.floor((now - c[field]) / (seconds * 1000)) * seconds * 1000;
           c[window] = 0;
+          resetRateWindow(c, window);
         }
+      }
+      // The short window starts with the first use after the previous one ended (like the
+      // 5-hour window of chat products), not on a fixed grid.
+      if (p.shortSeconds !== undefined && (c.shortStart === undefined || now >= c.shortStart + p.shortSeconds * 1000)) {
+        c.short = 0;
+        c.shortStart = now;
+        resetRateWindow(c, "short");
       }
     }
     if (next.adminGrant) next.adminGrant = this.normalized(next.adminGrant);
@@ -643,7 +776,8 @@ export class Subscriptions {
     const product: Product | undefined = entitlement.plan.products.find((p: Product) => p.id === productId);
     const c = entitlement.counters?.[productId];
     if (!product || !c) return 0;
-    return Math.max(0, Math.min(product.dailyLimit - c.day, product.weeklyLimit - c.week, product.credits - c.period));
+    const short = product.shortSeconds !== undefined ? product.shortLimit! - (c.short ?? 0) : Infinity;
+    return Math.max(0, Math.min(product.dailyLimit - c.day, product.weeklyLimit - c.week, product.credits - c.period, short));
   }
 
   /** Credits held by active (unexpired) reservations of a product. */
@@ -695,6 +829,113 @@ export class Subscriptions {
     if (reason === "product") throw new HttpError(403, "Product is not included in your plan");
     const entitlement = this.effective(data);
     return { entitlement, product: entitlement.plan.products.find((p: Product) => p.id === productId) as Product };
+  }
+
+  // -------------------------------------------------------------------------
+  // Finance limits: per-model caps, provider costs and the margin rule. Caps and the margin cap
+  // are read live from the settings (the plan with the entitlement's plan id), so an operator can
+  // tighten them without a deploy or a migration; the windows keep the plan as subscribed.
+  // See docs/polyglot/subscriptions-limits.md.
+  // -------------------------------------------------------------------------
+
+  /** The active entitlement or undefined (no plan, not active or past its period). */
+  private active(data: any) {
+    const entitlement = this.effective(data);
+    return entitlement?.plan && entitlement.status === "active" && this.now() < entitlement.periodEnd ? entitlement : undefined;
+  }
+
+  /** The cap of a rate for a product of the active entitlement, from the current settings. */
+  private rateCap(data: any, values: Settings, productId: string, rateId: string | undefined): RateCap | undefined {
+    const entitlement = rateId === undefined ? undefined : this.active(data);
+    if (!entitlement) return undefined;
+    const plan: Plan = values.plans.find((p) => p.id === entitlement.plan.id) ?? entitlement.plan;
+    return plan.products.find((p) => p.id === productId)?.rateCaps?.find((c) => c.rateId === rateId);
+  }
+
+  /** Every cap of a product of the active entitlement, from the current settings. */
+  private rateCaps(data: any, values: Settings, productId: string): RateCap[] {
+    const entitlement = this.active(data);
+    if (!entitlement) return [];
+    const plan: Plan = values.plans.find((p) => p.id === entitlement.plan.id) ?? entitlement.plan;
+    return plan.products.find((p) => p.id === productId)?.rateCaps ?? [];
+  }
+
+  /**
+   * Usage of a capped rate per window (the cap's windows, in the order short, day, week,
+   * period; short only when the subscribed product has a short window), with the active holds of
+   * that rate as `reserved`. [] without a cap.
+   */
+  private rateWindows(data: any, productId: string, cap: RateCap | undefined) {
+    const entitlement = cap && this.active(data);
+    const product: Product | undefined = entitlement?.plan.products.find((p: Product) => p.id === productId);
+    const c = entitlement?.counters?.[productId];
+    if (!cap || !product || !c) return [];
+    const used = c.rates?.[cap.rateId] ?? {};
+    const reserved = activeHolds(data.reservations, this.now())
+      .filter((h) => h.productId === productId && h.rateId === cap.rateId)
+      .reduce((n, h) => n + h.credits, 0);
+    const resetAt: Record<string, number> = {
+      short: c.shortStart + (product.shortSeconds ?? 0) * 1000,
+      day: c.dayStart + product.daySeconds * 1000,
+      week: c.weekStart + product.weekSeconds * 1000,
+      period: entitlement.periodEnd,
+    };
+    return CAP_WINDOWS.filter((w) => cap[w] !== undefined && (w !== "short" || product.shortSeconds !== undefined)).map((w) =>
+      windowUsage(w, used[w] ?? 0, reserved, cap[w]!, resetAt[w]),
+    );
+  }
+
+  /** Count credits used at a capped rate on every window of the product (short only with one). */
+  private countRate(data: any, productId: string, cap: RateCap | undefined, credits: number) {
+    const entitlement = cap && credits > 0 ? this.active(data) : undefined;
+    const product: Product | undefined = entitlement?.plan.products.find((p: Product) => p.id === productId);
+    const c = entitlement?.counters?.[productId];
+    if (!cap || !product || !c) return;
+    c.rates ??= {};
+    const r = (c.rates[cap.rateId] ??= {});
+    for (const w of CAP_WINDOWS) if (w !== "short" || product.shortSeconds !== undefined) r[w] = (r[w] ?? 0) + credits;
+  }
+
+  /** Add provider cost (minor units of `currency`) to the account: all-time per currency and this period. */
+  private addCost(data: any, cost: number | null | undefined, currency: string) {
+    if (!(typeof cost === "number" && cost > 0)) return;
+    const start = this.effective(data)?.periodStart ?? null;
+    const c = (data.providerCost ??= { totalMinor: {}, periodStart: start, periodMinor: 0 });
+    if (c.periodStart !== start) {
+      c.periodStart = start;
+      c.periodMinor = 0;
+    }
+    c.periodMinor = round4(c.periodMinor + cost);
+    c.totalMinor[currency] = round4((c.totalMinor[currency] ?? 0) + cost);
+  }
+
+  /** Provider cost of the current entitlement period (0 when none was recorded in it). */
+  private periodCost(data: any): number {
+    const c = data.providerCost;
+    return c && c.periodStart === (this.effective(data)?.periodStart ?? null) ? c.periodMinor : 0;
+  }
+
+  /**
+   * The margin rule of the active entitlement or null: provider cost of this period against the
+   * plan's maxProviderCostMinor (live), percent = floor(cost * 100 / cap) (100 for a 0 cap).
+   */
+  private margin(data: any, values: Settings) {
+    const entitlement = this.active(data);
+    if (!entitlement) return null;
+    const plan: Plan = values.plans.find((p) => p.id === entitlement.plan.id) ?? entitlement.plan;
+    const cap = plan.maxProviderCostMinor;
+    if (cap === undefined) return null;
+    const cost = this.periodCost(data);
+    const percent = cap > 0 ? Math.floor((cost * 100) / cap) : 100;
+    return {
+      currency: values.credits.pack.currency,
+      costMinor: cost,
+      capMinor: cap,
+      remainingMinor: round4(Math.max(0, cap - cost)),
+      percent,
+      threshold: thresholdOf(percent),
+      resetAt: entitlement.periodEnd,
+    };
   }
 
   /** Allowance windows of the active entitlement, keyed so a plan change closes the previous ones. */
@@ -805,6 +1046,7 @@ export class Subscriptions {
           weekUsed: c.week,
           dayResetAt: c.dayStart + p.daySeconds * 1000,
           weekResetAt: c.weekStart + p.weekSeconds * 1000,
+          ...(p.shortSeconds !== undefined ? { shortUsed: c.short, shortResetAt: c.shortStart + p.shortSeconds * 1000 } : {}),
         };
       }),
     };
@@ -1165,7 +1407,17 @@ export class Subscriptions {
     productId: string,
     credits: number,
     requestId: string,
-    meta: { reason?: string; kind?: LedgerKind; source?: LedgerSource; actorId?: string; details?: LedgerEntry["details"] } = {},
+    meta: {
+      reason?: string;
+      kind?: LedgerKind;
+      source?: LedgerSource;
+      actorId?: string;
+      details?: LedgerEntry["details"];
+      /** Model usage (consumeUsage): checked against the model caps and counted; its provider cost. */
+      rateId?: string;
+      rateName?: string;
+      costMinor?: number | null;
+    } = {},
   ) {
     id(requestId);
     integer(credits, 1);
@@ -1188,18 +1440,27 @@ export class Subscriptions {
       const fromBalance = credits - fromAllowance;
       if (fromBalance > free.balance) {
         const window =
-          counter.day >= product.dailyLimit ? "day" : counter.week >= product.weeklyLimit ? "week" : "period";
+          product.shortSeconds !== undefined && counter.short >= product.shortLimit!
+            ? "short"
+            : counter.day >= product.dailyLimit ? "day" : counter.week >= product.weeklyLimit ? "week" : "period";
         throw new HttpError(
           429,
           `Subscription ${window} limit reached. Add credits or wait for the reset.`,
         );
       }
+      const values = (await this.settings()).values;
+      const cap = this.rateCap(data, values, productId, meta.rateId);
+      const capped = cap && exceededWindow(this.rateWindows(data, productId, cap), credits);
+      if (capped) throw modelLimit(meta.rateName ?? meta.rateId!, capped);
       data.creditBalance ??= {};
       data.creditBalance[productId] = balance - fromBalance;
       // Window counters track the plan allowance only; additional credits live in creditBalance.
       counter.period += fromAllowance;
       counter.day += fromAllowance;
       counter.week += fromAllowance;
+      if (product.shortSeconds !== undefined) counter.short += fromAllowance;
+      this.countRate(data, productId, cap, credits);
+      this.addCost(data, meta.costMinor, values.credits.pack.currency);
       data.totalConsumed = (data.totalConsumed ?? 0) + credits;
       const at = this.now();
       const receipt = {
@@ -1337,9 +1598,8 @@ export class Subscriptions {
     if (!selected) throw new HttpError(404, "Credit rate not found");
     const inputTokens = integer(input.inputTokens, 0, 1e10);
     const outputTokens = integer(input.outputTokens ?? 0, 0, 1e10);
-    const exact = (inputTokens / 1000) * selected.inputPer1k + (outputTokens / 1000) * selected.outputPer1k;
     // Round up to whole credits (tolerating float noise) and apply the per-request minimum.
-    const credits = Math.max(selected.minimum, Math.ceil(Math.round(exact * 1e6) / 1e6));
+    const { exact, credits } = rateCredits(selected, inputTokens, outputTokens);
     const valueMinor = Math.round((credits * config.pack.amountMinor) / config.pack.credits);
     const result: any = {
       rate: selected,
@@ -1381,11 +1641,20 @@ export class Subscriptions {
     requestId: string,
   ) {
     const estimate = await this.estimate(usage);
+    const cost = providerCost(estimate.rate, estimate.inputTokens, estimate.outputTokens);
     const receipt = await this.consume(userId, productId, estimate.credits, requestId, {
       reason: estimate.rate.name + " request",
-      details: { rateId: estimate.rate.id, inputTokens: estimate.inputTokens, outputTokens: estimate.outputTokens },
+      details: {
+        rateId: estimate.rate.id,
+        inputTokens: estimate.inputTokens,
+        outputTokens: estimate.outputTokens,
+        ...(cost !== null ? { costMinor: cost } : {}),
+      },
+      rateId: estimate.rate.id,
+      rateName: estimate.rate.name,
+      costMinor: cost,
     });
-    return { ...receipt, valueMinor: estimate.valueMinor, currency: estimate.currency };
+    return { ...receipt, valueMinor: estimate.valueMinor, currency: estimate.currency, ...(cost !== null ? { costMinor: cost } : {}) };
   }
 
   // -------------------------------------------------------------------------
@@ -1504,8 +1773,11 @@ export class Subscriptions {
       const available = this.available(data, productId);
       if (amount.credits > available)
         throw new HttpError(429, `Not enough credits: ${amount.credits - available} missing. Add credits or wait for the reset.`);
+      const cap = this.rateCap(data, (await this.settings()).values, productId, amount.estimate?.rateId);
+      const capped = cap && exceededWindow(this.rateWindows(data, productId, cap), amount.credits);
+      if (capped) throw modelLimit(amount.rateName!, capped);
       const at = this.now();
-      const hold: Hold = { key, productId, credits: amount.credits, at, expiresAt: at + ttlMs };
+      const hold: Hold = { key, productId, credits: amount.credits, at, expiresAt: at + ttlMs, ...(cap ? { rateId: cap.rateId } : {}) };
       data.reservations = [...holds, hold];
       const text = reason ?? (amount.rateName ? amount.rateName + " request" : product.name + " usage");
       const entry = this.ledgerEntry(
@@ -1592,11 +1864,17 @@ export class Subscriptions {
       const charged = fromAllowance + fromBalance;
       const uncovered = used - charged;
       if (fromAllowance > 0) {
-        const counter = this.effective(data).counters[productId];
+        const entitlement = this.effective(data);
+        const counter = entitlement.counters[productId];
         counter.period += fromAllowance;
         counter.day += fromAllowance;
         counter.week += fromAllowance;
+        if (entitlement.plan.products.find((p: Product) => p.id === productId)?.shortSeconds !== undefined) counter.short += fromAllowance;
       }
+      // Model caps count what was used (uncovered included); provider cost is the full usage.
+      this.countRate(data, productId, this.rateCap(data, settings.values, productId, record.estimate?.rateId), used);
+      const cost = priced ? providerCost(priced.rate, priced.inputTokens, priced.outputTokens) : null;
+      this.addCost(data, cost, settings.values.credits.pack.currency);
       data.creditBalance ??= {};
       data.creditBalance[productId] = free.rawBalance - fromBalance;
       data.totalConsumed = (data.totalConsumed ?? 0) + charged;
@@ -1621,6 +1899,7 @@ export class Subscriptions {
             reserved: record.credits,
             used,
             uncovered,
+            ...(cost !== null ? { costMinor: cost } : {}),
           },
           ...(meta.actorId ? { actorId: meta.actorId } : {}),
         },
@@ -1642,6 +1921,7 @@ export class Subscriptions {
         valueMinor: Math.round((charged * pack.amountMinor) / pack.credits),
         currency: pack.currency,
         usage: reported,
+        ...(cost !== null ? { costMinor: cost } : {}),
       };
       await this.store.transact([
         write(old, "SUB_ACCOUNTS", userId, data),
@@ -1724,6 +2004,9 @@ export class Subscriptions {
     // Holds sit on the allowance first: that part counts on every window once settled.
     const reserved = Math.min(this.held(data, productId), this.allowanceLeft(data, productId));
     return [
+      ...(product.shortSeconds !== undefined
+        ? [windowUsage("short", c.short, reserved, product.shortLimit!, c.shortStart + product.shortSeconds * 1000)]
+        : []),
       windowUsage("day", c.day, reserved, product.dailyLimit, c.dayStart + product.daySeconds * 1000),
       windowUsage("week", c.week, reserved, product.weeklyLimit, c.weekStart + product.weekSeconds * 1000),
       windowUsage("period", c.period, reserved, product.credits, entitlement.periodEnd),
@@ -1750,14 +2033,21 @@ export class Subscriptions {
     const free = this.free(data, productId);
     const available = blocked ? 0 : free.allowance + free.balance;
     const missing = Math.max(0, amount.credits - available);
-    const fits = !blocked && missing === 0;
+    const cap = blocked ? undefined : this.rateCap(data, settings.values, productId, amount.estimate?.rateId);
+    const models = this.rateWindows(data, productId, cap);
+    const capped = cap ? exceededWindow(models, amount.credits) : null;
+    const fits = !blocked && missing === 0 && !capped;
     const pack = settings.values.credits.pack;
     const packs = Math.ceil(missing / pack.credits);
+    const rate = amount.estimate && settings.values.credits.rates.find((r) => r.id === amount.estimate!.rateId);
+    const cost = rate ? providerCost(rate, amount.estimate!.inputTokens, amount.estimate!.maxOutputTokens) : null;
+    const margin = blocked ? null : this.margin(data, settings.values);
+    const exceeded = !!margin && round4(margin.costMinor + (cost ?? 0)) > margin.capMinor;
     return {
       productId,
       credits: amount.credits,
       fits,
-      reason: fits ? null : (blocked ?? "credits"),
+      reason: fits ? null : (blocked ?? (missing > 0 ? "credits" : "model")),
       available,
       missing,
       allowanceLeft: free.rawAllowance,
@@ -1774,7 +2064,49 @@ export class Subscriptions {
               currency: pack.currency,
             }
           : null,
+      costMinor: cost,
+      model: cap ? { rateId: cap.rateId, windows: models, exceeded: capped } : null,
+      margin: margin ? { ...margin, stepMinor: cost ?? 0, exceeded } : null,
+      degrade:
+        rate && !blocked && (missing > 0 || capped || exceeded)
+          ? this.degrade(data, settings.values, productId, rate, amount.estimate!, available, margin)
+          : null,
     };
+  }
+
+  /**
+   * A cheaper rate for the same step when it does not fit (credits, a model cap or the margin
+   * rule): among the other rates (settings order), those strictly cheaper than `current` by
+   * (provider cost, credits) that fit the available credits, their own caps and the margin
+   * left, the least degradation wins: the highest (cost, credits), first on ties. Rates
+   * without costs cost 0. Null when none fits.
+   */
+  private degrade(
+    data: any,
+    values: Settings,
+    productId: string,
+    current: CreditRate,
+    estimate: { inputTokens: number; maxOutputTokens?: number },
+    available: number,
+    margin: { costMinor: number; capMinor: number } | null,
+  ) {
+    const tokensIn = estimate.inputTokens,
+      tokensOut = estimate.maxOutputTokens ?? 0;
+    const price = (r: CreditRate) => ({ rate: r, credits: rateCredits(r, tokensIn, tokensOut).credits, cost: providerCost(r, tokensIn, tokensOut) });
+    const base = price(current);
+    const cheaper = (a: ReturnType<typeof price>, b: ReturnType<typeof price>) =>
+      (a.cost ?? 0) < (b.cost ?? 0) || ((a.cost ?? 0) === (b.cost ?? 0) && a.credits < b.credits);
+    let best: ReturnType<typeof price> | undefined;
+    for (const r of values.credits.rates) {
+      if (r.id === current.id) continue;
+      const option = price(r);
+      if (!cheaper(option, base) || option.credits > available) continue;
+      const cap = this.rateCap(data, values, productId, r.id);
+      if (cap && exceededWindow(this.rateWindows(data, productId, cap), option.credits)) continue;
+      if (margin && round4(margin.costMinor + (option.cost ?? 0)) > margin.capMinor) continue;
+      if (!best || cheaper(best, option)) best = option;
+    }
+    return best ? { rateId: best.rate.id, name: best.rate.name, credits: best.credits, costMinor: best.cost } : null;
   }
 
   /**
@@ -1794,6 +2126,11 @@ export class Subscriptions {
     const items = products.map((productId) => {
       const free = this.free(data, productId);
       const windows = this.usageWindows(data, productId);
+      const models = this.rateCaps(data, settings.values, productId).map((cap) => ({
+        rateId: cap.rateId,
+        name: settings.values.credits.rates.find((r) => r.id === cap.rateId)?.name ?? null,
+        windows: this.rateWindows(data, productId, cap),
+      }));
       return {
         productId,
         name: plan.find((p) => p.id === productId)?.name ?? null,
@@ -1803,6 +2140,7 @@ export class Subscriptions {
         available: free.allowance + free.balance,
         threshold: Math.max(0, ...windows.map((w) => w.threshold)),
         windows,
+        ...(models.length ? { models } : {}),
       };
     });
     return {
@@ -1816,12 +2154,18 @@ export class Subscriptions {
         at: h.at,
         expiresAt: h.expiresAt,
       })),
-      alerts: items.flatMap((p) =>
-        p.windows
+      alerts: items.flatMap((p) => [
+        ...p.windows
           .filter((w) => w.threshold >= 80)
           .map((w) => ({ productId: p.productId, window: w.kind, percent: w.percent, threshold: w.threshold })),
-      ),
+        ...(p.models ?? []).flatMap((m) =>
+          m.windows
+            .filter((w) => w.threshold >= 80)
+            .map((w) => ({ productId: p.productId, window: w.kind, percent: w.percent, threshold: w.threshold, rateId: m.rateId })),
+        ),
+      ]),
       pack: settings.values.credits.pack,
+      margin: this.margin(data, settings.values),
     };
   }
 
@@ -1931,10 +2275,75 @@ export class Subscriptions {
     };
   }
 
+  /**
+   * Unit economics: per user and per plan, provider cost (all time: settlements and model usage
+   * priced with the rates' costs), revenue (money paid: purchases and paid plans, from the
+   * ledger totals) and margin (revenue − cost), per currency with 4 decimals. Accounts with no
+   * active plan, cost or revenue are skipped; users are grouped by their current plan ("none"
+   * without one). Returns the `limit` (1..200, default 50) users with the highest cost in the
+   * pack currency (then by id), every plan (by id) and the totals. Never writes.
+   */
+  async economics(limit = 50) {
+    integer(limit, 1, 200);
+    const values = (await this.settings()).values;
+    const currency = values.credits.pack.currency;
+    type Money = Record<string, number>;
+    const add = (target: Money, source: Money, sign = 1) => {
+      for (const [code, value] of Object.entries(source)) target[code] = round4((target[code] ?? 0) + sign * value);
+    };
+    const totals = { users: 0, costMinor: {} as Money, revenueMinor: {} as Money, marginMinor: {} as Money };
+    const plans: Record<string, { planId: string; name: string | null; users: number; costMinor: Money; revenueMinor: Money; marginMinor: Money }> = {};
+    const users: any[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.store.list("SUB_ACCOUNTS", cursor);
+      for (const row of page.items) {
+        const data = this.normalized(row.data);
+        const entitlement = this.active(data);
+        const cost: Money = data.providerCost?.totalMinor ?? {};
+        const revenue: Money = data.ledgerTotals?.paidMinor ?? {};
+        if (!entitlement && !Object.keys(cost).length && !Object.keys(revenue).length) continue;
+        const margin: Money = {};
+        add(margin, revenue);
+        add(margin, cost, -1);
+        const live: Plan | undefined = entitlement && (values.plans.find((p) => p.id === entitlement.plan.id) ?? entitlement.plan);
+        users.push({
+          userId: row.sk,
+          planId: live?.id ?? null,
+          costMinor: cost,
+          revenueMinor: revenue,
+          marginMinor: margin,
+          periodCostMinor: this.periodCost(data),
+          capMinor: live?.maxProviderCostMinor ?? null,
+        });
+        const key = live?.id ?? "none";
+        const group = (plans[key] ??= { planId: key, name: live?.name ?? null, users: 0, costMinor: {}, revenueMinor: {}, marginMinor: {} });
+        group.users++;
+        add(group.costMinor, cost);
+        add(group.revenueMinor, revenue);
+        add(group.marginMinor, margin);
+        totals.users++;
+        add(totals.costMinor, cost);
+        add(totals.revenueMinor, revenue);
+        add(totals.marginMinor, margin);
+      }
+      cursor = page.cursor;
+    } while (cursor);
+    const order = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+    users.sort((a, b) => (b.costMinor[currency] ?? 0) - (a.costMinor[currency] ?? 0) || order(a.userId, b.userId));
+    return {
+      asOf: this.now(),
+      currency,
+      totals,
+      plans: Object.values(plans).sort((a, b) => order(a.planId, b.planId)),
+      users: users.slice(0, limit),
+    };
+  }
+
   async reset(userId: string, input: any, actorId: string) {
     const key = id(input.requestId),
       scope = input.scope;
-    if (!["day", "week", "period", "all"].includes(scope))
+    if (!["short", "day", "week", "period", "all"].includes(scope))
       throw new HttpError(400, "Invalid reset scope");
     const reason = String(input.reason ?? "").trim();
     if (!reason || reason.length > 300)
@@ -1953,8 +2362,11 @@ export class Subscriptions {
       const entries: Write[] = [];
       for (const [productId, c] of Object.entries(this.effective(data).counters) as [string, any][]) {
         const before = this.allowanceLeft(data, productId);
-        for (const field of ["day", "week", "period"])
-          if (scope === "all" || scope === field) c[field] = 0;
+        for (const field of ["short", "day", "week", "period"])
+          if ((scope === "all" || scope === field) && (field !== "short" || c.short !== undefined)) {
+            c[field] = 0;
+            resetRateWindow(c, field);
+          }
         const restored = this.allowanceLeft(data, productId) - before;
         entries.push(
           this.ledgerEntry(
@@ -2630,6 +3042,19 @@ export class Subscriptions {
         },
         {
           method: "GET",
+          path: "/subscriptions/admin/economics",
+          resource: "subscriptions.manage",
+          access: "owner",
+          tool: {
+            name: "subscriptions_economics",
+            description:
+              "Unit economics: provider cost (settlements priced with the rates' costs), revenue (money paid) and margin per currency, per plan and for the users with the highest cost. query.limit (1-200, default 50). Never writes.",
+            example: { query: { limit: "50" } },
+          },
+          handle: (c) => this.economics(c.request.query.limit ? Number(c.request.query.limit) : 50),
+        },
+        {
+          method: "GET",
           path: "/subscriptions/admin/accounts/:id/ledger",
           resource: "subscriptions.manage",
           access: "owner",
@@ -2665,9 +3090,7 @@ export class Subscriptions {
               reason: body.reason,
               amountMinor: body.amountMinor,
               currency: body.currency,
-              details: body.details && typeof body.details === "object" && !Array.isArray(body.details)
-                ? Object.fromEntries(Object.entries(body.details).slice(0, 20).map(([k, v]) => [String(k).slice(0, 40), typeof v === "number" || typeof v === "boolean" ? v : String(v).slice(0, 200)]))
-                : undefined,
+              details: ledgerDetails(body.details),
               source: "admin",
               actorId: c.actor!.id,
             });
@@ -2871,9 +3294,76 @@ export class Subscriptions {
           },
           handle: (c) => this.release(c.params.id, c.params.key, { source: "api", actorId: c.actor!.id }),
         },
+        // Metering for backends with a scoped service key (resource "subscriptions.meter"): the
+        // same calls as the owner endpoints above, on the account in the path, source "api" and
+        // actorId "service:<key id>". No user, settings or plan endpoint is reachable this way.
+        ...this.meterEndpoints(),
       ],
     };
   }
+
+  /** `access: "service"` endpoints of the `subscriptions.meter` scope. */
+  private meterEndpoints(): Endpoint[] {
+    const account = (c: Context) => id(c.params.id);
+    const meta = (c: Context) => ({ source: "api" as const, actorId: c.actor!.id });
+    const base = "/service/subscriptions/accounts/:id";
+    return [
+      { method: "GET", path: base + "/usage", resource: METER, access: "service", handle: (c) => this.usageSummary(account(c)) },
+      {
+        method: "POST",
+        path: base + "/preflight",
+        resource: METER,
+        access: "service",
+        handle: (c) => this.preflight(account(c), c.request.body.productId, amountBody(c.request.body)),
+      },
+      {
+        method: "POST",
+        path: base + "/reservations",
+        resource: METER,
+        access: "service",
+        handle: (c) => this.reserve(account(c), c.request.body.productId, reserveBody(c.request.body), meta(c)),
+      },
+      {
+        method: "POST",
+        path: base + "/reservations/:key/settle",
+        resource: METER,
+        access: "service",
+        handle: (c) => this.settle(account(c), c.params.key, usageBody(c.request.body), meta(c)),
+      },
+      {
+        method: "POST",
+        path: base + "/reservations/:key/release",
+        resource: METER,
+        access: "service",
+        handle: (c) => this.release(account(c), c.params.key, meta(c)),
+      },
+      {
+        method: "POST",
+        path: base + "/ledger",
+        resource: METER,
+        access: "service",
+        // Debits only: a metering key charges usage; adding credits stays with the owner.
+        handle: (c) => {
+          const body = c.request.body;
+          const userId = account(c);
+          if (typeof body.credits === "number" && body.credits > 0) throw new HttpError(403, "Service keys can only record debits");
+          return this.recordCredits(userId, {
+            requestId: body.requestId,
+            productId: body.productId,
+            credits: body.credits,
+            kind: body.kind,
+            reason: body.reason,
+            details: ledgerDetails(body.details),
+            source: "api",
+            actorId: c.actor!.id,
+          });
+        },
+      },
+    ];
+  }
 }
+
+/** Scope of the metering endpoints a service key may call (see ServiceKeys in rt-app-auth). */
+export const METER = "subscriptions.meter";
 
 export { LocalBilling } from "./local.js";

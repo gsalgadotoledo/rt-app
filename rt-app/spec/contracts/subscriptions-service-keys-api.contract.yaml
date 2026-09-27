@@ -1,0 +1,135 @@
+contract: 1
+kind: http
+module: service-keys-api
+title: Service keys over HTTP - admin management and scoped metering (local mode)
+description: |
+  Service keys as every backend serves them (algorithms and rows: service-keys.contract.yaml).
+  Keys are created by the admin (local owner under /admin/app); the token is returned once.
+
+    GET  /admin/app/service-keys                  owner (admin only)   list (never secrets)
+    POST /admin/app/service-keys                  owner (admin only)   {id?, description, scopes, rateLimit?} -> {key, token}
+    POST /admin/app/service-keys/:id/rotate       owner (admin only)   -> {key, token}
+    POST /admin/app/service-keys/:id/revoke       owner (admin only)   -> {key}
+    GET  /service/keys/self                       service, scope service-keys.self
+    GET  /service/subscriptions/accounts/:id/usage                        service, scope subscriptions.meter
+    POST /service/subscriptions/accounts/:id/preflight                    service, scope subscriptions.meter
+    POST /service/subscriptions/accounts/:id/reservations                 service, scope subscriptions.meter
+    POST /service/subscriptions/accounts/:id/reservations/:key/settle     service, scope subscriptions.meter
+    POST /service/subscriptions/accounts/:id/reservations/:key/release    service, scope subscriptions.meter
+    POST /service/subscriptions/accounts/:id/ledger                       service, scope subscriptions.meter (debits only)
+
+  Service endpoints take `Authorization: Bearer rtsk_<id>.<secret>` only: no header is 401
+  "Service key required"; a malformed, unknown, rotated-out or revoked key is 401 "Invalid service
+  key"; a key without the endpoint's scope is 403 "Service key not allowed for this resource".
+  They are never mounted under /admin/app, and a service key is not a session anywhere else.
+  The per-key rate limit is covered by the module contract (a real clock crosses minutes).
+  The file sorts after subscriptions-api on purpose: HTTP contracts share one server per target
+  and subscriptions-api pins an overview without customers.
+cases:
+  - name: service endpoints need a service key
+    tags: [ security ]
+    requests:
+      - { request: { method: GET, path: /service/subscriptions/accounts/svc-nobody/usage }, expect: { status: 401, body: { error: Service key required } } }
+      - { request: { method: GET, path: /service/subscriptions/accounts/svc-nobody/usage, headers: { authorization: "Bearer not-a-key" } }, expect: { status: 401, body: { error: Invalid service key } } }
+      - { request: { method: GET, path: /service/subscriptions/accounts/svc-nobody/usage, headers: { authorization: "Bearer rtsk_nobody.envsecret-envsecret-envsecret-0123" } }, expect: { status: 401, body: { error: Invalid service key } } }
+      - { request: { method: POST, path: /service/subscriptions/accounts/svc-nobody/reservations, body: { key: "t:1", productId: api, credits: 1 } }, expect: { status: 401, body: { error: Service key required } } }
+      - { request: { method: POST, path: "/service/subscriptions/accounts/svc-nobody/reservations/t:1/settle", body: { credits: 1 } }, expect: { status: 401, body: { error: Service key required } } }
+      - { request: { method: POST, path: "/service/subscriptions/accounts/svc-nobody/reservations/t:1/release" }, expect: { status: 401, body: { error: Service key required } } }
+      - { request: { method: POST, path: /service/subscriptions/accounts/svc-nobody/preflight, body: { productId: api, credits: 1 } }, expect: { status: 401, body: { error: Service key required } } }
+      - { request: { method: POST, path: /service/subscriptions/accounts/svc-nobody/ledger, body: { requestId: r1, productId: api, credits: -1, reason: x } }, expect: { status: 401, body: { error: Service key required } } }
+      - { request: { method: GET, path: /service/keys/self }, expect: { status: 401, body: { error: Service key required } } }
+      - { request: { method: GET, path: /admin/app/service/subscriptions/accounts/svc-nobody/usage }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: key management is served only under /admin/app
+    tags: [ security ]
+    requests:
+      - { request: { method: GET, path: /service-keys }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /service-keys, body: { description: x, scopes: [ subscriptions.meter ] } }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /service-keys/x/revoke }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /service-keys/x/rotate }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /admin/app/service-keys, body: { id: svc-bad, description: Bad, scopes: [ users.manage ] } }, expect: { status: 400, body: { error: Invalid service key scopes } } }
+      - { request: { method: POST, path: /admin/app/service-keys, body: { id: "svc bad", description: Bad, scopes: [ subscriptions.meter ] } }, expect: { status: 400, body: { error: Invalid service key id } } }
+      - { request: { method: POST, path: /admin/app/service-keys/svc-missing/revoke }, expect: { status: 404, body: { error: Service key not found } } }
+      - { request: { method: GET, path: /admin/app/service-keys }, expect: { status: 200, body: { $partial: { items: { $type: array }, scopes: [ service-keys.self, subscriptions.meter ] } } } }
+
+  - name: a metering key charges an account without the admin password
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: Metered User, email: svc-meter-1@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { id: { $type: string } } } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/grant", body: { requestId: svc-grant-1, kind: plan, planId: starter, reason: Pilot, currency: usd, valueMinor: 0 } }
+        expect: { status: 200, body: { ok: true } }
+      - request: { method: POST, path: /admin/app/service-keys, body: { id: svc-agent-1, description: "  Agent server  ", scopes: [ subscriptions.meter ], rateLimit: 1000, extra: ignored } }
+        expect:
+          status: 200
+          headers: { cache-control: no-store }
+          body:
+            key: { id: svc-agent-1, description: Agent server, scopes: [ subscriptions.meter ], rateLimit: 1000, source: admin, prefix: rtsk_svc-agent-1., active: true, createdAt: { $type: integer }, createdBy: rt-app-root, rotatedAt: null, revokedAt: null, revokedBy: null, lastUsedAt: null }
+            token: { $regex: "^rtsk_svc-agent-1\\.[A-Za-z0-9_-]{43}$" }
+      - request: { method: POST, path: /admin/app/service-keys, body: { id: svc-agent-1, description: Again, scopes: [ subscriptions.meter ] } }
+        expect: { status: 409, body: { error: Service key id already used } }
+      - request: { method: POST, path: "/service/subscriptions/accounts/{{0.body.id}}/reservations", headers: { authorization: "Bearer {{2.body.token}}" }, body: { key: "turn-1:0", productId: api, estimate: { rateId: standard, inputTokens: 12000, maxOutputTokens: 8000 }, reason: Agent step } }
+        expect: { status: 200, body: { key: "turn-1:0", productId: api, credits: 36, status: active, at: { $type: integer }, expiresAt: { $type: integer }, available: 64, replayed: false } }
+      - request: { method: POST, path: "/service/subscriptions/accounts/{{0.body.id}}/preflight", headers: { authorization: "Bearer {{2.body.token}}" }, body: { productId: api, credits: 70 } }
+        expect: { status: 200, body: { $partial: { fits: false, reason: credits, available: 64, missing: 6, costMinor: null, model: null, margin: null, degrade: null } } }
+      - request: { method: POST, path: "/service/subscriptions/accounts/{{0.body.id}}/reservations/turn-1%3A0/settle", headers: { authorization: "Bearer {{2.body.token}}" }, body: { inputTokens: 12000, outputTokens: 2000 } }
+        expect: { status: 200, body: { key: "turn-1:0", productId: api, reserved: 36, used: 18, credits: 18, fromAllowance: 18, fromBalance: 0, uncovered: 0, expired: false, status: settled, at: { $type: integer }, available: 82, valueMinor: 18, currency: usd, usage: { inputTokens: 12000, outputTokens: 2000 }, replayed: false } }
+      - request: { method: POST, path: "/service/subscriptions/accounts/{{0.body.id}}/reservations", headers: { authorization: "Bearer {{2.body.token}}" }, body: { key: "turn-1:1", productId: api, credits: 5 } }
+        expect: { status: 200, body: { $partial: { credits: 5, available: 77 } } }
+      - request: { method: POST, path: "/service/subscriptions/accounts/{{0.body.id}}/reservations/turn-1:1/release", headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 200, body: { key: "turn-1:1", productId: api, credits: 5, status: released, releasedAt: { $type: integer }, replayed: false } }
+      - request: { method: POST, path: "/service/subscriptions/accounts/{{0.body.id}}/ledger", headers: { authorization: "Bearer {{2.body.token}}" }, body: { requestId: svc-debit-1, productId: api, credits: -2, reason: Tool call, amountMinor: 99, currency: usd } }
+        expect: { status: 200, body: { requestId: svc-debit-1, productId: api, credits: 2, fromAllowance: 2, fromBalance: 0, at: { $type: integer }, replayed: false } }
+      - request: { method: POST, path: "/service/subscriptions/accounts/{{0.body.id}}/ledger", headers: { authorization: "Bearer {{2.body.token}}" }, body: { requestId: svc-credit-1, productId: api, credits: 1000, kind: purchase, reason: Free credits } }
+        expect: { status: 403, body: { error: Service keys can only record debits } }
+      - request: { method: GET, path: "/service/subscriptions/accounts/{{0.body.id}}/usage", headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 200, body: { $partial: { userId: { $ref: "0.body.id" }, active: true, products: [ { $partial: { productId: api, available: 80, reserved: 0 } } ], reservations: [], margin: null } } }
+      - request: { method: GET, path: "/service/subscriptions/accounts/bad%20id/usage", headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 400, body: { error: Invalid identifier } }
+      - request: { method: GET, path: "/admin/app/subscriptions/admin/accounts/{{0.body.id}}/ledger" }
+        expect:
+          status: 200
+          body:
+            $partial:
+              entries:
+                - { $partial: { kind: allowance } }
+                - { $partial: { kind: plan, source: admin } }
+                - { $partial: { kind: reservation, source: api, actorId: "service:svc-agent-1", requestId: "turn-1:0", held: 36 } }
+                - { $partial: { kind: settlement, source: api, actorId: "service:svc-agent-1", credits: -18 } }
+                - { $partial: { kind: reservation, source: api, actorId: "service:svc-agent-1", requestId: "turn-1:1" } }
+                - { $partial: { kind: release, source: api, actorId: "service:svc-agent-1", held: -5 } }
+                - { $partial: { kind: usage, source: api, actorId: "service:svc-agent-1", credits: -2, reason: Tool call }, note: "every metering entry names the key; money fields from the key are ignored" }
+
+  - name: scopes, rotation and revocation take effect on the next request
+    tags: [ security ]
+    requests:
+      - request: { method: POST, path: /admin/app/service-keys, body: { id: svc-meter-2, description: Meter only, scopes: [ subscriptions.meter ] } }
+        expect: { status: 200, body: { $partial: { token: { $type: string } } } }
+      - request: { method: POST, path: /admin/app/service-keys, body: { id: svc-self-2, description: Self only, scopes: [ service-keys.self ] } }
+        expect: { status: 200, body: { $partial: { token: { $type: string } } } }
+      - request: { method: GET, path: /service/keys/self, headers: { authorization: "Bearer {{0.body.token}}" } }
+        expect: { status: 403, body: { error: Service key not allowed for this resource } }
+      - request: { method: GET, path: /service/subscriptions/accounts/svc-nobody/usage, headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect: { status: 403, body: { error: Service key not allowed for this resource } }
+      - request: { method: GET, path: /service/keys/self, headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect: { status: 200, body: { id: svc-self-2, description: Self only, scopes: [ service-keys.self ], rateLimit: 600 } }
+      - request: { method: GET, path: /users/me, headers: { authorization: "Bearer {{0.body.token}}" } }
+        expect: { status: 401, body: { error: { $type: string } } }
+        note: a service key is not a session
+      - request: { method: GET, path: /subscriptions/credits/usage, headers: { authorization: "Bearer {{0.body.token}}" } }
+        expect: { status: 401, body: { error: { $type: string } } }
+      - request: { method: GET, path: /service/subscriptions/accounts/svc-nobody/usage, headers: { authorization: "Bearer {{0.body.token}}" } }
+        expect: { status: 200, body: { userId: svc-nobody, active: false, products: [], reservations: [], alerts: [], pack: { credits: 1000, amountMinor: 1000, currency: usd }, margin: null } }
+      - request: { method: POST, path: /admin/app/service-keys/svc-meter-2/rotate }
+        expect: { status: 200, body: { key: { $partial: { id: svc-meter-2, active: true, rotatedAt: { $type: integer }, lastUsedAt: { $type: integer } } }, token: { $regex: "^rtsk_svc-meter-2\\.[A-Za-z0-9_-]{43}$" } } }
+      - request: { method: GET, path: /service/subscriptions/accounts/svc-nobody/usage, headers: { authorization: "Bearer {{0.body.token}}" } }
+        expect: { status: 401, body: { error: Invalid service key } }
+        note: the rotated-out token fails at once
+      - request: { method: GET, path: /service/subscriptions/accounts/svc-nobody/usage, headers: { authorization: "Bearer {{8.body.token}}" } }
+        expect: { status: 200, body: { $partial: { userId: svc-nobody } } }
+      - request: { method: POST, path: /admin/app/service-keys/svc-meter-2/revoke }
+        expect: { status: 200, body: { key: { $partial: { id: svc-meter-2, active: false, revokedAt: { $type: integer }, revokedBy: rt-app-root } } } }
+      - request: { method: GET, path: /service/subscriptions/accounts/svc-nobody/usage, headers: { authorization: "Bearer {{8.body.token}}" } }
+        expect: { status: 401, body: { error: Invalid service key } }
+        note: revoked keys are rejected immediately
+      - request: { method: POST, path: /admin/app/service-keys/svc-meter-2/rotate }
+        expect: { status: 409, body: { error: Service key is revoked } }

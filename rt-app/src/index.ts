@@ -128,7 +128,7 @@ import {
   type RunnerOptions,
 } from "@gsalgadotoledo/rt-app-migrations";
 import { Users, DEMO_USERS } from "@gsalgadotoledo/rt-app-users";
-import { Auth, type Mailer, SesMailer } from "@gsalgadotoledo/rt-app-auth";
+import { Auth, type Mailer, SesMailer, ServiceKeys, serviceKeysFromEnv } from "@gsalgadotoledo/rt-app-auth";
 import { JwtTokens } from "@gsalgadotoledo/rt-app-jwt";
 import { ACL } from "@gsalgadotoledo/rt-app-acl";
 import { tasksFeature } from "@gsalgadotoledo/rt-app-tasks";
@@ -167,6 +167,12 @@ export function createApplication(options: {
   identityProvider?: IdentityProvider;
   adminPasswordVerifier?: string;
   localAdminAccess?: boolean;
+  /**
+   * Configured service keys (the parsed RT_APP_SERVICE_KEYS value). Defaults to
+   * RT_APP_SERVICE_KEYS or the file named by RT_APP_SERVICE_KEYS_FILE; admin-managed keys live in
+   * the store either way. See docs/authentication.md "Service keys".
+   */
+  serviceKeys?: unknown;
   modules?: string[];
   features?: Feature[];
   featureFactories?: FeatureFactory[];
@@ -273,6 +279,11 @@ export function createApplication(options: {
   };
   let endpoints: Endpoint[] = [];
   const acl = new ACL(options.store, () => endpoints);
+  // Scoped credentials for backends: they reach only `access: "service"` endpoints in their scopes.
+  const serviceKeys = new ServiceKeys(options.store, options.secret, {
+    keys: options.serviceKeys !== undefined ? options.serviceKeys : serviceKeysFromEnv(),
+    scopes: () => [...new Set(endpoints.filter((e) => e.access === "service").map((e) => e.resource))].sort(),
+  });
   const registered: Feature[] = [
     flags.feature(),
     visits.feature(),
@@ -289,6 +300,7 @@ export function createApplication(options: {
     users.feature(),
     auth.feature(),
     acl.feature(),
+    serviceKeys.feature(),
     ...(options.tasks === false ? [] : [tasksFeature(options.store)]),
     ...(options.featureFactories ?? []).map((factory) => factory(options.store, featureContext)),
     ...(choice ? [choice.feature()] : []),
@@ -311,6 +323,7 @@ export function createApplication(options: {
       requested.includes(f.id) ||
       f.id === "observer" ||
       f.id === "subscriptions" ||
+      f.id === "service-keys" ||
       (f.id === "aws-monitor" && requested.includes("infra")),
   );
   // Root sessions share the application store (SESSIONS#rt-app-root) so the console can refresh.
@@ -337,7 +350,8 @@ export function createApplication(options: {
         !e.path.startsWith("/aws/") &&
         e.path !== "/observer/report" &&
         e.path !== "/observer/logs" &&
-        !e.path.startsWith("/subscriptions/admin/"),
+        !e.path.startsWith("/subscriptions/admin/") &&
+        !e.path.startsWith("/service-keys"),
     ),
     ...adminEndpoints,
     ...admin.features.flatMap((f) => f.endpoints),
@@ -399,10 +413,15 @@ export function createApplication(options: {
 
   const signatures = new Set<string>();
   for (const e of endpoints) {
+    // Service endpoints live under /service/ and nothing else does: one prefix, one credential.
+    if ((e.access === "service") !== e.path.startsWith("/service/"))
+      throw new Error(`Service endpoints must use /service/ paths: ${e.method} ${e.path}`);
     const key = e.method + " " + e.path;
     if (signatures.has(key)) throw new Error(`Duplicate endpoint ${key}`);
     signatures.add(key);
   }
+  // Refuse to start with an invalid RT_APP_SERVICE_KEYS instead of failing on the first request.
+  serviceKeys.validate();
   // Literal routes take precedence over parameter routes.
   endpoints.sort(
     (a, b) => Number(a.path.includes(":")) - Number(b.path.includes(":")),
@@ -431,10 +450,12 @@ export function createApplication(options: {
       const actor =
         route.access === "guest"
           ? undefined
-          : await (route.path.startsWith("/admin/") ? admin.auth : auth).actor(
-              request.headers.authorization,
-            );
-      (route.path.startsWith("/admin/") ? admin.acl : acl).check(route, actor);
+          : route.access === "service"
+            ? await serviceKeys.actor(request.headers.authorization)
+            : await (route.path.startsWith("/admin/") ? admin.auth : auth).actor(
+                request.headers.authorization,
+              );
+      (route.access === "service" ? serviceKeys : route.path.startsWith("/admin/") ? admin.acl : acl).check(route, actor);
       if (route.subscription) {
         if (!actor) throw new HttpError(401, "Authentication required");
         const key = request.headers["idempotency-key"];
@@ -506,6 +527,7 @@ export function createApplication(options: {
     users,
     auth,
     admin,
+    serviceKeys,
     environment,
     /** Migration runner over every enabled module: status, up and down. */
     migrations: (runner: MigrationRunnerOptions = {}) =>

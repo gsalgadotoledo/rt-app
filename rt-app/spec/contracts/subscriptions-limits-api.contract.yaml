@@ -1,0 +1,132 @@
+contract: 1
+kind: http
+module: subscriptions-limits-api
+title: Finance limits and unit economics over HTTP (local mode)
+description: |
+  Model caps, the short window, provider costs, the margin rule and unit economics as every
+  backend serves them (algorithms: subscriptions-limits and subscriptions-economics). The case
+  adds two rates with provider costs and a new plan (the existing plans and rates are kept, so
+  the other contracts sharing the server are not affected), grants the plan to a new user and
+  meters through the owner endpoints.
+
+    GET /subscriptions/admin/economics   owner (admin only)   query.limit (1-200, default 50)
+cases:
+  - name: economics is served only under /admin/app
+    tags: [ security ]
+    requests:
+      - { request: { method: GET, path: /subscriptions/admin/economics }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: "/admin/app/subscriptions/admin/economics?limit=0" }, expect: { status: 400, body: { error: Invalid numeric setting } } }
+      - { request: { method: GET, path: "/admin/app/subscriptions/admin/economics?limit=abc" }, expect: { status: 400, body: { error: Invalid numeric setting } } }
+      - { request: { method: GET, path: /admin/app/subscriptions/admin/economics }, expect: { status: 200, body: { asOf: { $type: integer }, currency: usd, totals: { $type: object }, plans: { $type: array }, users: { $type: array } } } }
+
+  - name: caps, costs and the margin rule are configured without a deploy and enforced at once
+    requests:
+      - request: { method: GET, path: /admin/app/subscriptions/admin/settings }
+        expect: { status: 200, body: { $partial: { version: { $type: integer } } } }
+      - request:
+          method: PUT
+          path: /admin/app/subscriptions/admin/settings
+          body:
+            version: { $ref: "0.body.version" }
+            values:
+              paymentRequired: { $ref: "0.body.values.paymentRequired" }
+              notifications: { $ref: "0.body.values.notifications" }
+              reminderDays: { $ref: "0.body.values.reminderDays" }
+              plans: { $ref: "0.body.values.plans" }
+              credits:
+                pack: { $ref: "0.body.values.credits.pack" }
+                rates:
+                  - { id: standard, name: Standard model, inputPer1k: 1, outputPer1k: 3, minimum: 1 }
+                  - { id: advanced, name: Advanced model, inputPer1k: 5, outputPer1k: 15, minimum: 1 }
+                  - { id: frugal, name: Frugal model, inputPer1k: 1, outputPer1k: 3, minimum: 1, costInputPer1k: 0.3, costOutputPer1k: 1.5 }
+                  - { id: premium, name: Premium model, inputPer1k: 5, outputPer1k: 15, minimum: 1, costInputPer1k: 1.5, costOutputPer1k: 7.5 }
+        expect: { status: 200, body: { $partial: { version: { $type: integer } } } }
+      - request:
+          method: POST
+          path: /admin/app/subscriptions/admin/plans/actions/create
+          body:
+            version: { $ref: "1.body.version" }
+            plan:
+              name: Limits Plan
+              amount: 0
+              currency: usd
+              periodDays: 30
+              maxProviderCostMinor: 10
+              products: [ { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800, shortLimit: 30, shortSeconds: 18000, rateCaps: [ { rateId: premium, day: 20, period: 100 } ] } ]
+        expect: { status: 200, body: { $partial: { version: { $type: integer } } } }
+      - request:
+          method: POST
+          path: /admin/app/subscriptions/admin/plans/actions/create
+          body:
+            version: { $ref: "2.body.version" }
+            plan: { name: Broken Caps, amount: 0, currency: usd, periodDays: 30, products: [ { id: api, name: API credits, credits: 1, dailyLimit: 1, weeklyLimit: 1, daySeconds: 86400, weekSeconds: 604800, rateCaps: [ { rateId: unknown-rate, day: 1 } ] } ] }
+        expect: { status: 400, body: { error: Invalid model cap } }
+      - request: { method: POST, path: /admin/app/users, body: { name: Limits Tester, email: limits-1@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { id: { $type: string } } } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{4.body.id}}/grant", body: { requestId: lim-grant-1, kind: plan, planId: limits-plan, reason: Pilot, currency: usd, valueMinor: 0 } }
+        expect: { status: 200, body: { ok: true } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{4.body.id}}/preflight", body: { productId: api, estimate: { rateId: premium, inputTokens: 2000, maxOutputTokens: 1000 } } }
+        expect:
+          status: 200
+          body:
+            productId: api
+            credits: 25
+            fits: false
+            reason: model
+            available: 30
+            missing: 0
+            allowanceLeft: 30
+            additionalCredits: 0
+            reserved: 0
+            windows:
+              - { kind: short, used: 0, reserved: 0, limit: 30, remaining: 30, percent: 0, threshold: 0, resetAt: { $type: integer } }
+              - { kind: day, used: 0, reserved: 0, limit: 100, remaining: 100, percent: 0, threshold: 0, resetAt: { $type: integer } }
+              - { kind: week, used: 0, reserved: 0, limit: 500, remaining: 500, percent: 0, threshold: 0, resetAt: { $type: integer } }
+              - { kind: period, used: 0, reserved: 0, limit: 1000, remaining: 1000, percent: 0, threshold: 0, resetAt: { $type: integer } }
+            topUp: null
+            costMinor: 10.5
+            model:
+              rateId: premium
+              windows:
+                - { kind: day, used: 0, reserved: 0, limit: 20, remaining: 20, percent: 0, threshold: 0, resetAt: { $type: integer } }
+                - { kind: period, used: 0, reserved: 0, limit: 100, remaining: 100, percent: 0, threshold: 0, resetAt: { $type: integer } }
+              exceeded: day
+            margin: { currency: usd, costMinor: 0, capMinor: 10, remainingMinor: 10, percent: 0, threshold: 0, resetAt: { $type: integer }, stepMinor: 10.5, exceeded: true }
+            degrade: { rateId: frugal, name: Frugal model, credits: 5, costMinor: 2.1 }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{4.body.id}}/reservations", body: { key: "lim-1:0", productId: api, estimate: { rateId: premium, inputTokens: 2000, maxOutputTokens: 200 } } }
+        expect: { status: 200, body: { $partial: { key: "lim-1:0", credits: 13, status: active, available: 17 } } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{4.body.id}}/reservations/lim-1:0/settle", body: { inputTokens: 2000, outputTokens: 500 } }
+        expect: { status: 200, body: { key: "lim-1:0", productId: api, reserved: 13, used: 18, credits: 18, fromAllowance: 18, fromBalance: 0, uncovered: 0, expired: false, status: settled, at: { $type: integer }, available: 12, valueMinor: 18, currency: usd, usage: { inputTokens: 2000, outputTokens: 500 }, costMinor: 6.75, replayed: false } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{4.body.id}}/reservations", body: { key: "lim-1:1", productId: api, estimate: { rateId: premium, inputTokens: 1000, maxOutputTokens: 0 } } }
+        expect: { status: 429, body: { error: "Model limit reached: Premium model day limit. Use another model or wait for the reset." } }
+      - request: { method: POST, path: "/admin/app/subscriptions/admin/accounts/{{4.body.id}}/reservations", body: { key: "lim-1:1", productId: api, estimate: { rateId: frugal, inputTokens: 1000, maxOutputTokens: 0 } } }
+        expect: { status: 200, body: { $partial: { credits: 1, status: active } } }
+      - request: { method: GET, path: "/admin/app/subscriptions/admin/accounts/{{4.body.id}}/usage" }
+        expect:
+          status: 200
+          body:
+            $partial:
+              products:
+                - $partial:
+                    productId: api
+                    available: 11
+                    windows:
+                      - { kind: short, used: 18, reserved: 1, limit: 30, remaining: 11, percent: 63, threshold: 0, resetAt: { $type: integer } }
+                      - { $partial: { kind: day, used: 18 } }
+                      - { $partial: { kind: week } }
+                      - { $partial: { kind: period } }
+                    models:
+                      - rateId: premium
+                        name: Premium model
+                        windows:
+                          - { kind: day, used: 18, reserved: 0, limit: 20, remaining: 2, percent: 90, threshold: 80, resetAt: { $type: integer } }
+                          - { kind: period, used: 18, reserved: 0, limit: 100, remaining: 82, percent: 18, threshold: 0, resetAt: { $type: integer } }
+              alerts: [ { productId: api, window: day, percent: 90, threshold: 80, rateId: premium } ]
+              margin: { currency: usd, costMinor: 6.75, capMinor: 10, remainingMinor: 3.25, percent: 67, threshold: 0, resetAt: { $type: integer } }
+      - request: { method: GET, path: "/admin/app/subscriptions/admin/economics?limit=1" }
+        expect:
+          status: 200
+          body:
+            $partial:
+              currency: usd
+              users: [ { userId: { $ref: "4.body.id" }, planId: limits-plan, costMinor: { usd: 6.75 }, revenueMinor: {}, marginMinor: { usd: -6.75 }, periodCostMinor: 6.75, capMinor: 10 } ]

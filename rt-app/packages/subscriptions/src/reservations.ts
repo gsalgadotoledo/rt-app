@@ -40,6 +40,8 @@ export interface Hold {
   credits: number;
   at: number;
   expiresAt: number;
+  /** The rate of an estimate, kept only when the product caps that rate (model caps). */
+  rateId?: string;
 }
 
 /** Input of `reserve`: a fixed amount of credits, or a model call priced at its maximum. */
@@ -97,7 +99,7 @@ export function thresholdOf(percent: number): number {
  * percent = floor((used + reserved) * 100 / limit), 100 when the limit is 0.
  * @example windowUsage("day", 60, 25, 100, 86400000) → {kind:"day", used:60, reserved:25, limit:100, remaining:15, percent:85, threshold:80, resetAt:86400000}
  */
-export function windowUsage(kind: "day" | "week" | "period", used: number, reserved: number, limit: number, resetAt: number) {
+export function windowUsage(kind: "short" | "day" | "week" | "period", used: number, reserved: number, limit: number, resetAt: number) {
   const percent = limit > 0 ? Math.floor(((used + reserved) * 100) / limit) : 100;
   return { kind, used, reserved, limit, remaining: Math.max(0, limit - used - reserved), percent, threshold: thresholdOf(percent), resetAt };
 }

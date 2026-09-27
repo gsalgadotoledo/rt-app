@@ -1,0 +1,77 @@
+contract: 1
+module: subscriptions-economics
+subject: subscriptions
+title: Subscriptions service - unit economics (provider cost, revenue and margin per user and plan)
+description: |
+  economics(limit = 50) through the `subscriptions` facade (provider costs and the margin rule:
+  subscriptions-limits). Design: docs/polyglot/subscriptions-limits.md.
+
+  integer(limit, 1, 200) (400 "Invalid numeric setting"; wire null is the default). Reads the
+  settings, then every SUB_ACCOUNTS page in order; each account is normalized. cost =
+  providerCost.totalMinor ?? {}, revenue = ledgerTotals.paidMinor ?? {} (purchases and paid
+  plans). Accounts without an active entitlement, cost or revenue are skipped. margin = revenue -
+  cost per currency. Sums per currency use round4 after every addition, in account order. The
+  plan is the active entitlement's plan from the CURRENT settings (by id), else the subscribed
+  one. User item {userId, planId (null without an active plan), costMinor, revenueMinor,
+  marginMinor, periodCostMinor (cost of the current entitlement period, else 0), capMinor (the
+  plan's maxProviderCostMinor or null)}. Plans: one group per plan id ("none" without an active
+  plan, name null) {planId, name, users, costMinor, revenueMinor, marginMinor}, sorted by planId
+  (code points). Users sorted by costMinor[pack currency] (missing 0) descending, then userId
+  (code points), cut to `limit`. Result {asOf: now, currency: pack currency, totals: {users,
+  costMinor, revenueMinor, marginMinor}, plans, users}. Never writes. Money maps never hold -0.
+fixtures:
+  alice: &alice { id: alice, email: alice@example.test, role: user }
+  service: &service { id: "service:agent", role: service, grants: [ subscriptions.meter ] }
+  starter: &starter { id: starter, name: Starter, amount: 0, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800 } ] }
+  pro: &pro { id: pro, name: Pro, amount: 2000, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 10000, dailyLimit: 1000, weeklyLimit: 5000, daySeconds: 86400, weekSeconds: 604800 } ] }
+  max: &max { id: max, name: Max, amount: 5000, currency: usd, periodDays: 30, enabled: true, products: [ { id: api, name: API credits, credits: 50000, dailyLimit: 5000, weeklyLimit: 25000, daySeconds: 86400, weekSeconds: 604800 } ] }
+  cappedProduct: &cappedProduct { id: api, name: API credits, credits: 1000, dailyLimit: 100, weeklyLimit: 500, daySeconds: 86400, weekSeconds: 604800, shortLimit: 30, shortSeconds: 18000, rateCaps: [ { rateId: advanced, day: 40, period: 100 } ] }
+  capped: &capped { id: capped, name: Capped, amount: 0, currency: usd, periodDays: 30, enabled: true, maxProviderCostMinor: 10, products: [ *cappedProduct ] }
+  rates: &rates
+    - { id: standard, name: Standard model, inputPer1k: 1, outputPer1k: 3, minimum: 1, costInputPer1k: 0.3, costOutputPer1k: 1.5 }
+    - { id: advanced, name: Advanced model, inputPer1k: 5, outputPer1k: 15, minimum: 1, costInputPer1k: 1.5, costOutputPer1k: 7.5 }
+    - { id: lite, name: Lite model, inputPer1k: 0.5, outputPer1k: 1, minimum: 1 }
+  credits: &credits { pack: { credits: 1000, amountMinor: 1000, currency: usd }, rates: *rates }
+  limited: &limited { version: 0, values: { paymentRequired: false, notifications: true, reminderDays: 3, plans: [ *starter, *pro, *max, *capped ], credits: *credits } }
+cases:
+  - name: an empty store has no economics
+    steps:
+      - { call: economics, args: [ null ], expect: { value: { asOf: 1767225600000, currency: usd, totals: { users: 0, costMinor: {}, revenueMinor: {}, marginMinor: {} }, plans: [], users: [] } } }
+      - { call: economics, args: [ 0 ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: economics, args: [ 201 ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+      - { call: economics, args: [ 1.5 ], expect: { error: { status: 400, message: Invalid numeric setting } } }
+
+  - name: cost, revenue and margin per user and per plan
+    steps:
+      - { call: saveSettings, args: [ *limited, admin-1 ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: change, args: [ *alice, capped, p-alice ], expect: { value: { ok: true } } }
+      - { call: change, args: [ { id: bob, email: bob@example.test, role: user }, starter, p-bob ], expect: { value: { ok: true } } }
+      - { call: change, args: [ { id: erin, email: erin@example.test, role: user }, starter, p-erin ], expect: { value: { ok: true } } }
+      - { call: consumeUsage, args: [ alice, api, { rateId: advanced, inputTokens: 2000, outputTokens: 0 }, a1 ], expect: { value: { $partial: { credits: 10, costMinor: 3 } } } }
+      - { call: recordCredits, args: [ alice, { requestId: buy-a, productId: api, credits: 100, kind: purchase, reason: Top-up, amountMinor: 500, currency: usd } ], expect: { value: { $partial: { credits: 100 } } } }
+      - { call: consumeUsage, args: [ bob, api, { rateId: standard, inputTokens: 15000, outputTokens: 0 }, b1 ], expect: { value: { $partial: { credits: 15, costMinor: 4.5 } } } }
+      - { call: consumeUsage, args: [ bob, api, { rateId: lite, inputTokens: 1000, outputTokens: 0 }, b2 ], expect: { value: { requestId: b2, productId: api, credits: 1, fromAllowance: 1, fromBalance: 0, at: 1767225600000, replayed: false, valueMinor: 1, currency: usd } }, note: "a rate without costs adds no cost" }
+      - { call: recordCredits, args: [ carol, { requestId: buy-c, productId: api, credits: 50, kind: purchase, reason: Top-up, amountMinor: 200, currency: usd } ], expect: { value: { $partial: { credits: 50 } } } }
+      - call: economics
+        args: [ null ]
+        expect:
+          value:
+            asOf: 1767225600000
+            currency: usd
+            totals: { users: 4, costMinor: { usd: 7.5 }, revenueMinor: { usd: 700 }, marginMinor: { usd: 692.5 } }
+            plans:
+              - { planId: capped, name: Capped, users: 1, costMinor: { usd: 3 }, revenueMinor: { usd: 500 }, marginMinor: { usd: 497 } }
+              - { planId: none, name: null, users: 1, costMinor: {}, revenueMinor: { usd: 200 }, marginMinor: { usd: 200 } }
+              - { planId: starter, name: Starter, users: 2, costMinor: { usd: 4.5 }, revenueMinor: {}, marginMinor: { usd: -4.5 } }
+            users:
+              - { userId: bob, planId: starter, costMinor: { usd: 4.5 }, revenueMinor: {}, marginMinor: { usd: -4.5 }, periodCostMinor: 4.5, capMinor: null }
+              - { userId: alice, planId: capped, costMinor: { usd: 3 }, revenueMinor: { usd: 500 }, marginMinor: { usd: 497 }, periodCostMinor: 3, capMinor: 10 }
+              - { userId: carol, planId: null, costMinor: {}, revenueMinor: { usd: 200 }, marginMinor: { usd: 200 }, periodCostMinor: 0, capMinor: null }
+              - { userId: erin, planId: starter, costMinor: {}, revenueMinor: {}, marginMinor: {}, periodCostMinor: 0, capMinor: null }
+      - { call: economics, args: [ 1 ], expect: { value: { $partial: { totals: { $partial: { users: 4 } }, users: [ { $partial: { userId: bob } } ] } } } }
+      - { call: row, args: [ SUB_ACCOUNTS, alice ], expect: { value: { $partial: { data: { $partial: { providerCost: { totalMinor: { usd: 3 }, periodStart: 1767225600000, periodMinor: 3 } } } } } } }
+      - { call: setNow, args: [ "2026-02-01T00:00:00.000Z" ], expect: { value: null } }
+      - { call: economics, args: [ 2 ], expect: { value: { $partial: { asOf: 1769904000000, users: [ { $partial: { userId: bob, costMinor: { usd: 4.5 }, periodCostMinor: 0 } }, { $partial: { userId: alice, costMinor: { usd: 3 }, periodCostMinor: 0 } } ] } } }, note: "a new period starts the period cost again; totals are all time" }
+      - { call: consumeUsage, args: [ alice, api, { rateId: standard, inputTokens: 1000, outputTokens: 1000 }, a2 ], expect: { value: { $partial: { credits: 4, costMinor: 1.8 } } } }
+      - { call: row, args: [ SUB_ACCOUNTS, alice ], expect: { value: { $partial: { data: { $partial: { providerCost: { totalMinor: { usd: 4.8 }, periodStart: 1769817600000, periodMinor: 1.8 } } } } } } }
+      - { call: usageSummary, args: [ alice ], expect: { value: { $partial: { margin: { currency: usd, costMinor: 1.8, capMinor: 10, remainingMinor: 8.2, percent: 18, threshold: 0, resetAt: 1772409600000 } } } } }

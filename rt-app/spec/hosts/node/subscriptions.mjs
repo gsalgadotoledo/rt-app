@@ -109,6 +109,7 @@ async function subscriptions(init) {
     usageSummary: (userId) => service.usageSummary(userId),
     // Overview and maintenance
     overview: (months) => service.overview(given(months)),
+    economics: (limit) => service.economics(given(limit)),
     maintenance: () => service.maintenance(),
     // Module surface: endpoint list, one endpoint call (handler included), admin entry, migrations
     endpoints: () => feature.endpoints.map((e) => ({ method: e.method, path: e.path, access: e.access, resource: e.resource, tool: e.tool?.name, maxBodyBytes: e.maxBodyBytes })),

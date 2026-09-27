@@ -7,6 +7,7 @@ import { rateLimit } from "./limits.js";
 import { RefreshSessions, sessionLive, parseRefreshToken, INVALID_REFRESH, type SessionClient } from "./sessions.js";
 export * from "./sessions.js";
 export { rateLimit } from "./limits.js";
+export * from "./service-keys.js";
 import { createHmac, randomInt, timingSafeEqual, randomUUID } from "node:crypto";
 import { SESv2Client, SendEmailCommand } from "@aws-sdk/client-sesv2";
 import {
