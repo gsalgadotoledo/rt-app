@@ -611,3 +611,22 @@ cases:
       - { call: requestEmailChange, args: [ u-carol, free@example.test, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
       - { call: mailbox, args: [], expect: { value: [] } }
       - { call: confirmEmailChange, args: [ u-alice, "123456", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } }, note: no pending change }
+
+  - name: MFA on any page blocks disabling password sign-in
+    tags: [ settings, mfa, pagination, edge ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - $repeat: { count: 60, item: { pk: MFA, sk: "u-{i:02}", version: 1, data: { enabled: false } } }
+        - { pk: MFA, sk: u-zz, version: 1, data: { enabled: true } }
+    call: updateSettings
+    args: [ { version: 0, values: { passwordLogin: false, emailCodeLogin: true } } ]
+    expect: { error: { status: 409, message: Password sign-in is required for accounts with MFA } }
+    note: the only enabled MFA row is on the second page of the MFA partition
+
+  - name: MFA setup for an unknown user is 404
+    tags: [ mfa, edge ]
+    call: setupMfa
+    args: [ u-missing, "correct horse battery", 127.0.0.1 ]
+    expect: { error: { status: 404, message: User not found } }

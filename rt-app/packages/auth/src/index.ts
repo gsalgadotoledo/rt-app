@@ -435,7 +435,8 @@ export class Auth {
     await this.limit('mfa-setup:'+ip,5);await this.limit('mfa-setup-user:'+id,5);
     if(!(await this.settings()).values.passwordLogin) throw new HttpError(409,"Enable password sign-in before enabling MFA");
     if(await this.hasMfa(id)) throw new HttpError(409,"MFA is already enabled");
-    const user=(await this.users.get(id))!;
+    const user=await this.users.get(id);
+    if(!user) throw new HttpError(404,"User not found");
     validatePassword(password);
     let secret:string, accessToken:string|undefined;
     if(this.provider) {
@@ -455,7 +456,9 @@ export class Auth {
     if(pending.data.userId!==id) throw new HttpError(403,"Challenge belongs to another account");
     if(await this.hasMfa(id)) throw new HttpError(409,"MFA is already enabled");
     if(typeof code!=='string'||!/^\d{6}$/.test(code))throw new HttpError(400,"Invalid code");
-    const value=this.vault.open(pending.data.sealed),user=(await this.users.get(id))!;
+    const user=await this.users.get(id);
+    if(!user) throw new HttpError(404,"User not found");
+    const value=this.vault.open(pending.data.sealed);
     if(this.provider) {
       await this.provider.enableTotp(id,value.accessToken,code);
       // Invalidate all application sessions and retain an enrollment marker atomically.
@@ -504,6 +507,16 @@ export class Auth {
       ],
     };
   }
+  /** Whether any account has MFA enabled, across every page of the MFA partition. */
+  private async anyMfaEnabled() {
+    let cursor: string | undefined;
+    do {
+      const page = await this.store.list('MFA', cursor);
+      if (page.items.some(r => r.data.enabled)) return true;
+      cursor = page.cursor;
+    } while (cursor);
+    return false;
+  }
   async updateSettings(input: Record<string, any>) {
     const { version, values } = input;
     if (
@@ -516,7 +529,7 @@ export class Auth {
         400,
         "At least one sign-in method must remain enabled",
       );
-    if (!values.passwordLogin && (await this.store.list('MFA')).items.some(r=>r.data.enabled))
+    if (!values.passwordLogin && (await this.anyMfaEnabled()))
       throw new HttpError(409,"Password sign-in is required for accounts with MFA");
     const row = await this.store.get("SETTINGS", "auth");
     if (version !== (row?.version ?? 0)) throw new Conflict();

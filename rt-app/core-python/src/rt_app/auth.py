@@ -539,10 +539,21 @@ class Auth:
     def _finish_pending(self, row: Row) -> None:
         self.store.transact([{"row": _bump(row, used=True), "expected": row["version"]}])
 
+    def _any_mfa_enabled(self) -> bool:
+        """Whether any account has MFA enabled, across every page of the MFA partition."""
+        cursor: str | None = None
+        while True:
+            page = self.store.list("MFA", cursor)
+            if any(row["data"].get("enabled") for row in page["items"]):
+                return True
+            cursor = page.get("cursor")
+            if not cursor:
+                return False
+
     def _user(self, id: str) -> Row:
         user = self.users.get(id)
         if user is None:
-            raise TypeError(f"User {id} does not exist")  # the reference fails the same way (500)
+            raise HttpError(404, "User not found")
         return user
 
     def verify_mfa(self, id: object, code: object, ip: str) -> dict[str, Any]:
@@ -665,7 +676,7 @@ class Auth:
         is_integer = _js.is_number(version) and float(version).is_integer()  # type: ignore[arg-type]
         if not is_integer or not isinstance(password_login, bool) or not isinstance(email_login, bool) or not (password_login or email_login):
             raise HttpError(400, "At least one sign-in method must remain enabled")
-        if not password_login and any(row["data"].get("enabled") for row in self.store.list("MFA")["items"]):
+        if not password_login and self._any_mfa_enabled():
             raise HttpError(409, "Password sign-in is required for accounts with MFA")
         row = self.store.get("SETTINGS", "auth")
         if version != (row["version"] if row else 0):

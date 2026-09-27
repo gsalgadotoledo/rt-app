@@ -269,3 +269,18 @@ export function auditCreate(actor: string | null, at: Date = new Date()) {
 export function auditUpdate(actor: string | null, at: Date = new Date()) {return {updatedAt:at.toISOString(),updatedBy:actor};}
 export function auditDelete(actor: string, at: Date = new Date()) {const now=at.toISOString();return {updatedAt:now,updatedBy:actor,deletedAt:now,deletedBy:actor};}
 export function auditRestore(actor: string, at: Date = new Date()) {return {...auditUpdate(actor, at),deletedAt:null,deletedBy:null,restoredAt:at.toISOString(),restoredBy:actor};}
+
+const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+/**
+ * The client address for rate limits and audit. X-Forwarded-For is trusted only when the
+ * connection comes from this machine (the Python/Go backend forwarding to the Node core): its
+ * last entry is the address that proxy saw. Remote connections always use the socket address.
+ * @example clientIp("127.0.0.1", "203.0.113.9") // → "203.0.113.9"
+ */
+export function clientIp(remoteAddress: string | undefined, forwardedFor?: string | string[]) {
+  const remote = remoteAddress || "unknown";
+  if (!LOOPBACK.has(remote) || !forwardedFor) return remote;
+  const header = Array.isArray(forwardedFor) ? forwardedFor.join(",") : forwardedFor;
+  const last = header.split(",").map((part) => part.trim()).filter(Boolean).at(-1);
+  return last && last.length <= 64 && /^[0-9A-Fa-f:.]+$/.test(last) ? last : remote;
+}

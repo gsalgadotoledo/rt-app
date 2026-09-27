@@ -1,4 +1,5 @@
 import {publicConfig} from "@gsalgadotoledo/rt-app-config";
+import { clientIp } from "@gsalgadotoledo/rt-app-contracts";
 import {localSecret} from "./local-secret.js";
 import { localSetupStatus } from "./setup.js";
 import { readFile, writeFile } from "node:fs/promises";
@@ -186,7 +187,7 @@ const server = createServer(async (req, res) => {
       body,
       rawBody: raw,
       headers: { authorization: req.headers.authorization, "stripe-signature": typeof req.headers["stripe-signature"]==='string'?req.headers["stripe-signature"]:undefined, "idempotency-key":typeof req.headers["idempotency-key"]==='string'?req.headers["idempotency-key"]:undefined },
-      ip: req.socket.remoteAddress ?? "unknown",
+      ip: clientIp(req.socket.remoteAddress, req.headers["x-forwarded-for"]),
     });
     reply(result.status, result.body);
   } catch {

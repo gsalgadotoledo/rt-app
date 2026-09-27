@@ -148,7 +148,7 @@ func (a *Auth) SetupMFA(ctx context.Context, id string, password any, ip string)
 		return nil, err
 	}
 	if user == nil {
-		return nil, errors.New("auth: user not found")
+		return nil, apperr.NotFound("User not found")
 	}
 	if err := users.ValidatePassword(password); err != nil {
 		return nil, err
@@ -205,7 +205,7 @@ func (a *Auth) EnableMFA(ctx context.Context, id string, challengeID, code any, 
 		return Reply{}, err
 	}
 	if user == nil {
-		return Reply{}, errors.New("auth: user not found")
+		return Reply{}, apperr.NotFound("User not found")
 	}
 	step, ok, err := TOTPStep(secret, code, -1, a.nowMs())
 	if err != nil {
@@ -308,13 +308,19 @@ func (a *Auth) UpdateSettings(ctx context.Context, input map[string]any) (Settin
 		return Settings{}, apperr.BadRequest("At least one sign-in method must remain enabled")
 	}
 	if !password {
-		page, err := a.store.List(ctx, "MFA", "")
-		if err != nil {
-			return Settings{}, err
-		}
-		for _, row := range page.Items {
-			if js.Truthy(row.Data["enabled"]) {
-				return Settings{}, apperr.New(http.StatusConflict, "Password sign-in is required for accounts with MFA")
+		// Every page of the MFA partition: one enabled account is enough to refuse.
+		for cursor := ""; ; {
+			page, err := a.store.List(ctx, "MFA", cursor)
+			if err != nil {
+				return Settings{}, err
+			}
+			for _, row := range page.Items {
+				if js.Truthy(row.Data["enabled"]) {
+					return Settings{}, apperr.New(http.StatusConflict, "Password sign-in is required for accounts with MFA")
+				}
+			}
+			if cursor = page.Cursor; cursor == "" {
+				break
 			}
 		}
 	}
