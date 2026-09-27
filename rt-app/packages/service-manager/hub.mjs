@@ -11,13 +11,14 @@ import {adminFor} from './admins.mjs';
 import {TerraformRunner,findStacks} from './terraform.mjs';
 import {ContractRunner,findConfigs,describe as describeContracts} from './contracts.mjs';
 import {createHash as hashOf} from 'node:crypto';
+import {spawn as spawnProcess} from 'node:child_process';
 const jobs=new Map();
 import {readFile,writeFile,mkdir,rename,realpath,readdir} from 'node:fs/promises';
 import {homedir} from 'node:os';
 import {join,basename} from 'node:path';
 import {createServer} from 'node:net';
 import {setTimeout as delay} from 'node:timers/promises';
-import {ensureDaemon,request,manifest,bindPorts} from './client.mjs';
+import {ensureDaemon,request,manifest,bindPorts,packageManager} from './client.mjs';
 const defaults={api:4010,admin:5174,spa:5175,ssr:5176};
 const active=s=>['running','starting','waiting'].includes(s.state);
 async function read(path,fallback){try{return JSON.parse(await readFile(path,'utf8'));}catch(e){if(e.code==='ENOENT'&&fallback!==undefined)return fallback;throw e;}}
@@ -39,7 +40,7 @@ async function apply(root,config){
 }
 /** Main-process coordinator. Each project retains its own native daemon; common services have one per user. */
 export class ServiceHub {
- constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine,terraform,contracts}={}){this.home=home;this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();this.terraform=terraform??new TerraformRunner({home});this.contracts=contracts??new ContractRunner({home});}
+ constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine,terraform,contracts,spawn=spawnProcess}={}){this.home=home;this.spawn=spawn;this.installs=new Map();this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();this.terraform=terraform??new TerraformRunner({home});this.contracts=contracts??new ContractRunner({home});}
  exclusive(fn){const job=this.queue.then(fn);this.queue=job.catch(()=>{});return job;}
  async initialize(){await mkdir(this.home,{recursive:true,mode:0o700});this.registry=await read(join(this.home,'projects.json'),[]);this.global=await read(join(this.home,'settings.json'),{version:1,ports:{smtp:1025,mail:8025},extra:[]});validatePorts(this.global.ports);}
  async select(root){return this.exclusive(async()=>{
@@ -59,13 +60,15 @@ export class ServiceHub {
    validatePorts(ports);settings.local={...settings.local,ports};await save(join(root,'rt-app.settings.json'),settings);
    this.registry.push({path:root,name:pkg.name??basename(root)});await save(join(this.home,'projects.json'),this.registry);
   }
-  this.root=root;
+  const previous=this.root;this.root=root;
+  try{
   // The command belongs to the framework, but its cache/database belong to the global directory.
   this.global.mailCommand??=['node',packageFile('@gsalgadotoledo/rt-app-cli','bin/rta.mjs',root),'mail'];
   await save(join(this.home,'settings.json'),this.global);
   const globalConfig=this.globalManifest();const globalDaemon=await ensureDaemon(this.home,{binary:this.options.binary,config:globalConfig});
   if(!globalDaemon.started&&JSON.stringify(await read(join(this.home,'.rt-app/services.json')))!==JSON.stringify(globalConfig))await apply(this.home,globalConfig);
   await this.ensureProject(root);
+  }catch(error){this.root=previous;throw error;}
   return this.snapshot();
  });}
  globalManifest(){const {smtp,mail}=this.global.ports;return {services:[...(this.global.mailCommand?[{id:'mail',label:'Mailpit · shared email',cwd:'.',command:this.global.mailCommand,env:{RT_APP_MAIL_SMTP_PORT:String(smtp),RT_APP_MAIL_UI_PORT:String(mail)},ports:[smtp,mail],url:`http://localhost:${mail}`,readyUrl:`http://localhost:${mail}/readyz`,dependencies:[]}]:[]),...(this.global.extra??[]).map(bindPorts)]};}
@@ -86,7 +89,7 @@ export class ServiceHub {
  async projectManifest(root,settings){return manifest(root,{...this.options,sharedMail:this.global.ports,sharedEnv:Object.fromEntries((this.global.extra??[]).flatMap(s=>(s.portEnv??[]).map((key,i)=>[key,String(s.ports[i])]))),settings});}
  async ensureProject(root){const config=await this.isGeneric(root)?genericManifest((await this.genericConfig(root)).services):await this.projectManifest(root);const {started}=await ensureDaemon(root,{binary:this.options.binary,config});if(!started){const current=await read(join(root,'.rt-app/services.json'));if(JSON.stringify(current)!==JSON.stringify(config))await apply(root,config);}}
  async snapshot(){
-  if(!this.root)return {project:'',services:[],projects:await this.projects(),catalog:[]};
+  if(!this.root)return {project:'',services:[],projects:await this.withActivity(await this.projects()),catalog:[]};
   this.global=await read(join(this.home,'settings.json'),this.global);this.registry=await read(join(this.home,'projects.json'),this.registry);
   const [project,global]=await Promise.all([request(this.root,'status'),request(this.home,'status')]);
   const settings=await read(join(this.root,'rt-app.settings.json'),{});
@@ -96,7 +99,42 @@ export class ServiceHub {
   const installed=this.global.catalogTools??[];const pgweb=global.services.find(s=>s.id==='pgweb'&&s.state==='running');
   const globalConfig=await read(join(this.home,'.rt-app/services.json'),{services:[]});
   const runtime=(s,list,backend)=>runtimeLabel(list.find(spec=>spec.id===s.id)??s,backend);
-  return {...project,catalog:catalog.map(t=>({...t,installed:(this.global.catalogTools??[]).includes(t.id),job:jobs.get(t.id)})),projects:await this.projects(),globalPorts:{...this.global.ports,...extraPorts(this.global.extra)},projectPorts:detected.kind==='generic'?{}:{...defaults,...settings.local?.ports,...extraPorts(settings.services?.extra)},projectKind:detected.kind,projectRuntimes:detected.runtimes,services:[...global.services.map(s=>({...s,runtime:runtime(s,globalConfig.services),id:`global:${s.id}`,scope:'global',project:'Shared across projects',background:background.has(agentLabel(this.home,s.id)),admin:adminFor({...(globalConfig.services.find(spec=>spec.id===s.id)??{}),...s},{installed,running:pgweb?{pgweb:pgweb.url}:{}})})),...project.services.map(s=>({...s,runtime:runtime(s,config.services,settings.backend),scope:'project',project:this.registry.find(p=>p.path===this.root)?.name??basename(this.root),background:background.has(agentLabel(this.root,s.id))}))]};
+  return {...project,catalog:catalog.map(t=>({...t,installed:(this.global.catalogTools??[]).includes(t.id),job:jobs.get(t.id)})),projects:await this.withActivity(await this.projects(),{[this.root]:project}),globalPorts:{...this.global.ports,...extraPorts(this.global.extra)},projectPorts:detected.kind==='generic'?{}:{...defaults,...settings.local?.ports,...extraPorts(settings.services?.extra)},projectKind:detected.kind,projectRuntimes:detected.runtimes,services:[...global.services.map(s=>({...s,runtime:runtime(s,globalConfig.services),id:`global:${s.id}`,scope:'global',project:'Shared across projects',background:background.has(agentLabel(this.home,s.id)),admin:adminFor({...(globalConfig.services.find(spec=>spec.id===s.id)??{}),...s},{installed,running:pgweb?{pgweb:pgweb.url}:{}})})),...project.services.map(s=>({...s,runtime:runtime(s,config.services,settings.backend),scope:'project',project:this.registry.find(p=>p.path===this.root)?.name??basename(this.root),background:background.has(agentLabel(this.root,s.id))}))]};
+ }
+ /**
+  * Run `<npm|pnpm|yarn> install` in a known project whose dependencies are missing (e.g. created by npx and never
+  * installed). Runs in the background with a bounded log; poll installStatus(path). One run per
+  * project at a time. Resolves immediately with the job; it never throws for the command's exit.
+  */
+ async installDependencies(path){
+  if(typeof path!=='string'||!(await this.projects()).some(p=>p.path===path))throw new Error('Unknown project');
+  const running=this.installs.get(path);
+  if(running?.state==='running')return running;
+  let manager='npm';try{manager=await packageManager(path);}catch{}
+  const args=manager==='npm'?['install','--no-audit','--no-fund']:['install'];
+  const job={path,state:'running',manager,log:[`$ ${manager} ${args.join(' ')}`],startedAt:new Date().toISOString()};
+  this.installs.set(path,job);
+  const append=chunk=>{job.log=[...job.log,...String(chunk).split('\n').filter(line=>line.trim())].slice(-300);};
+  const child=this.spawn(process.platform==='win32'?`${manager}.cmd`:manager,args,{cwd:path,env:process.env,stdio:['ignore','pipe','pipe']});
+  child.stdout?.on('data',append);child.stderr?.on('data',append);
+  child.once('error',error=>{append(error.code==='ENOENT'?`${manager} was not found. Install it (for pnpm: corepack enable) and try again.`:error.message);job.state='failed';job.exitCode=127;});
+  child.once('close',code=>{if(job.state!=='running')return;job.exitCode=code;job.state=code===0?'succeeded':'failed';append(code===0?'Dependencies installed.':`${manager} install failed (exit ${code}).`);});
+  return job;
+ }
+
+ /** Last dependency install of a project, or null. */
+ installStatus(path){return this.installs.get(path)??null;}
+
+ /**
+  * Adds `running` (active service count) to each project. Only supervisors that are already up are
+  * asked; a project whose daemon is not running counts as 0 and nothing is started.
+  */
+ async withActivity(projects,known={}){
+  return Promise.all(projects.map(async p=>{
+   if(p.kind==='missing')return {...p,running:0};
+   const status=known[p.path]??await request(p.path,'status').catch(()=>null);
+   return {...p,running:status?status.services.filter(s=>s.pid&&active(s)).length:0};
+  }));
  }
  /**
   * Projects opened before plus every RT-App project in the workspace folder (one level deep,
@@ -239,6 +277,7 @@ export class ServiceHub {
   return Promise.all(stacks.map(async stack=>({...stack,lastRun:(await this.terraform.history(stack))[0]??null})));
  }
  async terraformStack(id){const stack=(await this.terraformStacks()).find(s=>s.id===id);if(!stack)throw new Error('Unknown Terraform stack');return stack;}
+ async terraformResources(id){return this.terraform.resources(await this.terraformStack(id));}
  async terraformVariables(id){return this.terraform.variables(await this.terraformStack(id));}
  async terraformSetVariables(id,values){const stack=await this.terraformStack(id);for(const [name,value] of Object.entries(values))await this.terraform.setVariable(stack,name,value);return this.terraform.variables(stack);}
  terraformGlobals(){return this.terraform.globals();}

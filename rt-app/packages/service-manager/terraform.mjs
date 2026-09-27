@@ -1,5 +1,5 @@
 import {readdir,readFile,writeFile,mkdir,stat,rm} from 'node:fs/promises';
-import {join,relative} from 'node:path';
+import {join,relative,resolve,sep} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {spawn as spawnProcess} from 'node:child_process';
 
@@ -82,6 +82,93 @@ export async function readVariables(dir){
  return variables;
 }
 
+/** Blank out comments (#, //, block comments) and heredoc bodies, keeping offsets and line numbers intact. */
+function stripComments(text){
+ const out=[...text];let i=0;
+ const blank=(from,to)=>{for(let k=from;k<to;k++)if(out[k]!=='\n')out[k]=' ';};
+ while(i<text.length){
+  const c=text[i];
+  if(c==='"'){i++;while(i<text.length&&text[i]!=='"'&&text[i]!=='\n'){if(text[i]==='\\')i++;i++;}i++;continue;}
+  if(c==='#'||(c==='/'&&text[i+1]==='/')){const end=text.indexOf('\n',i);blank(i,end<0?text.length:end);i=end<0?text.length:end;continue;}
+  if(c==='/'&&text[i+1]==='*'){const end=text.indexOf('*/',i+2);const stop=end<0?text.length:end+2;blank(i,stop);i=stop;continue;}
+  if(c==='<'&&text[i+1]==='<'){const m=text.slice(i).match(/^<<-?([A-Z_]+)\n/);if(m){const close=new RegExp(`\\n\\s*${m[1]}\\s*(\\n|$)`).exec(text.slice(i+m[0].length));const stop=close?i+m[0].length+close.index:text.length;blank(i+m[0].length,stop);i=stop;continue;}}
+  i++;
+ }
+ return out.join('');
+}
+
+/** Brace depth at every offset of comment-free HCL (braces inside strings are ignored). */
+function depths(text){
+ const depth=new Int32Array(text.length+1);let d=0,quote=false;
+ for(let i=0;i<text.length;i++){depth[i]=d;const c=text[i];if(c==='"'&&text[i-1]!=='\\')quote=!quote;else if(!quote){if(c==='{')d++;else if(c==='}')d=Math.max(0,d-1);}}
+ return depth;
+}
+
+/**
+ * References in a block body, relative to its module: resource (type.name), data.type.name and
+ * module.name. They are resolved against the declared addresses once every file has been read.
+ */
+function references(body){
+ const refs=new Set();
+ for(const m of body.matchAll(/(?<![\w.])(data\.[a-z][a-z0-9]*_[a-z0-9_]+\.[A-Za-z_][\w-]*|module\.[A-Za-z_][\w-]*|[a-z][a-z0-9]*_[a-z0-9_]+\.[A-Za-z_][\w-]*)/g))refs.add(m[1]);
+ return [...refs];
+}
+
+const attribute=(body,name)=>body.match(new RegExp(`(?:^|[\\s,{])${name}\\s*=\\s*"((?:[^"\\\\]|\\\\.)*)"`,'m'))?.[1];
+
+/**
+ * Everything a stack declares, for the visual map: resources, data sources, modules, outputs and
+ * providers. Local modules (./ or ../ sources inside `within`) are read too, so resources behind a
+ * module appear with their module address. Nothing is executed and no state is read.
+ */
+export async function readResources(dir,{within=dir,maxDepth=4}={}){
+ const root=resolve(within);
+ const result={items:[],modules:[],providers:[],backend:null,files:0};
+ const providers=new Map();
+ async function visit(folder,address,level,stack){
+  let files;try{files=(await readdir(folder)).filter(f=>f.endsWith('.tf')).sort();}catch{return;}
+  for(const file of files){
+   const raw=await readFile(join(folder,file),'utf8');const text=stripComments(raw);const depth=depths(text);
+   const line=index=>text.slice(0,index).split('\n').length;
+   const where={file:relative(dir,join(folder,file)),module:address.join('.')||null};
+   result.files++;
+   for(const m of text.matchAll(/^[ \t]*(resource|data|module|output|provider|terraform)\b[ \t]*(?:"([^"]+)")?[ \t]*(?:"([^"]+)")?[ \t]*\{/gm)){
+    if(depth[m.index]!==0)continue;
+    const body=block(text,m.index+m[0].length-1);const [,kind,a,b]=m;
+    const prefix=address.length?`module.${address.join('.module.')}.`:'';
+    const multiple=/^\s*(count|for_each)\s*=/m.test(body);
+    const refs=references(body).map(r=>prefix+r);
+    if(kind==='terraform'){
+     const required=body.match(/required_providers\s*\{/);
+     if(required)for(const p of block(body,required.index+required[0].length-1).matchAll(/([A-Za-z][\w-]*)\s*=\s*\{([^}]*)\}/g)){
+      const current=providers.get(p[1])??{name:p[1]};
+      providers.set(p[1],{...current,source:current.source??attribute(p[2],'source')??null,version:current.version??attribute(p[2],'version')??null});
+     }
+     const backend=body.match(/backend\s+"([^"]+)"/);if(backend&&!address.length)result.backend=backend[1];
+    }
+    else if(kind==='provider'&&a){providers.set(a,{name:a,source:null,version:null,...providers.get(a),configured:true});}
+    else if(kind==='output'&&a&&!address.length)result.items.push({kind,type:'output',name:a,address:`output.${a}`,line:line(m.index),...where,sensitive:/^\s*sensitive\s*=\s*true/m.test(body),refs});
+    else if((kind==='resource'||kind==='data')&&a&&b)result.items.push({kind,type:a,name:b,address:`${prefix}${kind==='data'?'data.':''}${a}.${b}`,provider:a.split('_')[0],line:line(m.index),multiple,...where,refs});
+    else if(kind==='module'&&a){
+     const source=attribute(body,'source')??'';const local=/^\.\.?\//.test(source);
+     const path=local?resolve(folder,source):null;
+     const inside=path&&(path===root||path.startsWith(root+sep));
+     const moduleAddress=[...address,a];
+     result.modules.push({name:a,address:`module.${moduleAddress.join('.module.')}`,source,version:attribute(body,'version')??null,local:Boolean(inside),parent:address.join('.')||null,multiple,line:line(m.index),...where,refs});
+     if(inside&&level<maxDepth&&!stack.includes(path))await visit(path,moduleAddress,level+1,[...stack,path]);
+    }
+   }
+  }
+ }
+ await visit(resolve(dir),[],0,[resolve(dir)]);
+ // Keep only references to declared blocks (drops var./local./path. lookalikes and attributes).
+ const declared=new Set([...result.items,...result.modules].map(i=>i.address));
+ for(const node of [...result.items,...result.modules])node.refs=node.refs.filter(r=>declared.has(r)&&r!==node.address);
+ for(const item of result.items)if(item.provider&&!providers.has(item.provider))providers.set(item.provider,{name:item.provider,source:null,version:null});
+ result.providers=[...providers.values()].map(p=>({name:p.name,source:p.source??null,version:p.version??null,configured:Boolean(p.configured),resources:result.items.filter(i=>i.provider===p.name&&i.kind==='resource').length}));
+ return result;
+}
+
 /** Terraform errors in command output: summary, file and line when present. */
 export function parseErrors(output){
  const errors=[];const lines=output.split('\n');
@@ -110,6 +197,9 @@ export class TerraformRunner {
   if(value)data.env[key]=String(value);else delete data.env[key];
   await this.writeJson(join(this.home,'global.json'),data);
  }
+
+ /** What the stack declares (see readResources); modules are followed only inside the project. */
+ resources(stack){return readResources(stack.path,{within:stack.projectPath??stack.path});}
 
  /** Variables of a stack with whether each has a value (secrets are never returned). */
  async variables(stack){

@@ -95,7 +95,7 @@ test('workspace projects are listed without opening them; registered ones keep t
  assert.deepEqual(await hub.projects(),[beta,{path:join(ws,'alpha-app'),name:'alpha-app',kind:'rt-app',runtimes:['node'],discovered:true},{path:join(ws,'old-app'),name:'old-app',kind:'generic',runtimes:['node'],discovered:true}],'a folder with only package.json is a generic Node project');
  await writeFile(join(home,'workspace.json'),JSON.stringify({path:join(ws,'missing')}));
  assert.equal((await hub.projects()).length,1);
- assert.deepEqual((await hub.snapshot()).projects,[beta]);
+ assert.deepEqual((await hub.snapshot()).projects,[{...beta,running:0}],'snapshot adds the running service count; no supervisor → 0');
 });
 
 test('deleteProject forgets a known project and refuses unknown paths',async t=>{

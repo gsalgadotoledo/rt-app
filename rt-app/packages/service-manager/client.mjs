@@ -25,6 +25,62 @@ export function bindPorts(service) {
  const env={...service.env,...Object.fromEntries(bindings.map((key,i)=>[key,String(service.ports[i])]))};
  return {...service,env,command:service.command.map(arg=>arg.replace(/^\$\{([A-Z][A-Z0-9_]*)\}$/,(_match,key)=>{if(env[key]===undefined)throw new Error(`Missing command variable ${key}`);return env[key];}))};
 }
+/**
+ * Package manager a JavaScript project uses: pnpm or yarn when declared (packageManager field) or
+ * when their lock/workspace files exist, npm otherwise.
+ * @example await packageManager('/work/app') // → 'pnpm' when pnpm-workspace.yaml is present
+ */
+export async function packageManager(root,pkg){
+ pkg??=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
+ const declared=String(pkg.packageManager??'').split('@')[0];
+ if(['npm','pnpm','yarn'].includes(declared))return declared;
+ const has=async name=>{try{await access(join(root,name));return true;}catch{return false;}};
+ if(await has('pnpm-workspace.yaml')||await has('pnpm-lock.yaml'))return 'pnpm';
+ if(await has('yarn.lock'))return 'yarn';
+ return 'npm';
+}
+
+/** Workspace globs from package.json (npm/yarn) or pnpm-workspace.yaml's `packages:` list. */
+async function workspacePatterns(root,pkg,manager){
+ if(manager==='pnpm'){
+  try{
+   const yaml=await readFile(join(root,'pnpm-workspace.yaml'),'utf8');
+   const block=yaml.match(/^packages:\s*\n((?:[ \t]*-.*\n?|[ \t]*#.*\n?|[ \t]*\n)+)/m)?.[1]??'';
+   return [...block.matchAll(/^[ \t]*-[ \t]*['"]?([^'"#\n]+?)['"]?[ \t]*(?:#.*)?$/gm)].map(m=>m[1].trim());
+  }catch{return [];}
+ }
+ return Array.isArray(pkg.workspaces)?pkg.workspaces:pkg.workspaces?.packages??[];
+}
+
+/**
+ * Workspaces of a project as [{name, scripts, location}]. npm answers `npm query .workspace`; pnpm
+ * and yarn workspaces are read from their globs (only `*` segments, which is what RT-App uses), so
+ * nothing is executed for them.
+ */
+export async function listWorkspaces(root,{pkg,manager}={}){
+ pkg??=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
+ manager??=await packageManager(root,pkg);
+ if(manager==='npm'){const {stdout}=await promisify(execFile)('npm',['query','.workspace','--json'],{cwd:root});return JSON.parse(stdout);}
+ const {readdir}=await import('node:fs/promises');
+ const found=[];
+ async function expand(dir,parts){
+  if(!parts.length){try{const w=JSON.parse(await readFile(join(dir,'package.json'),'utf8'));if(w.name)found.push({name:w.name,scripts:w.scripts??{},location:dir.slice(root.length+1)});}catch{}return;}
+  const [head,...rest]=parts;
+  if(head==='*'){let entries=[];try{entries=await readdir(dir,{withFileTypes:true});}catch{}for(const e of entries)if(e.isDirectory()&&e.name!=='node_modules'&&!e.name.startsWith('.'))await expand(join(dir,e.name),rest);}
+  else await expand(join(dir,head),rest);
+ }
+ for(const pattern of await workspacePatterns(root,pkg,manager))if(!pattern.startsWith('!'))await expand(root,pattern.replace(/^\.\//,'').replace(/\/$/,'').split('/'));
+ return found.filter((w,i)=>found.findIndex(o=>o.name===w.name)===i);
+}
+
+/** Command that runs a package script, at the root or in one workspace, with the project's manager. */
+export function scriptCommand(manager,script,workspace){
+ if(!workspace)return [manager,'run',script];
+ if(manager==='pnpm')return ['pnpm','--filter',workspace,'run',script];
+ if(manager==='yarn')return ['yarn','workspace',workspace,'run',script];
+ return ['npm','run',script,'--workspace',workspace];
+}
+
 export async function manifest(root,{noBuild=false,noMail=false,sharedMail,sharedEnv={},settings:providedSettings}={}) {
  const pkg=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
  const settings=providedSettings??JSON.parse(await readFile(join(root,'rt-app.settings.json'),'utf8'));
@@ -36,21 +92,21 @@ export async function manifest(root,{noBuild=false,noMail=false,sharedMail,share
  const credentials=['ADMIN_PASSWORD','DEMO_PASSWORD','RT_APP_JSON_FILE','ENABLE_TASKS','AWS_PROFILE','AWS_REGION','AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','AWS_SESSION_TOKEN','RT_APP_AWS_APP','OBSERVER_EMAIL_TRANSPORT','OBSERVER_EMAIL_FROM','OBSERVER_EMAIL_TO','OBSERVER_SMS_TO','OBSERVER_LOG_GROUP','OBSERVER_LOG_STREAM','SUBSCRIPTIONS_PROVIDER','STRIPE_SECRET_KEY','STRIPE_WEBHOOK_SECRET','STRIPE_PUBLISHABLE_KEY'];
  const services=[];
  if(settings.services?.defaults!==false){
-  const {stdout}=await promisify(execFile)('npm',['query','.workspace','--json'],{cwd:root});
-  const workspaces=JSON.parse(stdout);
-  if(!noBuild)services.push({id:'build',label:'Build workspace',kind:'task',command:['npm','run','build'],cwd:'.',env:shared,ports:[],dependencies:[]});
+  const manager=await packageManager(root,pkg);
+  const workspaces=await listWorkspaces(root,{pkg,manager});
+  if(!noBuild)services.push({id:'build',label:'Build workspace',kind:'task',command:scriptCommand(manager,'build'),cwd:'.',env:shared,ports:[],dependencies:[]});
   if(!noMail&&!sharedMail)services.push({id:'mail',label:'Mailpit · local email',command:[process.env.RT_APP_NODE_BINARY??'node', packageFile('@gsalgadotoledo/rt-app-cli','bin/rta.mjs',root),'mail'],cwd:'.',env:shared,ports:[1025,8025],url:'http://127.0.0.1:8025',readyUrl:'http://127.0.0.1:8025/readyz',dependencies:[]});
-  if(nativeBackend)services.push({id:'core-api',label:'RT-App core · Node',command:['npm','run','dev','--workspace','@gsalgadotoledo/rt-app-server'],cwd:'.',env:{...shared,PORT:String(corePort),RT_APP_MAIL_TRANSPORT:noMail?'memory':'smtp',RT_APP_MAIL_SMTP_PORT:String(sharedMail?.smtp??1025)},inheritEnv:credentials,ports:[corePort],url:`http://localhost:${corePort}`,readyUrl:`http://localhost:${corePort}/`,dependencies:[...(!noBuild?['build']:[]),...(!noMail&&!sharedMail?['mail']:[])]});
+  if(nativeBackend)services.push({id:'core-api',label:'RT-App core · Node',command:scriptCommand(manager,'dev','@gsalgadotoledo/rt-app-server'),cwd:'.',env:{...shared,PORT:String(corePort),RT_APP_MAIL_TRANSPORT:noMail?'memory':'smtp',RT_APP_MAIL_SMTP_PORT:String(sharedMail?.smtp??1025)},inheritEnv:credentials,ports:[corePort],url:`http://localhost:${corePort}`,readyUrl:`http://localhost:${corePort}/`,dependencies:[...(!noBuild?['build']:[]),...(!noMail&&!sharedMail?['mail']:[])]});
   for(const role of ['backend','admin','spa','ssr']){
    const workspace=pkg.rtApp?.[role];if(!workspace)continue;
    if (role==='admin' && !workspaces.some(w=>w.name===workspace)) {
     services.push({id:'admin',label:'Admin',command:[process.env.RT_APP_NODE_BINARY??'node',packageFile('@gsalgadotoledo/rt-app-cli','bin/rta.mjs',root),'admin'],cwd:'.',env:shared,ports:[Number(new URL(urls.admin).port)],url:urls.admin,readyUrl:urls.admin+'/',dependencies:[...(!noBuild?['build']:[]),'api']});
     continue;
    }
-   const entry=workspaces.find(w=>w.name===workspace);if(!entry)throw new Error(`Missing workspace ${workspace}; run npm install`);
+   const entry=workspaces.find(w=>w.name===workspace);if(!entry)throw new Error(`Missing workspace ${workspace}; run ${manager} install`);
    const script=entry.scripts?.dev?'dev':'start';if(!entry.scripts?.[script])throw new Error(`No dev/start script for ${workspace}`);
    const id=role==='backend'?'api':role,url=urls[id];
-   services.push({id,label:{api:nativeBackend?`API · ${settings.backend}`:'API · Node TS',admin:'Admin',spa:'React SPA',ssr:'Next.js SSR'}[id],command:['npm','run',script,'--workspace',workspace],cwd:'.',env:{...shared,PORT:new URL(urls.api).port,...(nativeBackend&&role==='backend'?{RT_APP_CORE_API_URL:`http://127.0.0.1:${corePort}`} : {}),RT_APP_MAIL_TRANSPORT:noMail?'memory':'smtp',RT_APP_MAIL_SMTP_PORT:String(sharedMail?.smtp??1025)},inheritEnv:role==='backend'&&!nativeBackend?credentials:[],ports:[Number(new URL(url).port)],url,readyUrl:url+'/',dependencies:[...(!noBuild?['build']:[]),...(role==='backend'?(nativeBackend?['core-api']:(!noMail&&!sharedMail?['mail']:[])):['api'])]});
+   services.push({id,label:{api:nativeBackend?`API · ${settings.backend}`:'API · Node TS',admin:'Admin',spa:'React SPA',ssr:'Next.js SSR'}[id],command:scriptCommand(manager,script,workspace),cwd:'.',env:{...shared,PORT:new URL(urls.api).port,...(nativeBackend&&role==='backend'?{RT_APP_CORE_API_URL:`http://127.0.0.1:${corePort}`} : {}),RT_APP_MAIL_TRANSPORT:noMail?'memory':'smtp',RT_APP_MAIL_SMTP_PORT:String(sharedMail?.smtp??1025)},inheritEnv:role==='backend'&&!nativeBackend?credentials:[],ports:[Number(new URL(url).port)],url,readyUrl:url+'/',dependencies:[...(!noBuild?['build']:[]),...(role==='backend'?(nativeBackend?['core-api']:(!noMail&&!sharedMail?['mail']:[])):['api'])]});
   }
  }
  for(const service of settings.services?.extra??[])services.push(bindPorts({...service,env:{...shared,...service.env}}));
