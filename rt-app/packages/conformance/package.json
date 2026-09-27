@@ -1,6 +1,6 @@
 {
   "name": "@gsalgadotoledo/rt-app-conformance",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Language-neutral contracts for RT-App modules: YAML/JSON cases with inputs, outputs and errors, an HTTP host protocol and a runner that checks every language implementation.",
   "type": "module",
   "main": "./dist/index.js",
