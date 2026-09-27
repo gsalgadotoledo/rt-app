@@ -429,3 +429,16 @@ body.rt-resizing{cursor:col-resize;user-select:none}
 .rt-install-spinner{width:16px;height:16px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:rt-spin .8s linear infinite}
 .rt-services .rt-install-deps .rt-primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
 .rt-install-deps-log{max-height:180px;overflow:auto;margin:10px 0 0;padding:8px 10px;font-size:10.5px;line-height:1.5;color:var(--muted);background:var(--bg);border:1px solid var(--line);border-radius:8px;white-space:pre-wrap}
+
+/* ── Pinned projects ────────────────────────────────────────────────────────────────────── */
+.rt-project-item{position:relative}
+.rt-project-group{margin:8px 12px 3px;font-size:9.5px;letter-spacing:1.4px;color:var(--muted)}
+.rt-project-group:first-child{margin-top:0}
+.rt-services .rt-project-list .rt-project-item .rt-project-open{padding-right:34px}
+.rt-services .rt-project-list .rt-project-item button.rt-pin{position:absolute;top:8px;right:6px;display:grid;place-items:center;width:24px;height:24px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--muted);opacity:0;transition:opacity .12s}
+.rt-services .rt-project-list .rt-project-item:hover button.rt-pin,.rt-services .rt-project-list .rt-project-item button.rt-pin:focus-visible,.rt-services .rt-project-list .rt-project-item.pinned button.rt-pin{opacity:1}
+.rt-services .rt-project-list .rt-project-item button.rt-pin:hover{color:var(--text);background:var(--hover)}
+.rt-services .rt-project-list .rt-project-item.pinned button.rt-pin{color:var(--accent)}
+.rt-project-item:has(.rt-running-badge) .rt-project-open strong{padding-right:0}
+.rt-services .rt-project-list .rt-project-item .rt-running-badge{margin-right:2px}
+@media(max-width:700px){.rt-project-item{flex-shrink:0}.rt-project-group{display:none}}
