@@ -56,3 +56,12 @@ Upgrading the framework becomes `npm update`, with no merges of copied code. An 
 - Host the admin in portable deployments (today it is published by the AWS pipeline).
 - Files role outside AWS: S3-compatible stores (Cloudflare R2, DigitalOcean Spaces) through the same adapter.
 - Public database URLs when the API and the database run on different providers (Railway Public Access).
+
+## Pending: refresh sessions (0.3.0)
+
+Sessions with refresh tokens ship in 0.3.0 in TypeScript, Python and Go (`docs/polyglot/auth-sessions.md`). Still open:
+
+- The local installer keeps stateless 15-minute root tokens: the setup wizard asks to sign in again during long installs.
+- Session-management UI (list and revoke your sessions) in the shared SecurityPanel; the API already exists.
+- Build and run the SSR starter (Next.js) end to end with the session client.
+- Decide whether the SPA should use `localStorage` to stay signed in across browser restarts (XSS trade-off in `docs/authentication.md`).
