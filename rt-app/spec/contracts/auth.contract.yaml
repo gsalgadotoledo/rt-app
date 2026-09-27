@@ -21,7 +21,10 @@ description: |
     requestEmailChange: email-change-ip:<ip> 10, email-change:<id> 3
     confirmEmailChange: email-confirm:<id> 8, email-confirm-ip:<ip> 20
 
-  Sessions: {token: jwt.issue(user), expiresIn: 900, user: users view}.
+  Sessions: {token, expiresIn: 900, refreshToken, refreshExpiresAt, sessionId, user: users view};
+  every sign-in starts a refresh session and token carries its sid (rows, refresh, logout and the
+  session list: auth-sessions.contract.yaml). login, consume, verifyMfa and confirmEmailChange take
+  an optional trailing userAgent (stored on the session only).
   login(email, password, ip): 403 "Password sign-in is disabled" when settings disable it; rate
   limits; password verified against the stored hash, or against the dummy hash
   "scrypt$" + "0"*32 + "$" + "00"*64 when the user is missing (constant work); missing, inactive or
@@ -50,7 +53,8 @@ description: |
   actor(header): no header or "" → null; not starting with "Bearer " (case-sensitive, one
   space) → 401 "Invalid token"; jwt.verify(rest) (401 "Invalid or expired session"); user missing,
   inactive, tokenVersion != v, or credentialProvider (default "local") != "local" → 401
-  "Invalid session"; else {id, email, name, role, grants, tokenVersion, active}.
+  "Invalid session"; a sid claim also needs a live session (auth-sessions); else {id, email, name,
+  role, grants, tokenVersion, active} (+ sessionId for tokens with sid).
 
   Settings: SETTINGS/auth. settings() → {version (0 when absent), values (row data, or
   {passwordLogin: true, emailCodeLogin: true}), fields: [...]}. updateSettings({version, values}):
@@ -91,8 +95,9 @@ description: |
   atomically: challenge used, user email + tokenVersion+1, old EMAIL row deleted, new EMAIL row
   created → session.
 
-  Subject facade "auth": init {secret, now, rows}. Auth methods as above (null for optional
-  arguments) plus helpers: mailbox() → sent messages newest first [{email, code, purpose}];
+  Subject facade "auth": init {secret, now, rows, sessionTtlMs?}. Auth methods as above (null for
+  optional arguments), the session methods refresh, sessions, revokeSession and logout
+  (auth-sessions.contract.yaml), plus helpers: mailbox() → sent messages newest first [{email, code, purpose}];
   row(pk, sk) → raw row|null; setNow(iso) → null (moves the shared clock); totpCode(secret, step)
   → 6-digit code; unseal(sealed) → the decrypted JSON value.
 subject: auth
@@ -115,7 +120,7 @@ cases:
     tags: [ interop, determinism ]
     call: login
     args: [ alice@example.test, correct horse battery, 1.1.1.1 ]
-    expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo, expiresIn: 900, user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+    expect: { value: { token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }, expiresIn: 900, refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }, refreshExpiresAt: "2026-01-06T03:04:05.000Z", sessionId: { $regex: "^[A-Za-z0-9_-]{22}$" }, user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
 
   - name: a session token identifies the actor
     steps:
@@ -255,7 +260,7 @@ cases:
         args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ]
         expect: { value: { pk: CHALLENGE, sk: b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61, version: 1, ttl: 1767323645, data: { userId: u-alice, hash: { $regex: "^[0-9a-f]{64}$" }, attempts: 0, used: false, expires: 1767323645000, tokenVersion: 1 } } }
         note: "sk = HMAC(secret, 'login:alice@example.test')"
-      - { call: consume, args: [ alice@example.test, { $ref: "1.value[0].code" }, login, 1.1.1.1 ], expect: { value: { token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo", expiresIn: 900, user: { $partial: { id: u-alice } } } } }
+      - { call: consume, args: [ alice@example.test, { $ref: "1.value[0].code" }, login, 1.1.1.1 ], expect: { value: { token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }, expiresIn: 900, refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }, refreshExpiresAt: "2026-01-06T03:04:05.000Z", sessionId: { $regex: "^[A-Za-z0-9_-]{22}$" }, user: { $partial: { id: u-alice } } } } }
       - { call: consume, args: [ alice@example.test, { $ref: "1.value[0].code" }, login, 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired code } }, note: codes are single-use }
       - { call: row, args: [ CHALLENGE, b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61 ], expect: { value: { $partial: { version: 2, data: { $partial: { used: true, attempts: 0 } } } } } }
 
@@ -270,7 +275,7 @@ cases:
         - { pk: CHALLENGE, sk: b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61, version: 1, ttl: 1767323645, data: { userId: u-alice, hash: 397475ca4d5d6aa2161d4364750e1d865832329fa3b5314ca170ea648685bdc0, attempts: 0, used: false, expires: 1767323645000, tokenVersion: 1 } }
     call: consume
     args: [ alice@example.test, "123456", login, 1.1.1.1 ]
-    expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo, expiresIn: 900, user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+    expect: { value: { token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }, expiresIn: 900, refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }, refreshExpiresAt: "2026-01-06T03:04:05.000Z", sessionId: { $regex: "^[A-Za-z0-9_-]{22}$" }, user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
 
   - name: codes are six ASCII digits
     tags: [ validation, unicode ]
@@ -439,7 +444,7 @@ cases:
       - { call: login, args: [ bob@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { challenge: totp, challengeId: { $type: string } } } }
       - call: verifyMfa
         args: [ { $ref: "0.value.challengeId" }, "652348", 1.1.1.1 ]
-        expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWJvYiIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.X7w12JG1kbuSSLwbKfSRngvuVBY3MGL8W7Z9NefiVH4, expiresIn: 900, user: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: null, updatedBy: null, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+        expect: { value: { token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }, expiresIn: 900, refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }, refreshExpiresAt: "2026-01-06T03:04:05.000Z", sessionId: { $regex: "^[A-Za-z0-9_-]{22}$" }, user: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: null, updatedBy: null, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
       - { call: row, args: [ MFA, u-bob ], expect: { value: { $partial: { version: 2, data: { $partial: { lastStep: 58910768, enabled: true } } } } } }
       - { call: verifyMfa, args: [ { $ref: "0.value.challengeId" }, "751330", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid or expired challenge } }, note: challenges are single-use }
 
@@ -478,7 +483,7 @@ cases:
       - call: verifyMfa
         args: [ flow-bob, { $ref: "1.value" }, 1.1.1.1 ]
         note: the challenge's sealed value and the MFA seed were sealed with fixed IVs
-        expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWJvYiIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMzNDUsImV4cCI6MTc2NzMyNDI0NX0.cfHw78q8WQ-EBU3vkfhjWUFhnAxhTjSickznsgd70XE, expiresIn: 900, user: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: null, updatedBy: null, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+        expect: { value: { token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }, expiresIn: 900, refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }, refreshExpiresAt: "2026-01-06T03:09:05.000Z", sessionId: { $regex: "^[A-Za-z0-9_-]{22}$" }, user: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: null, updatedBy: null, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
       - { call: row, args: [ AUTH_FLOW, flow-bob ], expect: { value: { $partial: { version: 2, data: { $partial: { used: true } } } } } }
 
   - name: pending challenges expire after five minutes
@@ -598,7 +603,7 @@ cases:
       - { call: confirmEmailChange, args: [ u-alice, "00000", 1.1.1.1 ], expect: { error: { status: 400, message: Invalid code } } }
       - call: confirmEmailChange
         args: [ u-alice, { $ref: "1.value[0].code" }, 1.1.1.1 ]
-        expect: { value: { token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoyLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.25yx92DtscQ0gMevmtUSdXkRBB8qnmJjyQNVhYD9KdI, expiresIn: 900, user: { id: u-alice, email: new@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
+        expect: { value: { token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoyLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }, expiresIn: 900, refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }, refreshExpiresAt: "2026-01-06T03:04:05.000Z", sessionId: { $regex: "^[A-Za-z0-9_-]{22}$" }, user: { id: u-alice, email: new@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null } } }
       - { call: row, args: [ EMAIL, alice@example.test ], expect: { value: null } }
       - { call: row, args: [ EMAIL, new@example.test ], expect: { value: { pk: EMAIL, sk: new@example.test, version: 1, data: { id: u-alice } } } }
       - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 2, data: { $partial: { email: new@example.test, tokenVersion: 2 } } } } } }

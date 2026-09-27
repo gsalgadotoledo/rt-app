@@ -28,6 +28,8 @@ export interface Actor {
   grants: string[];
   tokenVersion: number;
   active: boolean;
+  /** Refresh session behind the access token (its `sid` claim); absent for tokens without one. */
+  sessionId?: string;
 }
 export interface Request {
   rawBody?: string;

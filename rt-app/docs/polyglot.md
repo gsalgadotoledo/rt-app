@@ -33,6 +33,8 @@ See `rt-app/packages/conformance/src/contract.ts` and `values.ts`.
   - `$ref: "0.value.cursor"` reads the result of an earlier step.
   - `$repeat: {count, start, item}` builds a list, with `{i}` and `{i:03}` for the index.
   - `$text: {repeat, count}` builds a long string.
+  - `$concat: [a, b, …]` joins strings after expanding them (`["Bearer ", {$ref: "0.value.token"}]`).
+  - In `kind: http` requests, `{{0.body.id}}` works in paths (URL-encoded) and header values (as is).
 - **Wire values:**
   - JSON, plus tagged `{"$date"}`, `{"$bytes"}` and `{"$bigint"}`.
   - `null` stands for undefined, None and nil alike.
@@ -189,6 +191,9 @@ contract.
 
 ## Identity contracts: jwt, users, acl and auth
 
+Refresh sessions (rotating refresh tokens, `SESSIONS#<userId>` rows, `/auth/refresh`,
+`/auth/sessions`): `docs/polyglot/auth-sessions.md` and `spec/contracts/auth-sessions*.contract.yaml`.
+
 Contracts: `spec/contracts/{jwt,users,acl,auth}.contract.yaml`. Node host:
 `spec/hosts/node/identity.mjs`. The contract descriptions hold the full algorithms (claim rules,
 validation order, hash, HMAC and vault formats, rate-limit keys); this section lists what a port has
@@ -201,7 +206,7 @@ milliseconds or a Date; the system clock when omitted):
 - `new JwtTokens(secret, issuer?, audience?, {now})`
 - `new Users(store, credentials?, {now})`
 - `new ACL(store, resources, {now})`
-- `new Auth(users, tokens, mailer, secret, provider?, {now})`
+- `new Auth(users, tokens, mailer, secret, provider?, {now, sessionTtlMs?, refreshGraceMs?})`
 - `totpStep(secret, code, last?, nowMs?)`
 
 The audit helpers (`auditCreate`, `auditUpdate`, `auditDelete`, `auditRestore`) take an optional
@@ -212,7 +217,7 @@ The audit helpers (`auditCreate`, `auditUpdate`, `auditDelete`, `auditRestore`) 
 | `jwt` | `{secret, issuer?, audience?, now}` | `issue(user)`, `verify(token)` | `setNow(iso)` → null |
 | `users` | `{rows, now}` (rows seed a MemoryStore) | `get(id)`, `byEmail(email)`, `create(input, role?, actor?)`, `bootstrapOwner(input)`, `profile(id, input, actor?)` | `validatePassword(p)` → null, `hashPassword(p)`, `verifyPassword(p, stored)`, `row(pk, sk)` |
 | `acl` | `{rows, resources, now}` (resources are the registered endpoints) | `allows(actor, resource)`, `check(endpoint, actor)` → null | `resources(query)` (GET /acl/resources handler), `assign(id, body, actor)` (PUT /acl/users/:id handler), `row(pk, sk)` |
-| `auth` | `{secret, now, rows}` | `login`, `issue`, `consume`, `actor`, `limit` → null, `settings`, `updateSettings`, `hasMfa`, `setupMfa`, `enableMfa`, `verifyMfa`, `resetMfa`, `requestEmailChange`, `confirmEmailChange` | `mailbox()`, `row(pk, sk)`, `setNow(iso)`, `totpCode(secret, step)`, `unseal(sealed)` |
+| `auth` | `{secret, now, rows, sessionTtlMs?}` | `login`, `issue`, `consume`, `actor`, `limit` → null, `settings`, `updateSettings`, `hasMfa`, `setupMfa`, `enableMfa`, `verifyMfa`, `resetMfa`, `requestEmailChange`, `confirmEmailChange`, `refresh`, `sessions`, `revokeSession`, `logout` | `mailbox()`, `row(pk, sk)`, `setNow(iso)`, `totpCode(secret, step)`, `unseal(sealed)` |
 
 **Helper details:**
 
@@ -233,8 +238,8 @@ The audit helpers (`auditCreate`, `auditUpdate`, `auditDelete`, `auditRestore`) 
 
 - **JWT:**
   - The key is the UTF-8 secret, which needs at least 32 bytes.
-  - Payload key order is `v, sub, iss, aud, iat, exp`, so tokens are byte-identical across
-    languages.
+  - Payload key order is `v, sub, iss, aud, iat, exp` (`v, sid, sub, …` for session tokens), so
+    tokens are byte-identical across languages.
   - `exp <= now` is expired, with no leeway.
   - A future `iat` is accepted; `nbf` is honored.
   - `aud` may be an array.

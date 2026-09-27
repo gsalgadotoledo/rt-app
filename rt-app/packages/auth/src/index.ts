@@ -3,6 +3,10 @@ import {AuthVault, totpSecret, totpStep} from './totp.js';
 export type { IdentityProvider } from './provider.js';
 import type { NoSQL as Store } from "@gsalgadotoledo/rt-app-nosql";
 import { migrations } from "./migrations.js";
+import { rateLimit } from "./limits.js";
+import { RefreshSessions, sessionLive, parseRefreshToken, INVALID_REFRESH, type SessionClient } from "./sessions.js";
+export * from "./sessions.js";
+export { rateLimit } from "./limits.js";
 import { createHmac, randomInt, timingSafeEqual, randomUUID } from "node:crypto";
 import { SESv2Client, SendEmailCommand } from "@aws-sdk/client-sesv2";
 import {
@@ -10,6 +14,7 @@ import {
   type Row,
   HttpError,
   Conflict,
+  type Actor,
   emailAddress,
   publicUser,
   viewUser,
@@ -67,7 +72,17 @@ export interface AuthOptions {
    * TOTP steps; defaults to the system clock. Pass the same clock to JwtTokens.
    */
   now?: Clock;
+  /** Absolute refresh-session lifetime from sign-in in ms (default 4 days). */
+  sessionTtlMs?: number;
+  /** Grace window for reusing the previous refresh token in ms (default 30 s). */
+  refreshGraceMs?: number;
 }
+/** The User-Agent request header when it is a single string. */
+function userAgent(request: { headers: Record<string, unknown> }) {
+  const value = request.headers["user-agent"];
+  return typeof value === "string" ? value : undefined;
+}
+
 export class Auth {
   constructor(
     private users: Users,
@@ -76,7 +91,17 @@ export class Auth {
     private secret: string,
     private provider?: IdentityProvider,
     private options: AuthOptions = {},
-  ) {}
+  ) {
+    this.refreshSessions = new RefreshSessions(users.store, secret, {
+      now: options.now,
+      ttlMs: options.sessionTtlMs,
+      graceMs: options.refreshGraceMs,
+    });
+  }
+
+  /** Refresh sessions (rows SESSIONS#<userId>/<sessionId> and SESSION/<sessionId>). */
+  readonly refreshSessions: RefreshSessions;
+
   private now() {
     return epochMs(this.options.now);
   }
@@ -87,51 +112,139 @@ export class Auth {
   private digest(value: string) {
     return createHmac("sha256", this.secret).update(value).digest("hex");
   }
+  /** Count one attempt for key in the current minute; 429 when max is reached (see limits.ts). */
   async limit(key: string, max: number) {
-    const window = Math.floor(this.now() / 60000);
-    const sk = this.digest(`${key}:${window}`);
-    for (let i = 0; i < 8; i++) {
-      const row = await this.store.get("RATE", sk);
-      if ((row?.data.count ?? 0) >= max)
-        throw new HttpError(429, "Too many attempts; wait one minute");
-      try {
-        await this.store.transact([
-          {
-            row: {
-              pk: "RATE",
-              sk,
-              version: (row?.version ?? 0) + 1,
-              data: { count: (row?.data.count ?? 0) + 1 },
-              ttl: Math.floor(this.now() / 1000) + 120,
-            },
-            expected: row?.version ?? null,
-          },
-        ]);
-        return;
-      } catch (e) {
-        if (!(e instanceof Conflict)) throw e;
-      }
-    }
-    throw new HttpError(429, "Too many simultaneous attempts");
+    await rateLimit(this.store, this.secret, this.now(), key, max);
   }
-  async actor(header?: string) {
+
+  /**
+   * Resolve the Authorization header to an actor, checking the database on every request: the
+   * user must exist, be active, use this credential provider and have the token's version. A
+   * token with a sid claim also needs its refresh session to be live (one extra read), so
+   * revoking a session cuts its access token immediately. Tokens without sid keep working.
+   * Runs once at request start: work already running is never interrupted by expiry.
+   */
+  async actor(header?: string): Promise<Actor | undefined> {
     if (!header) return undefined;
     if (!header.startsWith("Bearer "))
       throw new HttpError(401, "Invalid token");
     const claims = await this.tokens.verify(header.slice(7));
     const user = await this.users.get(claims.id);
-    if (!user || !user.data.active || user.data.tokenVersion !== claims.version || (user.data.credentialProvider ?? 'local') !== (this.provider?.id ?? 'local'))
+    if (!user || !user.data.active || user.data.tokenVersion !== claims.version || (user.data.credentialProvider ?? 'local') !== this.providerId)
       throw new HttpError(401, "Invalid session");
-    return publicUser(user.data);
+    if (claims.sid === undefined) return publicUser(user.data);
+    if (!sessionLive(await this.refreshSessions.get(claims.id, claims.sid), this.now()))
+      throw new HttpError(401, "Invalid session");
+    return { ...publicUser(user.data), sessionId: claims.sid };
   }
-  private async session(row: Row) {
+
+  private get providerId() {
+    return this.provider?.id ?? "local";
+  }
+
+  /** Build the session response for a user row and its refresh session. */
+  private async respond(row: Row, refresh: { sessionId: string; refreshToken: string; expiresAt: number }) {
     return {
-      token: await this.tokens.issue(publicUser(row.data)),
+      token: await this.tokens.issue({ ...publicUser(row.data), sid: refresh.sessionId }),
       expiresIn: 900,
+      refreshToken: refresh.refreshToken,
+      refreshExpiresAt: new Date(refresh.expiresAt).toISOString(),
+      sessionId: refresh.sessionId,
       user: viewUser(row.data),
     };
   }
-  async login(email: string, password: unknown, ip: string) {
+
+  /** Start a refresh session for a user who just signed in and return the session response. */
+  private async session(row: Row, client: SessionClient = {}) {
+    const refresh = await this.refreshSessions.create(
+      { id: row.data.id, tokenVersion: row.data.tokenVersion, provider: this.providerId },
+      client,
+    );
+    return this.respond(row, refresh);
+  }
+
+  /** Whether a session row still matches its user in the database (the immediate cut-off). */
+  private async sessionUser(session: Row) {
+    const user = await this.users.get(session.data.userId);
+    const valid =
+      !!user &&
+      user.data.active === true &&
+      user.data.tokenVersion === session.data.tokenVersion &&
+      (user.data.credentialProvider ?? "local") === session.data.provider &&
+      session.data.provider === this.providerId;
+    return valid ? user : undefined;
+  }
+
+  /**
+   * POST /auth/refresh: rotate a refresh token and issue a new access token for the same session
+   * (same absolute expiry). Limits refresh-ip:<ip> 60 then refresh-session:<sessionId> 10 per
+   * minute; every failure is 401 "Invalid session".
+   * @example refresh("<sessionId>.<secret>", "1.1.1.1")
+   *   → {token, expiresIn: 900, refreshToken, refreshExpiresAt, sessionId, user}
+   */
+  async refresh(refreshToken: unknown, ip: string) {
+    await this.limit(`refresh-ip:${ip}`, 60);
+    const parsed = parseRefreshToken(refreshToken);
+    if (!parsed) throw new HttpError(401, INVALID_REFRESH);
+    await this.limit(`refresh-session:${parsed.sessionId}`, 10);
+    let user: Row | undefined;
+    const rotated = await this.refreshSessions.rotate(refreshToken, async (session) => {
+      user = await this.sessionUser(session);
+      return !!user;
+    });
+    return this.respond(user!, rotated);
+  }
+
+  /**
+   * GET /auth/sessions: the live sessions of a user, newest first. Never returns secrets or
+   * hashes. current marks the session of the calling access token.
+   */
+  async sessions(userId: string, currentSessionId?: string) {
+    const user = await this.users.get(userId), now = this.now();
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const items = (await this.refreshSessions.rows(userId))
+      .filter((row) => sessionLive(row, now) && row.data.tokenVersion === user?.data.tokenVersion && row.data.provider === this.providerId)
+      .sort((a, b) => b.data.createdAt - a.data.createdAt || (a.sk < b.sk ? -1 : a.sk > b.sk ? 1 : 0))
+      .map((row) => ({
+        id: row.sk,
+        createdAt: iso(row.data.createdAt),
+        lastUsedAt: iso(row.data.lastUsedAt),
+        expiresAt: iso(row.data.expiresAt),
+        current: row.sk === currentSessionId,
+        ip: row.data.ip ?? null,
+        userAgent: row.data.userAgent ?? null,
+      }));
+    return { items };
+  }
+
+  /** DELETE /auth/sessions/:id: revoke one of the caller's own live sessions, else 404. */
+  async revokeSession(userId: string, sessionId: unknown) {
+    const user = await this.users.get(userId);
+    const row = typeof sessionId === "string" && sessionId.length <= 100 ? await this.refreshSessions.get(userId, sessionId) : undefined;
+    if (!row || row.data.tokenVersion !== user?.data.tokenVersion || !(await this.refreshSessions.revoke(userId, sessionId as string, "revoked")))
+      throw new HttpError(404, "Session not found");
+    return { ok: true };
+  }
+
+  /**
+   * POST /auth/logout. Signs out the current session only (its refresh token and access token stop
+   * working at once). With all === true, or for an access token without a session (sid), it signs
+   * out everywhere as before: the identity provider logs out and tokenVersion is bumped, which
+   * kills every session and access token of the user.
+   */
+  async logout(userId: string, sessionId?: string, all?: unknown) {
+    if (all !== true && sessionId) {
+      await this.refreshSessions.revoke(userId, sessionId, "logout");
+      return { ok: true };
+    }
+    const row = await this.users.get(userId);
+    if (!row) throw new HttpError(401, "Invalid session");
+    if (this.provider) await this.provider.logout(row.data.id);
+    await this.invalidate(row);
+    return { ok: true };
+  }
+
+  async login(email: string, password: unknown, ip: string, userAgent?: string) {
     if (!(await this.settings()).values.passwordLogin)
       throw new HttpError(403, "Password sign-in is disabled");
     await this.limit(`login-ip:${ip}`, 30);
@@ -142,7 +255,7 @@ export class Auth {
       validatePassword(password);
       const result = await this.provider.password(row.data.id, password);
       if ('challenge' in result) return this.pending(row, 'totp', {providerSession:result.session});
-      return this.session(row);
+      return this.session(row, { ip, userAgent });
     }
     const valid = await verifyPassword(
       password,
@@ -152,7 +265,7 @@ export class Auth {
     if (!row || !row.data.active || !valid)
       throw new HttpError(401, "Incorrect email or password");
     if ((await this.store.get("MFA", row.data.id))?.data.enabled) return this.pending(row, 'totp', {});
-    return this.session(row);
+    return this.session(row, { ip, userAgent });
   }
   async issue(email: string, purpose: "login" | "reset", ip: string) {
     if (purpose === "login" && !(await this.settings()).values.emailCodeLogin)
@@ -203,6 +316,7 @@ export class Auth {
     ip: string,
     password?: unknown,
     challengeId?: string,
+    userAgent?: string,
   ) {
     if (purpose === "login" && !(await this.settings()).values.emailCodeLogin)
       throw new HttpError(403, "Email code sign-in is disabled");
@@ -223,7 +337,7 @@ export class Auth {
       if(pending.data.userId !== user.data.id) throw new HttpError(400,"Invalid code");
       await this.provider.verifyEmailCode(user.data.id, this.vault.open(pending.data.sealed).providerSession, code);
       await this.finishPending(pending);
-      return this.session(user);
+      return this.session(user, { ip, userAgent });
     }
     const sk = this.digest(`${purpose}:${email}`),
       row = await this.store.get("CHALLENGE", sk);
@@ -283,7 +397,7 @@ export class Auth {
     }
     if(await this.hasMfa(user.data.id)) throw new HttpError(403,"Use your password and authenticator");
     await this.store.transact([consumed]);
-    return this.session(user);
+    return this.session(user, { ip, userAgent });
   }
   async requestEmailChange(userId: string, email: string, ip: string) {
     await this.limit(`email-change-ip:${ip}`, 10);
@@ -318,7 +432,7 @@ export class Auth {
     await this.mail.sendCode(email, code, "email-change");
     return { message: "We sent a code to the new email address." };
   }
-  async confirmEmailChange(userId: string, code: unknown, ip: string) {
+  async confirmEmailChange(userId: string, code: unknown, ip: string, userAgent?: string) {
     await this.limit(`email-confirm:${userId}`, 8);
     await this.limit(`email-confirm-ip:${ip}`, 20);
     if (typeof code !== "string" || !/^\d{6}$/.test(code))
@@ -390,7 +504,7 @@ export class Auth {
         expected: null,
       },
     ]);
-    return this.session(updated);
+    return this.session(updated, { ip, userAgent });
   }
   private async invalidate(row:Row) {
     await this.store.transact([{row:{...row,version:row.version+1,data:{...row.data,tokenVersion:row.data.tokenVersion+1}},expected:row.version}]);
@@ -410,7 +524,7 @@ export class Auth {
     return row;
   }
   private finishPending(row:Row) {return this.store.transact([{row:{...row,version:row.version+1,data:{...row.data,used:true}},expected:row.version}]);}
-  async verifyMfa(id:unknown,code:unknown,ip:string) {
+  async verifyMfa(id:unknown,code:unknown,ip:string,userAgent?:string) {
     await this.limit('mfa-ip:'+ip,20);
     const pending=await this.readPending(id,'totp');
     await this.limit('mfa-user:'+pending.data.userId,5);
@@ -429,7 +543,7 @@ export class Auth {
         {row:{...pending,version:pending.version+1,data:{...pending.data,used:true}},expected:pending.version}
       ]);
     }
-    return this.session(user);
+    return this.session(user, { ip, userAgent });
   }
   async setupMfa(id:string,password:unknown,ip:string) {
     await this.limit('mfa-setup:'+ip,5);await this.limit('mfa-setup-user:'+id,5);
@@ -566,7 +680,7 @@ export class Auth {
       migrations,
       endpoints: [
         {method:'POST',path:'/auth/mfa/reset',resource:'auth.mfa.reset',access:'owner',handle:c=>this.resetMfa(c.request.body.userId)},
-        {method:'POST',path:'/auth/mfa/verify',resource:'auth.mfa.verify',access:'guest',handle:c=>this.verifyMfa(c.request.body.challengeId,c.request.body.code,c.request.ip)},
+        {method:'POST',path:'/auth/mfa/verify',resource:'auth.mfa.verify',access:'guest',handle:c=>this.verifyMfa(c.request.body.challengeId,c.request.body.code,c.request.ip,userAgent(c.request))},
         {method:'GET',path:'/auth/mfa',resource:'auth.mfa.status',access:'authenticated',handle:async c=>({enabled:await this.hasMfa(c.actor!.id),type:'totp'})},
         {method:'POST',path:'/auth/mfa/setup',resource:'auth.mfa.setup',access:'authenticated',handle:c=>this.setupMfa(c.actor!.id,c.request.body.password,c.request.ip)},
         {method:'POST',path:'/auth/mfa/enable',resource:'auth.mfa.enable',access:'authenticated',handle:c=>this.enableMfa(c.actor!.id,c.request.body.challengeId,c.request.body.code,c.request.ip)},
@@ -575,7 +689,7 @@ export class Auth {
           path: "/auth/methods",
           resource: "auth.methods",
           access: "guest",
-          handle: async () => ({...(await this.settings()).values, provider:this.provider?.id ?? "local",totp:true,selfRegistration:false,refreshTokens:false}),
+          handle: async () => ({...(await this.settings()).values, provider:this.provider?.id ?? "local",totp:true,selfRegistration:false,refreshTokens:true}),
         },
         {
           method: "GET",
@@ -601,6 +715,7 @@ export class Auth {
               emailAddress(c.request.body.email),
               c.request.body.password,
               c.request.ip,
+              userAgent(c.request),
             ),
         },
         {
@@ -628,6 +743,7 @@ export class Auth {
               c.request.ip,
               undefined,
               c.request.body.challengeId,
+              userAgent(c.request),
             ),
         },
         {
@@ -678,31 +794,36 @@ export class Auth {
               c.actor!.id,
               c.request.body.code,
               c.request.ip,
+              userAgent(c.request),
             ),
+        },
+        {
+          method: "POST",
+          path: "/auth/refresh",
+          resource: "auth.refresh",
+          access: "guest",
+          handle: (c) => this.refresh(c.request.body.refreshToken, c.request.ip),
+        },
+        {
+          method: "GET",
+          path: "/auth/sessions",
+          resource: "auth.sessions.list",
+          access: "authenticated",
+          handle: (c) => this.sessions(c.actor!.id, c.actor!.sessionId),
+        },
+        {
+          method: "DELETE",
+          path: "/auth/sessions/:id",
+          resource: "auth.sessions.revoke",
+          access: "authenticated",
+          handle: (c) => this.revokeSession(c.actor!.id, c.params.id),
         },
         {
           method: "POST",
           path: "/auth/logout",
           resource: "auth.logout",
           access: "authenticated",
-          handle: async (c) => {
-            const row = (await this.users.get(c.actor!.id))!;
-            if(this.provider) await this.provider.logout(row.data.id);
-            await this.store.transact([
-              {
-                row: {
-                  ...row,
-                  version: row.version + 1,
-                  data: {
-                    ...row.data,
-                    tokenVersion: row.data.tokenVersion + 1,
-                  },
-                },
-                expected: row.version,
-              },
-            ]);
-            return { ok: true };
-          },
+          handle: (c) => this.logout(c.actor!.id, c.actor!.sessionId, c.request.body.all),
         },
       ],
     };

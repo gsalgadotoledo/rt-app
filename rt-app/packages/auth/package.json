@@ -13,7 +13,11 @@
     "./settings": "./ui/settings.tsx",
     "./security": "./ui/security.tsx",
     "./package.json": "./package.json",
-    "./totp": "./dist/totp.js"
+    "./totp": "./dist/totp.js",
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

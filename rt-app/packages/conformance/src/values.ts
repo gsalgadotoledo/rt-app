@@ -133,11 +133,17 @@ export function lookup(results: Json[], reference: string): Json {
  *   {"$ref": "0.value.cursor"}   result of an earlier step of the same case
  *   {"$repeat": {"count": 60, "item": {...}}}  array of items; "{i}" and "{i:03}" in strings become the index
  *   {"$text": {"repeat": "ab", "count": 3}}    "ababab" (long strings for length limits)
+ *   {"$concat": ["Bearer ", {"$ref": "0.value.token"}]}  strings (after expansion) joined
  */
 export function expand(value: Json, results: Json[] = []): Json {
   if (Array.isArray(value)) return value.flatMap((item) => (isObject(item) && "$repeat" in item && Object.keys(item).length === 1 ? (expand(item, results) as Json[]) : [expand(item, results)]));
   if (isObject(value)) {
     if (typeof value.$ref === "string" && Object.keys(value).length === 1) return lookup(results, value.$ref);
+    if (Array.isArray(value.$concat) && Object.keys(value).length === 1) {
+      const parts = value.$concat.map((part) => expand(part, results));
+      if (parts.some((part) => typeof part !== "string")) throw new Error("$concat needs strings");
+      return parts.join("");
+    }
     if (isObject(value.$text) && Object.keys(value).length === 1) {
       const { repeat, count } = value.$text;
       if (typeof repeat !== "string" || !Number.isInteger(count) || (count as number) < 0 || (count as number) * repeat.length > 1_000_000) throw new Error("$text needs repeat (string) and count");

@@ -71,12 +71,13 @@ export const subjects = {
     const store = await memoryStore(init.rows);
     const users = new Users(store, undefined, { now: time.now });
     const mailbox = new LocalMailbox();
-    const auth = new Auth(users, new JwtTokens(init.secret, undefined, undefined, { now: time.now }), mailbox, init.secret, undefined, { now: time.now });
+    const options = { now: time.now, sessionTtlMs: opt(init.sessionTtlMs) };
+    const auth = new Auth(users, new JwtTokens(init.secret, undefined, undefined, { now: time.now }), mailbox, init.secret, undefined, options);
     const vault = new AuthVault(init.secret);
     return {
-      login: (email, password, ip) => auth.login(email, password, ip),
+      login: (email, password, ip, userAgent) => auth.login(email, password, ip, opt(userAgent)),
       issue: (email, purpose, ip) => auth.issue(email, purpose, ip),
-      consume: (email, code, purpose, ip, password, challengeId) => auth.consume(email, code, purpose, ip, opt(password), opt(challengeId)),
+      consume: (email, code, purpose, ip, password, challengeId, userAgent) => auth.consume(email, code, purpose, ip, opt(password), opt(challengeId), opt(userAgent)),
       actor: (header) => auth.actor(opt(header)),
       limit: (key, max) => auth.limit(key, max).then(() => null),
       settings: () => auth.settings(),
@@ -84,10 +85,15 @@ export const subjects = {
       hasMfa: (id) => auth.hasMfa(id),
       setupMfa: (id, password, ip) => auth.setupMfa(id, password, ip),
       enableMfa: (id, challengeId, code, ip) => auth.enableMfa(id, challengeId, code, ip),
-      verifyMfa: (challengeId, code, ip) => auth.verifyMfa(challengeId, code, ip),
+      verifyMfa: (challengeId, code, ip, userAgent) => auth.verifyMfa(challengeId, code, ip, opt(userAgent)),
       resetMfa: (id) => auth.resetMfa(id),
       requestEmailChange: (id, email, ip) => auth.requestEmailChange(id, email, ip),
-      confirmEmailChange: (id, code, ip) => auth.confirmEmailChange(id, code, ip),
+      confirmEmailChange: (id, code, ip, userAgent) => auth.confirmEmailChange(id, code, ip, opt(userAgent)),
+      // Refresh sessions (POST /auth/refresh, GET/DELETE /auth/sessions, POST /auth/logout).
+      refresh: (refreshToken, ip) => auth.refresh(refreshToken, ip),
+      sessions: (userId, currentSessionId) => auth.sessions(userId, opt(currentSessionId)),
+      revokeSession: (userId, sessionId) => auth.revokeSession(userId, sessionId),
+      logout: (userId, sessionId, all) => auth.logout(userId, opt(sessionId), opt(all)),
       // Helpers (not Auth methods): captured mail, stored rows, clock, TOTP and vault.
       mailbox: () => mailbox.messages.map(({ email, code, purpose }) => ({ email, code, purpose })),
       row: (pk, sk) => store.get(pk, sk),

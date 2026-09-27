@@ -1,0 +1,99 @@
+contract: 1
+kind: http
+module: auth-sessions-api
+title: Refresh sessions over HTTP (local mode)
+description: |
+  The refresh-session endpoints as every backend language serves them (algorithms and row formats:
+  auth-sessions.contract.yaml). Users are created through the owner endpoint POST /admin/app/users
+  (local admin access), then sign in with POST /auth/login. Each case uses its own email; all
+  cases together stay well under the per-ip login limit (30 per minute).
+    POST   /auth/refresh        guest          {refreshToken} → session response
+    GET    /auth/sessions       authenticated  → {items}
+    DELETE /auth/sessions/:id   authenticated  → {ok: true} | 404 Session not found
+    POST   /auth/logout         authenticated  {all?} → {ok: true}
+  GET /auth/methods reports refreshTokens: true.
+cases:
+  - name: methods advertise refresh tokens
+    requests:
+      - request: { method: GET, path: /auth/methods }
+        expect: { status: 200, body: { $partial: { refreshTokens: true } } }
+
+  - name: refresh rejects missing and invalid tokens with one message
+    tags: [validation]
+    requests:
+      - { request: { method: POST, path: /auth/refresh, body: {} }, expect: { status: 401, body: { error: Invalid session } } }
+      - { request: { method: POST, path: /auth/refresh, body: { refreshToken: garbage } }, expect: { status: 401, body: { error: Invalid session } } }
+      - { request: { method: POST, path: /auth/refresh, body: { refreshToken: AAAAAAAAAAAAAAAAAAAAAA.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx } }, expect: { status: 401, body: { error: Invalid session } } }
+
+  - name: session endpoints need a signed-in user
+    tags: [security]
+    requests:
+      - { request: { method: GET, path: /auth/sessions }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: DELETE, path: /auth/sessions/AAAAAAAAAAAAAAAAAAAAAA }, expect: { status: 401, body: { error: Sign in } } }
+
+  - name: sign in, refresh, list and log out
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: Session Tester, email: sessions-1@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: POST, path: /auth/login, body: { email: sessions-1@example.test, password: correct horse battery } }
+        expect:
+          status: 200
+          body:
+            token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }
+            expiresIn: 900
+            refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }
+            refreshExpiresAt: { $type: iso-date }
+            sessionId: { $regex: "^[A-Za-z0-9_-]{22}$" }
+            user: { $partial: { email: sessions-1@example.test } }
+      - request: { method: POST, path: /auth/refresh, body: { refreshToken: { $ref: "1.body.refreshToken" } } }
+        expect: { status: 200, body: { $partial: { expiresIn: 900, sessionId: { $ref: "1.body.sessionId" }, refreshExpiresAt: { $ref: "1.body.refreshExpiresAt" }, user: { $partial: { email: sessions-1@example.test } } } } }
+      - request: { method: GET, path: /auth/sessions, headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect:
+          status: 200
+          body: { items: [ { id: { $ref: "1.body.sessionId" }, createdAt: { $type: iso-date }, lastUsedAt: { $type: iso-date }, expiresAt: { $ref: "1.body.refreshExpiresAt" }, current: true, ip: { $any: true }, userAgent: { $any: true } } ] }
+      - request: { method: GET, path: /users/me, headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 200, body: { $partial: { email: sessions-1@example.test } } }
+      - request: { method: POST, path: /auth/refresh, body: { refreshToken: { $ref: "1.body.refreshToken" } } }
+        expect: { status: 200, body: { $partial: { sessionId: { $ref: "1.body.sessionId" } } } }
+        note: the previous token within the 30-second grace window
+      - request: { method: POST, path: /auth/logout, headers: { authorization: "Bearer {{5.body.token}}" }, body: {} }
+        expect: { status: 200, body: { ok: true } }
+      - request: { method: POST, path: /auth/refresh, body: { refreshToken: { $ref: "5.body.refreshToken" } } }
+        expect: { status: 401, body: { error: Invalid session } }
+      - request: { method: GET, path: /users/me, headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 401, body: { error: Invalid session } }
+        note: logging out cuts the session's access tokens at once
+
+  - name: revoke another session of your own
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: Session Tester, email: sessions-2@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: POST, path: /auth/login, body: { email: sessions-2@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: POST, path: /auth/login, body: { email: sessions-2@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: GET, path: /auth/sessions, headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 200, body: { items: { $length: 2 } } }
+      - request: { method: DELETE, path: "/auth/sessions/{{1.body.sessionId}}", headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 200, body: { ok: true } }
+      - request: { method: GET, path: /users/me, headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect: { status: 401, body: { error: Invalid session } }
+      - request: { method: DELETE, path: "/auth/sessions/{{1.body.sessionId}}", headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 404, body: { error: Session not found } }
+      - request: { method: GET, path: /auth/sessions, headers: { authorization: "Bearer {{2.body.token}}" } }
+        expect: { status: 200, body: { items: [ { $partial: { id: { $ref: "2.body.sessionId" }, current: true } } ] } }
+
+  - name: log out everywhere
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: Session Tester, email: sessions-3@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: POST, path: /auth/login, body: { email: sessions-3@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: POST, path: /auth/login, body: { email: sessions-3@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: POST, path: /auth/logout, headers: { authorization: "Bearer {{2.body.token}}" }, body: { all: true } }
+        expect: { status: 200, body: { ok: true } }
+      - request: { method: GET, path: /users/me, headers: { authorization: "Bearer {{1.body.token}}" } }
+        expect: { status: 401, body: { error: Invalid session } }
+      - request: { method: POST, path: /auth/refresh, body: { refreshToken: { $ref: "1.body.refreshToken" } } }
+        expect: { status: 401, body: { error: Invalid session } }

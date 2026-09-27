@@ -54,3 +54,19 @@ test("an injected clock makes tokens deterministic and controls expiry", async (
   now += 1;
   await assert.rejects(tokens.verify(token), { status: 401, message: "Invalid or expired session" });
 });
+
+test("an optional sid claim ties a token to a refresh session", async () => {
+  const tokens = new JwtTokens(secret, undefined, undefined, { now: () => 1767323045000 });
+  const plain = await tokens.issue({ id: "alice", tokenVersion: 1 });
+  assert.equal(await tokens.issue({ id: "alice", tokenVersion: 1, sid: "" }), plain);
+  const bound = await tokens.issue({ id: "alice", tokenVersion: 1, sid: "session-1" });
+  assert.deepEqual(Object.keys(JSON.parse(Buffer.from(bound.split(".")[1], "base64url"))), ["v", "sid", "sub", "iss", "aud", "iat", "exp"]);
+  assert.deepEqual(await tokens.verify(bound), { id: "alice", version: 1, sid: "session-1" });
+  assert.deepEqual(await tokens.verify(plain), { id: "alice", version: 1 });
+  const key = new TextEncoder().encode(secret);
+  for (const sid of [7, "", null, ["x"]]) {
+    const forged = await new SignJWT({ v: 1, sid }).setProtectedHeader({ alg: "HS256" }).setSubject("alice")
+      .setIssuer("rt-app").setAudience("rt-app-api").setIssuedAt(1767323045).setExpirationTime(1767323945).sign(key);
+    await assert.rejects(tokens.verify(forged), { status: 401 });
+  }
+});

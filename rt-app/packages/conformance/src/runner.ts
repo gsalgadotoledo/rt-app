@@ -159,7 +159,9 @@ async function runHttpCase(api: string, c: Case): Promise<{ status: Status; mess
     const target = request.path.replace(/\{\{([^}]+)\}\}/g, (_, ref: string) => encodeURIComponent(String(lookup(results, ref.trim()))));
     const path = target + (request.query ? "?" + new URLSearchParams(expand(request.query as Json, results) as Record<string, string>) : "");
     const body = typeof request.raw === "string" ? request.raw : request.body === undefined ? undefined : JSON.stringify(expand(request.body, results));
-    const response = await fetch(api + path, { method: request.method, headers: { ...(body ? { "content-type": "application/json" } : {}), ...request.headers }, body });
+    // {{0.body.token}} in a header value is an earlier result, inserted as is.
+    const headers = Object.fromEntries(Object.entries(request.headers ?? {}).map(([name, value]) => [name, value.replace(/\{\{([^}]+)\}\}/g, (_, ref: string) => String(lookup(results, ref.trim())))]));
+    const response = await fetch(api + path, { method: request.method, headers: { ...(body ? { "content-type": "application/json" } : {}), ...headers }, body });
     const text = await response.text();
     let parsed: Json = text;
     try { parsed = text ? JSON.parse(text) : null; } catch { /* keep text */ }

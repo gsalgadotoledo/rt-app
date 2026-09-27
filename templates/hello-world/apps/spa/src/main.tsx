@@ -8,25 +8,28 @@ import React, { useEffect, useState, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import SecurityPanel from "@gsalgadotoledo/rt-app-auth/security";
 import AuthPanel from "@gsalgadotoledo/rt-app-auth/admin";
+import { createSessionClient } from "@gsalgadotoledo/rt-app-auth/client";
 import "./style.css";
 const base = browserApiUrl(__RT_APP_CONFIG__);
-// The session survives reloads and payment redirects in this tab only (sessionStorage),
-// and is dropped on sign-out or on any 401 from the API.
-const SESSION_KEY = "rt-app.session";
-function storedSession() {
-  try { return JSON.parse(sessionStorage.getItem(SESSION_KEY) ?? "null") ?? undefined; } catch { return undefined; }
-}
-function storeSession(value: any) {
-  try { value ? sessionStorage.setItem(SESSION_KEY, JSON.stringify(value)) : sessionStorage.removeItem(SESSION_KEY); } catch {}
-}
+// The session (access + refresh token) survives reloads and payment redirects in this tab only
+// (sessionStorage). The client refreshes it ~90 s before the access token expires, retries once
+// on a session 401, shares rotations with duplicated tabs and signs out only when refresh fails.
+// Use localStorage instead to stay signed in across browser restarts (up to 4 days), at the cost
+// of a longer-lived token readable by any script injected into this origin.
+const sessions = createSessionClient({
+  baseUrl: base,
+  storageKey: "rt-app.session",
+  storage: (() => { try { return window.sessionStorage; } catch { return null; } })(),
+});
 function App() {
   useEffect(() => { document.title = branding.name; }, []);
   const [home, setHome] = useState<any>(),
-    [session, setSessionState] = useState<any>(storedSession),
+    [session, setSessionState] = useState<any>(sessions.session),
     [profile, setProfile] = useState<any>(),
     [error, setError] = useState("");
   const route=useLocation(), navigate=useNavigate();
-  const setSession=(value:any)=>{storeSession(value);setSessionState(value);};
+  const setSession=(value:any)=>sessions.set(value);
+  useEffect(()=>sessions.subscribe(value=>{setSessionState(value);if(!value)setProfile(undefined);}),[]);
   useEffect(()=>{trackPage(base,'spa',route.pathname);},[route.pathname]);
   useEffect(()=>{const params=new URLSearchParams(location.search);if(params.has('setup_intent')||params.has('payment_intent')){sessionStorage.setItem('rt-app-billing-return',JSON.stringify({setupId:params.get('setup_intent'),payment:params.has('payment_intent')}));navigate('/account',{replace:true});}},[]);
   const accountOpen=route.pathname==="/account"||route.pathname==="/login";
@@ -37,20 +40,7 @@ function App() {
     if (accountOpen && !dialog?.open) dialog?.showModal();
     else if (!accountOpen && dialog?.open) dialog.close();
   }, [accountOpen]);
-  async function api(path: string, method = "GET", body?: any) {
-    const response = await fetch(base + path, {
-      method,
-      headers: {
-        "content-type": "application/json",
-        ...(session ? { authorization: "Bearer " + session.token } : {}),
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    const value = await response.json();
-    if (response.status === 401 && session) { setSession(undefined); setProfile(undefined); }
-    if (!response.ok) throw new Error(value.error);
-    return value;
-  }
+  const api = (path: string, method = "GET", body?: any) => sessions.api(path, method, body);
   useEffect(() => {
     void api("/")
       .then(setHome)
@@ -61,7 +51,7 @@ function App() {
       void api("/users/me")
         .then(setProfile)
         .catch((e) => setError(e.message));
-  }, [session]);
+  }, [session?.sessionId ?? session?.token]);
   return (
     <div className="site-shell">
       <header className="topbar">

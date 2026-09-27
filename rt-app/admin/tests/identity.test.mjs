@@ -46,3 +46,28 @@ test('explicit local admin access needs no password and does not authenticate pu
  const secured=createApplication({store:new MemoryStore(),mailer:new LocalMailbox(),secret:'remote-test-secret-'.repeat(4)});
  assert.equal((await secured.handle({method:'GET',path:'/admin/modules',body:{},query:{},headers:{},ip:'127.0.0.1'})).status,401);
 });
+test('root sessions refresh through the application store and die with logout or a new password',async()=>{
+ const store=new MemoryStore(),verifier=await passwordVerifier(password),secret='root-session-secret-'.repeat(3);
+ const app=createApplication({store,mailer:new LocalMailbox(),secret,adminPasswordVerifier:verifier});
+ await app.migrate();
+ let ip=0;
+ const call=(method,path,body={},token)=>app.handle({method,path,body,query:{},headers:{authorization:token?'Bearer '+token:undefined},ip:'10.0.0.'+(ip++)});
+ const root=(await call('POST','/admin/identity/auth/login',{password})).body;
+ assert.equal(root.expiresIn,900);assert.match(root.refreshToken,/^[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/);assert.equal(root.refreshToken.split('.')[0],root.sessionId);
+ assert.equal((await store.get('SESSIONS#rt-app-root',root.sessionId)).data.provider.startsWith('admin:'),true);
+ const next=await call('POST','/admin/identity/auth/refresh',{refreshToken:root.refreshToken});
+ assert.equal(next.status,200);assert.equal(next.body.sessionId,root.sessionId);
+ assert.equal((await call('GET','/admin/modules',{},next.body.token)).status,200);
+ // Root refresh tokens are not application refresh tokens and vice versa.
+ assert.equal((await call('POST','/auth/refresh',{refreshToken:next.body.refreshToken})).status,401);
+ assert.equal((await call('POST','/admin/identity/auth/refresh',{refreshToken:'garbage'})).body.error,'Invalid session');
+ // A new ADMIN_PASSWORD ends every root session, even with the same store.
+ const rotated=new AdminIdentity(await passwordVerifier('Rotated-Password-Test-2026!'),secret,false,store);
+ await assert.rejects(rotated.refresh(next.body.refreshToken,'x'),e=>e.status===401);
+ assert.equal((await call('POST','/admin/identity/auth/logout',{},next.body.token)).status,200);
+ assert.equal((await call('GET','/admin/modules',{},next.body.token)).status,401);
+ assert.equal((await call('POST','/admin/identity/auth/refresh',{refreshToken:next.body.refreshToken})).status,401);
+ const stateless=new AdminIdentity(verifier,secret);
+ const plain=await stateless.login(password,'y');assert.equal(plain.refreshToken,undefined);
+ await assert.rejects(stateless.refresh(root.refreshToken,'y'),e=>e.status===401);
+});

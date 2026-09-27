@@ -42,6 +42,8 @@ test("values: $ref, $repeat and $text macros", () => {
   assert.deepEqual(expand([0, { $repeat: { count: 2, start: 1, item: { sk: "k{i:03}", i: "{i}" } } }, 9]), [0, { sk: "k001", i: 1 }, { sk: "k002", i: 2 }, 9]);
   assert.equal(expand({ $text: { repeat: "ab", count: 3 } }), "ababab");
   assert.throws(() => expand({ $repeat: { count: -1, item: 1 } }), /count/);
+  assert.equal(expand({ $concat: ["Bearer ", { $ref: "0.value.cursor" }, { $text: { repeat: "!", count: 2 } }] }, results), "Bearer c1!!");
+  assert.throws(() => expand({ $concat: ["a", 1] }), /\$concat needs strings/);
 });
 
 test("contracts: shorthands, defaults and validation", () => {

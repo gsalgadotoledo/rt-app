@@ -1,0 +1,455 @@
+contract: 1
+module: auth-sessions
+title: Refresh sessions (rotating refresh tokens behind 15-minute access tokens)
+description: |
+  Subject "auth" (same facade and init as auth.contract.yaml, plus optional init.sessionTtlMs).
+  Design notes for porters: docs/polyglot/auth-sessions.md. Clock: now = epoch ms, T = floor(now/1000).
+  Digest: hex(HMAC-SHA256(key = UTF-8 app secret, message = UTF-8 text)).
+
+  Session response (every sign-in path that returns a session: login, consume(login), verifyMfa,
+  confirmEmailChange, and refresh):
+    {token, expiresIn: 900, refreshToken, refreshExpiresAt, sessionId, user}
+  token = jwt.issue({id, tokenVersion, sid: sessionId}) (payload v, sid, sub, iss, aud, iat, exp);
+  refreshToken = "<sessionId>.<secret>"; sessionId = base64url_nopad(16 random bytes) (22 chars),
+  secret = base64url_nopad(32 random bytes) (43 chars); refreshExpiresAt = ISO 8601 of expiresAt
+  (milliseconds, "Z"); user = users view.
+
+  Creating a session (sign-in): expiresAt = now + sessionTtlMs (default 345600000 = 4 days,
+  absolute: rotation never extends it). One transaction, both rows expected absent, ttl = floor(expiresAt/1000):
+    SESSION/<sessionId>            {userId}                         (pointer: token → user)
+    SESSIONS#<userId>/<sessionId>  {userId, provider, tokenVersion, secretHash, previousHash: null,
+                                    rotatedAt: now, createdAt: now, lastUsedAt: now, expiresAt,
+                                    revokedAt: null, revokedReason: null, ip, userAgent}
+  provider = the credential provider id ("local" here); tokenVersion = the user's at sign-in;
+  secretHash = digest("refresh:<sessionId>:<secret>"); all times are epoch ms integers.
+  ip and userAgent: strings only (else null); every character outside U+0020..U+007E removed, then
+  cut to 64 (ip) / 200 (userAgent) characters; "" → null. Informational only.
+
+  A session is live when revokedAt is null and now < expiresAt (expiresAt <= now is expired).
+
+  refresh(refreshToken, ip) — POST /auth/refresh {refreshToken}; guest. Order:
+    1. limit("refresh-ip:<ip>", 60)                   (before looking at the token)
+    2. token must be a string matching ^([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})$ else 401
+    3. limit("refresh-session:<sessionId>", 10)
+    4. pointer SESSION/<sessionId>, then SESSIONS#<userId>/<sessionId>; missing → 401
+    5. session not live → 401
+    6. user USERS/<userId> must exist, be active, have tokenVersion == session.tokenVersion and
+       credentialProvider (default "local") == session.provider == this provider; else 401 (nothing written)
+    7. h = digest("refresh:<sessionId>:<secret>"), constant-time compared:
+       - h == secretHash → rotation: previousHash = secretHash, rotatedAt = now
+       - h == previousHash (not null) and now - rotatedAt <= 30000 → grace (a sibling tab raced with
+         the same token): previousHash and rotatedAt unchanged
+       - otherwise (an older, superseded or forged secret) → theft: revokedAt = now,
+         revokedReason = "reuse" (version+1), then 401
+    8. new secret; secretHash = digest of it, lastUsedAt = now, version+1 (expected = read version).
+       On a version conflict go back to step 4 (up to 4 attempts), then 409 "Conflict: refresh and try again".
+    9. → session response for the same sessionId and expiresAt (the access token carries sid).
+  Every 401 of refresh has the message "Invalid session".
+
+  actor(header): as in auth.contract.yaml; when the token has a sid claim, SESSIONS#<sub>/<sid> must
+  also be live (one read), else 401 "Invalid session"; the actor then includes sessionId. Tokens
+  without sid behave exactly as before. Actors are resolved once at request start.
+
+  sessions(userId, currentSessionId) — GET /auth/sessions (authenticated, own sessions):
+  {items} for rows of partition SESSIONS#<userId> (all pages) that are live and whose tokenVersion
+  and provider equal the user's current ones; newest createdAt first, ties by id ascending
+  (code-point order). Item: {id, createdAt, lastUsedAt, expiresAt (ISO), current: id ==
+  currentSessionId, ip, userAgent}. Never secrets or hashes. Unknown user → {items: []}.
+
+  revokeSession(userId, sessionId) — DELETE /auth/sessions/:id: the row SESSIONS#<userId>/<id>
+  must exist, be live and have the user's current tokenVersion (a non-string id or one longer than
+  100 units is never looked up), else 404 "Session not found"; writes revokedAt = now,
+  revokedReason = "revoked" → {ok: true}.
+
+  logout(userId, sessionId, all) — POST /auth/logout {all?}: all === true (the boolean) or no
+  sessionId (a token without sid) → sign out everywhere as before: provider logout, user
+  tokenVersion + 1 → {ok: true}. Otherwise revoke the current session only (revokedAt = now,
+  revokedReason = "logout"; nothing written when it is already dead) → {ok: true}.
+
+  Rate-limit rows are the ones of auth.contract.yaml (RATE/digest("<key>:<floor(now/60000)>")).
+subject: auth
+init:
+  secret: rt-app-contract-secret-0123456789abcdef
+  now: "2026-01-02T03:04:05.000Z"
+  rows:
+    - &alice { pk: USERS, sk: u-alice, version: 1, data: { id: u-alice, email: alice@example.test, name: Alice, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 1, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: u-alice, deletedAt: null, deletedBy: null } }
+    - &alice-email { pk: EMAIL, sk: alice@example.test, version: 1, data: { id: u-alice } }
+    - &bob { pk: USERS, sk: u-bob, version: 1, data: { id: u-bob, email: bob@example.test, name: Bob, passwordHash: "scrypt$00112233445566778899aabbccddeeff$57312542235f0bd20de68ba91435932724a28fb139d398248a941a31002a374c4b90936648d12a0fb3257c32d78b4f18d168bc11152ad26e7a4da912dfeae2d3", role: user, grants: [], active: true, tokenVersion: 1 } }
+    - &bob-email { pk: EMAIL, sk: bob@example.test, version: 1, data: { id: u-bob } }
+x-fixtures:
+  # sessionAlice0000000001: created 2026-01-01T03:04:05Z, expires 2026-01-05T03:04:05Z; current secret
+  # secretTwo2222…, previous secretOne1111… rotated 60 s before the contract clock.
+  - &a1-pointer { pk: SESSION, sk: sessionAlice0000000001, version: 1, ttl: 1767582245, data: { userId: u-alice } }
+  - &a1 { pk: "SESSIONS#u-alice", sk: sessionAlice0000000001, version: 1, ttl: 1767582245, data: { userId: u-alice, provider: local, tokenVersion: 1, secretHash: a22213d5d1f5f0bd41f7e78cf05c48a7e27ce66e70ab217f512b2e3fb4bfe731, previousHash: 6739169ea1e7c1816f255b48ae4accaebd9dd6e9551cabd56e505dbd9f5edb2e, rotatedAt: 1767322985000, createdAt: 1767236645000, lastUsedAt: 1767322985000, expiresAt: 1767582245000, revokedAt: null, revokedReason: null, ip: 1.1.1.1, userAgent: Fixture/1.0 } }
+  # sessionAlice0000000002: revoked by a logout.
+  - &a2-pointer { pk: SESSION, sk: sessionAlice0000000002, version: 1, ttl: 1767582245, data: { userId: u-alice } }
+  - &a2 { pk: "SESSIONS#u-alice", sk: sessionAlice0000000002, version: 2, ttl: 1767582245, data: { userId: u-alice, provider: local, tokenVersion: 1, secretHash: 6f7b3861ef065eb0aee6098fb31d76a56721effffa7e83f049a8a8885e64f727, previousHash: null, rotatedAt: 1767236645000, createdAt: 1767236645000, lastUsedAt: 1767236645000, expiresAt: 1767582245000, revokedAt: 1767323000000, revokedReason: logout, ip: null, userAgent: null } }
+cases:
+  # --- creation ------------------------------------------------------------------------------
+  - name: sign-in starts a refresh session with pinned rows
+    tags: [ sessions, interop ]
+    steps:
+      - call: login
+        args: [ alice@example.test, correct horse battery, 1.1.1.1, "Mozilla/5.0 (Test) ünïcode\u0007" ]
+        expect:
+          value:
+            token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }
+            expiresIn: 900
+            refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }
+            refreshExpiresAt: "2026-01-06T03:04:05.000Z"
+            sessionId: { $regex: "^[A-Za-z0-9_-]{22}$" }
+            user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null }
+      - call: row
+        args: [ SESSION, { $ref: "0.value.sessionId" } ]
+        expect: { value: { pk: SESSION, sk: { $ref: "0.value.sessionId" }, version: 1, ttl: 1767668645, data: { userId: u-alice } } }
+      - call: row
+        args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ]
+        expect:
+          value:
+            pk: "SESSIONS#u-alice"
+            sk: { $ref: "0.value.sessionId" }
+            version: 1
+            ttl: 1767668645
+            data: { userId: u-alice, provider: local, tokenVersion: 1, secretHash: { $regex: "^[0-9a-f]{64}$" }, previousHash: null, rotatedAt: 1767323045000, createdAt: 1767323045000, lastUsedAt: 1767323045000, expiresAt: 1767668645000, revokedAt: null, revokedReason: null, ip: 1.1.1.1, userAgent: "Mozilla/5.0 (Test) ncode" }
+        note: non-ASCII and control characters are removed from the user agent
+      - call: actor
+        args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] } ]
+        expect: { value: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], tokenVersion: 1, active: true, sessionId: { $ref: "0.value.sessionId" } } }
+
+  - name: client details are printable ASCII with length limits
+    tags: [ sessions, validation, edge ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, { $text: { repeat: "1", count: 70 } }, { $text: { repeat: a, count: 300 } } ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - call: row
+        args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ]
+        expect: { value: { $partial: { data: { $partial: { ip: { $text: { repeat: "1", count: 64 } }, userAgent: { $text: { repeat: a, count: 200 } } } } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 2.2.2.2, "éé" ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "2.value.sessionId" } ], expect: { value: { $partial: { data: { $partial: { ip: 2.2.2.2, userAgent: null } } } } }, note: nothing printable left → null }
+      - { call: login, args: [ alice@example.test, correct horse battery, 3.3.3.3, null ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "4.value.sessionId" } ], expect: { value: { $partial: { data: { $partial: { userAgent: null } } } } } }
+
+  - name: the session lifetime is configurable
+    tags: [ sessions, clock ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      sessionTtlMs: 3600000
+      rows: [ *alice, *alice-email ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { refreshExpiresAt: "2026-01-02T04:04:05.000Z" } } } }
+      - { call: row, args: [ SESSION, { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { ttl: 1767326645 } } } }
+
+  - name: email-code and MFA sign-ins also start refresh sessions
+    tags: [ sessions ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - *alice
+        - *alice-email
+        - { pk: CHALLENGE, sk: b45bc2fe0155c496812b155c5ec1cc508f15c54be8be38130e232f56c331be61, version: 1, ttl: 1767323645, data: { userId: u-alice, hash: 397475ca4d5d6aa2161d4364750e1d865832329fa3b5314ca170ea648685bdc0, attempts: 0, used: false, expires: 1767323645000, tokenVersion: 1 } }
+        - *bob
+        - *bob-email
+        - { pk: MFA, sk: u-bob, version: 1, data: { enabled: true, sealed: AAECAwQFBgcICQoLOToKaO5-5QPD1JHvL0I6C9CtDSvDjl7_8wQUWo0PfU1er31KjW6fOXMyqMi2cG3Koxq82AJrCWy_b6BmyA, lastStep: 58910700 } }
+        - { pk: AUTH_FLOW, sk: flow-bob, version: 1, ttl: 1767323345, data: { userId: u-bob, tokenVersion: 1, kind: totp, expires: 1767323345000, used: false, sealed: CwoJCAcGBQQDAgEABVssCWTvS22ukbO0Zn4B3ort } }
+    steps:
+      - { call: consume, args: [ alice@example.test, "123456", login, 1.1.1.1, null, null, Agent/1 ], expect: { value: { $partial: { refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }, sessionId: { $type: string }, refreshExpiresAt: "2026-01-06T03:04:05.000Z" } } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { data: { $partial: { ip: 1.1.1.1, userAgent: Agent/1 } } } } } }
+      - { call: verifyMfa, args: [ flow-bob, "652348", 5.5.5.5, Agent/2 ], expect: { value: { $partial: { refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }, sessionId: { $type: string }, refreshExpiresAt: "2026-01-06T03:04:05.000Z" } } } }
+      - { call: row, args: [ "SESSIONS#u-bob", { $ref: "2.value.sessionId" } ], expect: { value: { $partial: { data: { $partial: { userId: u-bob, ip: 5.5.5.5, userAgent: Agent/2 } } } } } }
+      - { call: refresh, args: [ { $ref: "2.value.refreshToken" }, 5.5.5.5 ], expect: { value: { $partial: { sessionId: { $ref: "2.value.sessionId" }, user: { $partial: { id: u-bob } } } } } }
+
+  # --- rotation ------------------------------------------------------------------------------
+  - name: refresh rotates the secret and keeps the session and its expiry
+    tags: [ sessions ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: setNow, args: [ "2026-01-02T03:05:05.000Z" ], expect: { value: null } }
+      - call: refresh
+        args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ]
+        expect:
+          value:
+            token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQi[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]{43}$" }
+            expiresIn: 900
+            refreshToken: { $regex: "^[A-Za-z0-9_-]{22}\\.[A-Za-z0-9_-]{43}$" }
+            refreshExpiresAt: "2026-01-06T03:04:05.000Z"
+            sessionId: { $ref: "0.value.sessionId" }
+            user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null }
+        note: same session and absolute expiry
+      - call: row
+        args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ]
+        expect: { value: { $partial: { version: 2, ttl: 1767668645, data: { $partial: { previousHash: { $ref: "1.value.data.secretHash" }, secretHash: { $regex: "^[0-9a-f]{64}$" }, rotatedAt: 1767323105000, lastUsedAt: 1767323105000, createdAt: 1767323045000, expiresAt: 1767668645000, revokedAt: null } } } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "3.value.token" } ] } ], expect: { value: { $partial: { id: u-alice, sessionId: { $ref: "0.value.sessionId" } } } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] } ], expect: { value: { $partial: { id: u-alice } } }, note: earlier access tokens of a live session stay valid until they expire }
+      - { call: refresh, args: [ { $ref: "3.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { sessionId: { $ref: "0.value.sessionId" } } } }, note: the new refresh token works }
+
+  - name: a refresh session written by another implementation is rotated
+    tags: [ sessions, interop ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ *alice, *alice-email, *a1-pointer, *a1 ]
+    steps:
+      - call: refresh
+        args: [ sessionAlice0000000001.secretTwo2222222222222222222222222222222222, 1.1.1.1 ]
+        expect:
+          value:
+            token: { $regex: "^eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\\.eyJ2IjoxLCJzaWQiOiJzZXNzaW9uQWxpY2UwMDAwMDAwMDAxIiwic3ViIjoidS1hbGljZSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0\\.A20bgnWNo87GH8r5t-WoKPBlTeqIN481pyFQBodvNQE$" }
+            expiresIn: 900
+            refreshToken: { $regex: "^sessionAlice0000000001\\.[A-Za-z0-9_-]{43}$" }
+            refreshExpiresAt: "2026-01-05T03:04:05.000Z"
+            sessionId: sessionAlice0000000001
+            user: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: 2026-01-01T00:00:00.000Z, createdBy: u-alice, updatedAt: 2026-01-01T00:00:00.000Z, updatedBy: u-alice, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null }
+        note: "secretHash = HMAC(secret, 'refresh:sessionAlice0000000001:secretTwo…'); the access token is exact"
+      - call: row
+        args: [ "SESSIONS#u-alice", sessionAlice0000000001 ]
+        expect: { value: { pk: "SESSIONS#u-alice", sk: sessionAlice0000000001, version: 2, ttl: 1767582245, data: { userId: u-alice, provider: local, tokenVersion: 1, secretHash: { $regex: "^[0-9a-f]{64}$" }, previousHash: a22213d5d1f5f0bd41f7e78cf05c48a7e27ce66e70ab217f512b2e3fb4bfe731, rotatedAt: 1767323045000, createdAt: 1767236645000, lastUsedAt: 1767323045000, expiresAt: 1767582245000, revokedAt: null, revokedReason: null, ip: 1.1.1.1, userAgent: Fixture/1.0 } } }
+      - { call: row, args: [ SESSION, sessionAlice0000000001 ], expect: { value: { pk: SESSION, sk: sessionAlice0000000001, version: 1, ttl: 1767582245, data: { userId: u-alice } } }, note: the pointer never changes }
+
+  - name: the previous token is accepted again within 30 seconds (concurrent tabs)
+    tags: [ sessions, concurrency, clock ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { sessionId: { $ref: "0.value.sessionId" } } } } }
+      - { call: setNow, args: [ "2026-01-02T03:04:35.000Z" ], expect: { value: null }, note: exactly 30 s after the rotation }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { sessionId: { $ref: "0.value.sessionId" }, refreshExpiresAt: "2026-01-06T03:04:05.000Z" } } }, note: the grace window is inclusive }
+      - call: row
+        args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ]
+        expect: { value: { $partial: { version: 3, data: { $partial: { previousHash: { $ref: "1.value.data.secretHash" }, rotatedAt: 1767323045000, lastUsedAt: 1767323075000, revokedAt: null } } } } }
+        note: a grace rotation keeps previousHash and rotatedAt
+      - { call: refresh, args: [ { $ref: "4.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { sessionId: { $ref: "0.value.sessionId" } } } }, note: the newest token rotates normally }
+
+  - name: the grace window ends 30 seconds after the rotation
+    tags: [ sessions, security, clock ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: setNow, args: [ "2026-01-02T03:04:35.001Z" ], expect: { value: null } }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: reuse after the grace window is theft }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { version: 3, data: { $partial: { revokedAt: 1767323075001, revokedReason: reuse } } } } } }
+      - { call: refresh, args: [ { $ref: "1.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: the whole session is revoked, including the newest token }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "1.value.token" } ] } ], expect: { error: { status: 401, message: Invalid session } }, note: and its access tokens stop at once }
+
+  - name: a token superseded by a grace rotation counts as reuse
+    tags: [ sessions, security ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: tab A }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: tab B with the same token (grace) }
+      - { call: refresh, args: [ { $ref: "1.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: tab A's token is neither current nor previous }
+      - { call: refresh, args: [ { $ref: "2.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { data: { $partial: { revokedReason: reuse } } } } } }
+
+  - name: reusing a stored previous token after the grace window revokes the session
+    tags: [ sessions, security, interop ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ *alice, *alice-email, *a1-pointer, *a1 ]
+    steps:
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOiJzZXNzaW9uQWxpY2UwMDAwMDAwMDAxIiwic3ViIjoidS1hbGljZSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.A20bgnWNo87GH8r5t-WoKPBlTeqIN481pyFQBodvNQE" ], expect: { value: { $partial: { id: u-alice, sessionId: sessionAlice0000000001 } } } }
+      - { call: refresh, args: [ sessionAlice0000000001.secretOne1111111111111111111111111111111111, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: rotated 60 s ago }
+      - { call: row, args: [ "SESSIONS#u-alice", sessionAlice0000000001 ], expect: { value: { $partial: { version: 2, data: { $partial: { secretHash: a22213d5d1f5f0bd41f7e78cf05c48a7e27ce66e70ab217f512b2e3fb4bfe731, revokedAt: 1767323045000, revokedReason: reuse } } } } } }
+      - { call: refresh, args: [ sessionAlice0000000001.secretTwo2222222222222222222222222222222222, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOiJzZXNzaW9uQWxpY2UwMDAwMDAwMDAxIiwic3ViIjoidS1hbGljZSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.A20bgnWNo87GH8r5t-WoKPBlTeqIN481pyFQBodvNQE" ], expect: { error: { status: 401, message: Invalid session } } }
+
+  - name: an unknown secret for a live session is treated as theft
+    tags: [ sessions, security ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ *alice, *alice-email, *a1-pointer, *a1 ]
+    steps:
+      - { call: refresh, args: [ sessionAlice0000000001.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: row, args: [ "SESSIONS#u-alice", sessionAlice0000000001 ], expect: { value: { $partial: { version: 2, data: { $partial: { revokedReason: reuse } } } } } }
+
+  # --- expiry and immediate cut-off -------------------------------------------------------------
+  - name: sessions end exactly four days after sign-in
+    tags: [ sessions, clock, edge ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { refreshExpiresAt: "2026-01-06T03:04:05.000Z" } } } }
+      - { call: setNow, args: [ "2026-01-06T03:04:04.999Z" ], expect: { value: null } }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { refreshExpiresAt: "2026-01-06T03:04:05.000Z" } } }, note: rotation never extends the session }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "2.value.token" } ] } ], expect: { value: { $partial: { id: u-alice } } } }
+      - { call: setNow, args: [ "2026-01-06T03:04:05.000Z" ], expect: { value: null } }
+      - { call: refresh, args: [ { $ref: "2.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: expiresAt <= now }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "2.value.token" } ] } ], expect: { error: { status: 401, message: Invalid session } }, note: the access token is 1 ms old but its session is over }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { version: 2, data: { $partial: { revokedAt: null } } } } }, note: expiry writes nothing }
+
+  - name: bumping tokenVersion ends every session at once
+    tags: [ sessions, security ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 2.2.2.2 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: resetMfa, args: [ u-alice ], expect: { value: { $partial: { message: { $type: string } } } }, note: "resetMfa, password reset, email change, deactivation, grants and logout {all: true} all bump tokenVersion" }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: refresh, args: [ { $ref: "1.value.refreshToken" }, 2.2.2.2 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] } ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: sessions, args: [ u-alice, null ], expect: { value: { items: [] } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { version: 1 } } }, note: dead sessions are not rewritten }
+
+  - name: refresh re-checks the user in the database
+    tags: [ sessions, security, interop ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - { pk: USERS, sk: u-alice, version: 2, data: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: false, tokenVersion: 1 } }
+        - { pk: USERS, sk: u-bob, version: 2, data: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, tokenVersion: 2 } }
+        - { pk: USERS, sk: u-dave, version: 1, data: { id: u-dave, email: dave@example.test, name: Dave, credentialProvider: cognito, role: user, grants: [], active: true, tokenVersion: 1 } }
+        - *a1-pointer
+        - *a1
+        - { pk: SESSION, sk: sessionBob000000000001, version: 1, ttl: 1767582245, data: { userId: u-bob } }
+        - { pk: "SESSIONS#u-bob", sk: sessionBob000000000001, version: 1, ttl: 1767582245, data: { userId: u-bob, provider: local, tokenVersion: 1, secretHash: 0c6f3284a70a9153b87c78ad382e23ec759354683b8af650487ee5c0d962ffe1, previousHash: null, rotatedAt: 1767236645000, createdAt: 1767236645000, lastUsedAt: 1767236645000, expiresAt: 1767582245000, revokedAt: null, revokedReason: null, ip: null, userAgent: null } }
+        - { pk: SESSION, sk: sessionDave00000000001, version: 1, ttl: 1767582245, data: { userId: u-dave } }
+        - { pk: "SESSIONS#u-dave", sk: sessionDave00000000001, version: 1, ttl: 1767582245, data: { userId: u-dave, provider: cognito, tokenVersion: 1, secretHash: 0be8fc43b8f5fc029f888bca8a6d58eb39147456ec9882fadfad9049463a62c6, previousHash: null, rotatedAt: 1767236645000, createdAt: 1767236645000, lastUsedAt: 1767236645000, expiresAt: 1767582245000, revokedAt: null, revokedReason: null, ip: null, userAgent: null } }
+    steps:
+      - { call: refresh, args: [ sessionAlice0000000001.secretTwo2222222222222222222222222222222222, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: deactivated user }
+      - { call: row, args: [ "SESSIONS#u-alice", sessionAlice0000000001 ], expect: { value: { $partial: { version: 1 } } }, note: the user is checked before the secret; nothing is written }
+      - { call: refresh, args: [ sessionBob000000000001.secretOne1111111111111111111111111111111111, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: tokenVersion changed since sign-in (a wrong secret is not theft here) }
+      - { call: row, args: [ "SESSIONS#u-bob", sessionBob000000000001 ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: refresh, args: [ sessionDave00000000001.secretOne1111111111111111111111111111111111, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: a cognito session on a local deployment }
+
+  # --- revocation, logout and the session list ---------------------------------------------------
+  - name: revoking a session cuts its access token immediately
+    tags: [ sessions, security ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 2.2.2.2 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: revokeSession, args: [ u-alice, { $ref: "0.value.sessionId" } ], expect: { value: { ok: true } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] } ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "1.value.token" } ] } ], expect: { value: { $partial: { sessionId: { $ref: "1.value.sessionId" } } } }, note: other sessions are untouched }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { version: 2, data: { $partial: { revokedAt: 1767323045000, revokedReason: revoked } } } } } }
+      - { call: revokeSession, args: [ u-alice, { $ref: "0.value.sessionId" } ], expect: { error: { status: 404, message: Session not found } }, note: already revoked }
+      - { call: revokeSession, args: [ u-bob, { $ref: "1.value.sessionId" } ], expect: { error: { status: 404, message: Session not found } }, note: another user's session }
+      - { call: revokeSession, args: [ u-alice, missing ], expect: { error: { status: 404, message: Session not found } } }
+      - { call: revokeSession, args: [ u-alice, 5 ], expect: { error: { status: 404, message: Session not found } } }
+      - { call: revokeSession, args: [ u-alice, { $text: { repeat: x, count: 101 } } ], expect: { error: { status: 404, message: Session not found } } }
+
+  - name: tokens without a session keep working and log out everywhere
+    tags: [ sessions, compatibility ]
+    steps:
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1LWFsaWNlIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.qNKkRWON9X82AHVk6-uFrQWV6Nt-qCNhtR3pff8L8mo" ], expect: { value: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], tokenVersion: 1, active: true } }, note: no sid → no session read, no sessionId }
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: logout, args: [ u-alice, null, null ], expect: { value: { ok: true } }, note: no current session → everywhere }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 2, data: { $partial: { tokenVersion: 2 } } } } } }
+      - { call: refresh, args: [ { $ref: "1.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+
+  - name: logout ends the current session; all ends every session
+    tags: [ sessions ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 2.2.2.2 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: logout, args: [ u-alice, { $ref: "0.value.sessionId" }, null ], expect: { value: { ok: true } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "0.value.token" } ] } ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "1.value.token" } ] } ], expect: { value: { $partial: { id: u-alice } } } }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 1, data: { $partial: { tokenVersion: 1 } } } } } }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { version: 2, data: { $partial: { revokedAt: 1767323045000, revokedReason: logout } } } } } }
+      - { call: logout, args: [ u-alice, { $ref: "0.value.sessionId" }, null ], expect: { value: { ok: true } }, note: an already ended session is not rewritten }
+      - { call: row, args: [ "SESSIONS#u-alice", { $ref: "0.value.sessionId" } ], expect: { value: { $partial: { version: 2 } } } }
+      - { call: logout, args: [ u-alice, { $ref: "1.value.sessionId" }, "true" ], expect: { value: { ok: true } }, note: only the boolean true means everywhere }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { data: { $partial: { tokenVersion: 1 } } } } } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 3.3.3.3 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: logout, args: [ u-alice, { $ref: "11.value.sessionId" }, true ], expect: { value: { ok: true } } }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 2, data: { $partial: { tokenVersion: 2 } } } } } }
+      - { call: actor, args: [ { $concat: [ "Bearer ", { $ref: "11.value.token" } ] } ], expect: { error: { status: 401, message: Invalid session } } }
+
+  - name: users list their live sessions, newest first
+    tags: [ sessions ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1, Browser A ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: setNow, args: [ "2026-01-02T03:05:05.000Z" ], expect: { value: null } }
+      - { call: login, args: [ alice@example.test, correct horse battery, 2.2.2.2 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: setNow, args: [ "2026-01-02T03:06:05.000Z" ], expect: { value: null } }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 3.3.3.3 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: refresh updates lastUsedAt only }
+      - { call: login, args: [ alice@example.test, correct horse battery, 4.4.4.4 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: revokeSession, args: [ u-alice, { $ref: "5.value.sessionId" } ], expect: { value: { ok: true } } }
+      - call: sessions
+        args: [ u-alice, { $ref: "0.value.sessionId" } ]
+        expect:
+          value:
+            items:
+              - { id: { $ref: "2.value.sessionId" }, createdAt: "2026-01-02T03:05:05.000Z", lastUsedAt: "2026-01-02T03:05:05.000Z", expiresAt: "2026-01-06T03:05:05.000Z", current: false, ip: 2.2.2.2, userAgent: null }
+              - { id: { $ref: "0.value.sessionId" }, createdAt: "2026-01-02T03:04:05.000Z", lastUsedAt: "2026-01-02T03:06:05.000Z", expiresAt: "2026-01-06T03:04:05.000Z", current: true, ip: 1.1.1.1, userAgent: Browser A }
+      - { call: sessions, args: [ u-bob, null ], expect: { value: { items: [] } } }
+      - { call: sessions, args: [ u-missing, null ], expect: { value: { items: [] } } }
+
+  - name: stored sessions are listed while live
+    tags: [ sessions, interop, clock ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows: [ *alice, *alice-email, *a1-pointer, *a1, *a2-pointer, *a2 ]
+    steps:
+      - { call: sessions, args: [ u-alice, sessionAlice0000000001 ], expect: { value: { items: [ { id: sessionAlice0000000001, createdAt: "2026-01-01T03:04:05.000Z", lastUsedAt: "2026-01-02T03:03:05.000Z", expiresAt: "2026-01-05T03:04:05.000Z", current: true, ip: 1.1.1.1, userAgent: Fixture/1.0 } ] } }, note: the revoked session is hidden }
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOiJzZXNzaW9uQWxpY2UwMDAwMDAwMDAyIiwic3ViIjoidS1hbGljZSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.4R0OrrjZadokk7JSHXXk5IW5nXbwP1hp946gf4PX2Cg" ], expect: { error: { status: 401, message: Invalid session } }, note: sid of the revoked session }
+      - { call: actor, args: [ "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOiJ1bmtub3duU2Vzc2lvbjAwMDAwMCIsInN1YiI6InUtYWxpY2UiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.TpJVO2TJARPpGq9Wwq9bjMA2pxDBv540F7Tiqvdh7sE" ], expect: { error: { status: 401, message: Invalid session } }, note: an unknown sid }
+      - { call: setNow, args: [ "2026-01-05T03:04:05.000Z" ], expect: { value: null } }
+      - { call: sessions, args: [ u-alice, null ], expect: { value: { items: [] } }, note: expired }
+
+  # --- validation and rate limits ------------------------------------------------------------------
+  - name: malformed and unknown refresh tokens
+    tags: [ sessions, validation ]
+    steps:
+      - { call: refresh, args: [ null, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: refresh, args: [ "", 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: refresh, args: [ 42, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: refresh, args: [ garbage, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: refresh, args: [ sessionAlice0000000001.short, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } } }
+      - { call: refresh, args: [ sessionAlice000000001.secretTwo2222222222222222222222222222222222, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: 21-character session id }
+      - { call: refresh, args: [ "sessionAlice0000000001.secretTwo2222222222222222222222222222222222=", 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: padding is not allowed }
+      - { call: refresh, args: [ "sessionAlice0000000001.secretTwo222222222222222222222222222222222+", 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: base64url alphabet only }
+      - { call: refresh, args: [ AAAAAAAAAAAAAAAAAAAAAA.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: well formed, no such session }
+
+  - name: sixty refreshes per ip per minute, before the token is read
+    tags: [ sessions, rate-limit ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - *alice
+        - *a1-pointer
+        - *a1
+        - { pk: RATE, sk: 70dea733bfecc41981eb9087eeead47769c6b046b3e4c07727adb5a156cf5b35, version: 60, ttl: 1767323165, data: { count: 60 } }
+    steps:
+      - { call: refresh, args: [ garbage, 9.9.9.9 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } }, note: "sk = HMAC(secret, 'refresh-ip:9.9.9.9:29455384')" }
+      - { call: refresh, args: [ sessionAlice0000000001.secretTwo2222222222222222222222222222222222, 9.9.9.9 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } } }
+      - { call: refresh, args: [ sessionAlice0000000001.secretTwo2222222222222222222222222222222222, 1.1.1.1 ], expect: { value: { $partial: { sessionId: sessionAlice0000000001 } } } }
+
+  - name: ten refreshes per session per minute
+    tags: [ sessions, rate-limit ]
+    init:
+      secret: rt-app-contract-secret-0123456789abcdef
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - *alice
+        - *a1-pointer
+        - *a1
+        - { pk: RATE, sk: 31079d1ce772de5df2019bd26ab320de8ac9773bcf41eb6c09ea75fac676ea40, version: 10, ttl: 1767323165, data: { count: 10 } }
+    steps:
+      - { call: refresh, args: [ sessionAlice0000000001.secretTwo2222222222222222222222222222222222, 1.1.1.1 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } }, note: "sk = HMAC(secret, 'refresh-session:sessionAlice0000000001:29455384')" }
+      - { call: row, args: [ "SESSIONS#u-alice", sessionAlice0000000001 ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: refresh, args: [ garbage, 1.1.1.1 ], expect: { error: { status: 401, message: Invalid session } }, note: malformed tokens never reach the session limit }
+      - { call: setNow, args: [ "2026-01-02T03:05:00.000Z" ], expect: { value: null } }
+      - { call: refresh, args: [ sessionAlice0000000001.secretTwo2222222222222222222222222222222222, 1.1.1.1 ], expect: { value: { $partial: { sessionId: sessionAlice0000000001 } } } }
+
+  - name: the session limit counts successful refreshes too
+    tags: [ sessions, rate-limit ]
+    steps:
+      - { call: login, args: [ alice@example.test, correct horse battery, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "0.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "1.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "2.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "3.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "4.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "5.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "6.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "7.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "8.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } } }
+      - { call: refresh, args: [ { $ref: "9.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: the 10th }
+      - { call: refresh, args: [ { $ref: "10.value.refreshToken" }, 1.1.1.1 ], expect: { error: { status: 429, message: "Too many attempts; wait one minute" } } }
+      - { call: setNow, args: [ "2026-01-02T03:05:00.000Z" ], expect: { value: null } }
+      - { call: refresh, args: [ { $ref: "10.value.refreshToken" }, 1.1.1.1 ], expect: { value: { $partial: { expiresIn: 900 } } }, note: a limited attempt changes nothing }

@@ -313,10 +313,12 @@ export function createApplication(options: {
       f.id === "subscriptions" ||
       (f.id === "aws-monitor" && requested.includes("infra")),
   );
+  // Root sessions share the application store (SESSIONS#rt-app-root) so the console can refresh.
   const admin = new AdminIdentity(
     options.adminPasswordVerifier,
     options.secret,
     options.localAdminAccess,
+    options.store,
   );
   const appEndpoints = features.flatMap((f) => f.endpoints);
   const adminEndpoints = appEndpoints

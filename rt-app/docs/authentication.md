@@ -22,7 +22,8 @@ the reserved ID; it never silently activates an incomplete account.
 | Password recovery | one-use captured code | Cognito forgot/confirm flows |
 | Optional TOTP MFA | RFC 6238, encrypted seed, replay guard | Cognito software-token MFA |
 | Email change | verify new email before updating | verify new email, update Cognito and profile |
-| Logout | invalidate all app sessions | Cognito global sign-out + app invalidation |
+| Logout | ends the current session; `{all:true}` ends every session | same; `{all:true}` adds Cognito global sign-out |
+| Refresh sessions | rotating refresh tokens, 4 days max | same (RT-App sessions, not Cognito refresh tokens) |
 | Profile/permissions | JSON | DynamoDB |
 
 `GET /auth/methods` advertises provider and capabilities. A password login can return
@@ -35,10 +36,66 @@ Cognito validates provider access tokens using GetUser and matches its immutable
 username to the app's reserved user ID. RT-App then issues its own 15-minute application
 JWT. API authorization always reads the current application profile; Cognito groups or
 unverified JWT claims cannot grant application roles. Provider tokens are not exposed
-to the frontend. Refresh tokens are not exposed or automatically renewed.
+to the frontend. Cognito refresh tokens are not exposed or renewed; RT-App sessions (below) are
+independent of them.
 
 AWS SDK clients are created once per application instance and reused across warm
 Lambda requests. No new pool, client or user is created during ordinary login.
+
+## Sessions and refresh tokens
+
+Every sign-in (password, email code, password + TOTP, email change) returns
+
+```json
+{"token": "<15-minute JWT>", "expiresIn": 900, "refreshToken": "<sessionId>.<secret>",
+ "refreshExpiresAt": "2026-01-06T03:04:05.000Z", "sessionId": "<id>", "user": {}}
+```
+
+- **Access token:** unchanged, 15 minutes. It is checked once, when a request starts, so work that
+  is already running (a long upload, a report, a deployment job) is never cut by expiry.
+- **Refresh:** `POST /auth/refresh {refreshToken}` returns a new access token and a new refresh
+  token for the same session. The old refresh token stops working; reusing it after 30 seconds is
+  treated as theft and ends the session everywhere. Failures are always 401 `Invalid session`:
+  send the user to sign in.
+- **Lifetime:** a session ends 4 days after sign-in no matter how often it is refreshed
+  (`new Auth(..., {sessionTtlMs})` changes it). Then the user signs in again.
+- **Immediate cut-off:** refresh re-reads the user every time. Deactivating a user, changing their
+  role or grants, a password reset, MFA changes and "log out everywhere" end every session and
+  every access token at once. Revoking one session also stops its access tokens immediately.
+- **Your sessions:** `GET /auth/sessions` lists your active sessions (`id, createdAt, lastUsedAt,
+  expiresAt, current, ip, userAgent`; never secrets). `DELETE /auth/sessions/:id` ends one.
+- **Logout:** `POST /auth/logout` now ends only the current session (the device you are on);
+  `POST /auth/logout {"all": true}` ends all of them, as logout did before. Old access tokens
+  without a session id still log out everywhere. Owners and admins end a user's sessions the
+  usual way (deactivate, change grants, reset MFA).
+- **Admin console:** with a deployed API the root sign-in also gets a refresh session
+  (`POST /admin/identity/auth/refresh`); changing `ADMIN_PASSWORD` ends all of them. The local
+  installer keeps 15-minute root tokens.
+
+The database stores only HMACs of refresh secrets (`SESSIONS#<userId>` rows with a TTL at
+expiry). Row formats and algorithms: `docs/polyglot/auth-sessions.md`.
+
+### Browser clients
+
+`@gsalgadotoledo/rt-app-auth/client` (`createSessionClient`) is used by the starter SPA, the SSR
+account menu and the admin console. It refreshes about 90 seconds before the access token expires,
+refreshes once and retries when the API answers 401 with a session error, runs one refresh at a
+time (across tabs with Web Locks, sharing rotations over a `BroadcastChannel`), and signs out only
+when the server rejects the refresh token. Network errors and 429/5xx keep the session and retry
+after 30 seconds.
+
+Storage choices and XSS trade-offs:
+
+- **Starter SPA:** `sessionStorage` (as before): survives reloads and payment redirects in the tab,
+  gone when the tab closes. Pass `storage: localStorage` to stay signed in across browser restarts
+  for up to 4 days.
+- **SSR account menu and admin console:** memory only (as before); a reload asks to sign in again.
+- Any script running on your origin (XSS) can read a token kept in JavaScript memory or Web
+  Storage, and a stolen refresh token lives up to 4 days instead of 15 minutes. Rotation and reuse
+  detection limit the damage (the first reuse ends the session for both parties), and `GET
+  /auth/sessions` + `DELETE` let users end sessions they do not recognize. An HttpOnly cookie
+  would hide the token from scripts, but it needs a same-site API and CSRF protection, which the
+  split SPA/API deployment does not have; prefer a strict Content-Security-Policy.
 
 ## TOTP and recovery
 
@@ -89,11 +146,12 @@ provisioning keeps incomplete profiles inactive. Email changes and MFA changes c
 administrator reconciliation if the remote step succeeds but a subsequent database
 write fails. Retrying a failed user creation is supported; ambiguous MFA changes should
 be reset by an authorized administrator before re-enrolling. Changes made directly in
-the Cognito console do not instantly revoke RT-App JWTs; they can last up to 15 minutes
-unless application sessions are also invalidated.
+the Cognito console do not revoke RT-App sessions: refresh checks the RT-App profile, not
+Cognito, so a session can keep refreshing for up to 4 days. Deactivate the user (or reset MFA)
+in RT-App to end their sessions immediately.
 
 Not implemented by this contract: social/SAML/OIDC federation, passkeys, hosted/managed
-login pages, refresh-session UI, SMS MFA, remembered devices, adaptive risk protection,
+login pages, a session-management UI (the API exists), SMS MFA, remembered devices, adaptive risk protection,
 public sign-up or a general Cognito administration console. These require additional
 provider capabilities rather than pretending every adapter supports them.
 

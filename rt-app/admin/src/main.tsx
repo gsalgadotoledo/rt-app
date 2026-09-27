@@ -11,6 +11,7 @@ import {browserApiUrl} from '@gsalgadotoledo/rt-app-config';
 declare const __RT_APP_CONFIG__: import('@gsalgadotoledo/rt-app-config').PublicConfig;
 import AwsMonitorPanel from "@gsalgadotoledo/rt-app-aws/admin";
 import React, { useState, useEffect, useRef } from "react";
+import { createSessionClient } from "@gsalgadotoledo/rt-app-auth/client";
 import { createRoot } from "react-dom/client";
 import type { Api } from "@gsalgadotoledo/rt-app-admin-ui";
 import { ModuleWorkspace } from "@gsalgadotoledo/rt-app-admin-ui";
@@ -45,7 +46,7 @@ function AdminApp({
     [installer, setInstaller] = useState(false),
     [localAccess, setLocalAccess] = useState(false),
     [base, setBase] = useState(API),
-    [session, setSession] = useState<any>(),
+    [session, setSessionState] = useState<any>(),
     [modules, setModules] = useState<any[]>([]),
     [error, setError] = useState("");
   const [menuOpen,setMenuOpen]=useState(false);
@@ -56,6 +57,19 @@ function AdminApp({
     catch { return 240; }
   });
   const sidebarDrag = useRef<{x:number;width:number} | null>(null);
+  // The root session stays in memory (a reload asks for the password again, as before). With a
+  // deployed API the sign-in also returns a refresh token: the client refreshes in the background
+  // and signs out only when the refresh is rejected. The installer has no refresh (15 minutes).
+  const baseRef = useRef(base);
+  baseRef.current = base;
+  const [sessions] = useState(() => createSessionClient({
+    baseUrl: () => baseRef.current,
+    refreshPath: "/admin/identity/auth/refresh",
+    storageKey: "rt-app.admin.session",
+    storage: null,
+  }));
+  useEffect(() => sessions.subscribe(setSessionState), [sessions]);
+  const setSession = (value: any) => sessions.set(value);
   const resizeSidebar = (width:number) => setSidebarWidth(Math.max(180, Math.min(440, width)));
   useEffect(() => {
     try { localStorage.setItem("rt-app.admin.sidebar-width", String(sidebarWidth)); } catch {}
@@ -110,11 +124,10 @@ function AdminApp({
       });
   }, []);
   const api: Api = async (path, method = "GET", body) => {
-    const response = await fetch(base + path, {
+    const response = await sessions.fetch(path, {
       method,
       headers: {
         "content-type": "application/json",
-        ...(session?.token ? { authorization: "Bearer " + session.token } : {}),
         ...(installer
           ? {
               "x-setup-token":
@@ -126,7 +139,6 @@ function AdminApp({
     });
     const data = await response.json();
     if (!response.ok) {
-      if (response.status === 401 && session) setSession(undefined);
       // Keep the HTTP status so panels can tell a 409 conflict from a 403 or a 400.
       throw Object.assign(new Error(data.error ?? "Request failed"), { status: response.status });
     }
@@ -137,7 +149,7 @@ function AdminApp({
       void api("/admin/modules")
         .then(setModules)
         .catch((e) => setError(e.message));
-  }, [session, installer]);
+  }, [session?.sessionId ?? session?.token, installer]);
   if (startup === "loading")
     return (
       <main className="setup-shell">
@@ -215,7 +227,9 @@ function AdminApp({
         <header>
           <div className="admin-page-heading"><nav aria-label="Breadcrumb" className="admin-breadcrumb"><Link to="/">Overview</Link>{page!=="home"&&<><span aria-hidden="true">/</span><Link to={route.pathname} aria-current="page">{page==="themes"?"Themes":page==="deployments"?"Deployments":manifest?.title??"Page not found"}</Link></>}</nav><h1>{page==="home"?"System console":page==="themes"?"Themes":page==="deployments"?"Deployments":manifest?.title??"Page not found"}</h1></div>
           {!localAccess && <button
-            onClick={() => {
+            onClick={async () => {
+              // Revoke the root session on the server when there is one; sign out locally anyway.
+              if (session?.refreshToken) await api("/admin/identity/auth/logout", "POST", {}).catch(() => undefined);
               setSession(undefined);
               setModules([]);
               setPage("home");

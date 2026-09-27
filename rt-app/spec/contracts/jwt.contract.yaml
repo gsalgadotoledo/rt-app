@@ -23,6 +23,13 @@ description: |
     - sub must be truthy (empty string rejected); v must be an integer number (0 accepted,
       "1", 1.5 and true rejected).
 
+  Refresh sessions (auth contract): issue({id, tokenVersion, sid}) with a non-empty string sid adds
+  the claim right after v: payload exactly {"v","sid","sub","iss","aud","iat","exp"}. A missing,
+  null, empty or non-string sid is ignored (the token is byte-identical to one without it). verify
+  returns {id, version, sid} when the token has a sid claim; a sid claim that is present but not a
+  non-empty string (number, "", null) is 401 "Invalid or expired session". Claim order never matters
+  for verification.
+
   Subject facade "jwt": init {secret, issuer?, audience?, now}: now is the ISO 8601 clock.
   Methods: issue(user), verify(token), setNow(iso) (helper: moves the clock, returns null).
 subject: jwt
@@ -186,3 +193,41 @@ cases:
         args: [ { id: user-1, tokenVersion: 1 } ]
         expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.rrjrlTdsx2uAubGCoff2KEbSJwOJZZV6nwauje2WVtU" }
         note: 8 emoji are 32 UTF-8 bytes; the key is the UTF-8 encoding
+
+  # --- optional sid claim (refresh sessions) ---------------------------------------------------
+  - name: a session id becomes the sid claim right after v
+    tags: [interop, determinism, sessions]
+    steps:
+      - call: issue
+        args: [ { id: user-1, tokenVersion: 1, sid: sessionAlice0000000001 } ]
+        expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOiJzZXNzaW9uQWxpY2UwMDAwMDAwMDAxIiwic3ViIjoidXNlci0xIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.FEeOrOavus06FFxuxPg0uzGYC_oNKiPzd6WxWf9FJbU" }
+        note: 'payload {"v":1,"sid":"sessionAlice0000000001","sub":"user-1",...}'
+      - { call: verify, args: [ { $ref: "0.value" } ], expect: { value: { id: user-1, version: 1, sid: sessionAlice0000000001 } } }
+
+  - name: an empty or missing sid is not a claim
+    tags: [interop, determinism, sessions, edge]
+    steps:
+      - call: issue
+        args: [ { id: user-1, tokenVersion: 1, sid: "" } ]
+        expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" }
+      - call: issue
+        args: [ { id: user-1, tokenVersion: 1, sid: null } ]
+        expect: { value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" }
+      - call: verify
+        args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.cKpp1WKANeBYqmOeu2NSuKbCgBCLFDl69JlwJG3CCfY" ]
+        expect: { value: { id: user-1, version: 1 } }
+        note: tokens without sid verify as before (no sid key, or null)
+
+  - name: sid is read wherever it appears in the payload
+    tags: [interop, sessions]
+    call: verify
+    args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDUsInNpZCI6InNlc3Npb25BbGljZTAwMDAwMDAwMDEifQ.IikC0eh-hWsMoEXa7AN9gZvgVCnACwZhwvBwufvOxYU" ]
+    expect: { value: { id: user-1, version: 1, sid: sessionAlice0000000001 } }
+    note: sid as the last claim
+
+  - name: a sid claim that is not a non-empty string is 401
+    tags: [security, sessions, edge]
+    steps:
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOjcsInN1YiI6InVzZXItMSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.xbIUwMtAP1WxrxZPivaAl_BUWvzAPa4IFf-QMeVCRMc" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: sid 7 }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOiIiLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.Fd1ruPb77Y7Y15AH1KCPo8nLvSSRTX0QZejejnAyWTY" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: sid "" }
+      - { call: verify, args: [ "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOm51bGwsInN1YiI6InVzZXItMSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.0vSxIDvxoevMJrRk2Y9jCgcw1qZFsaWGtFKbhjvDfo8" ], expect: { error: { status: 401, message: Invalid or expired session } }, note: sid null (present) }
