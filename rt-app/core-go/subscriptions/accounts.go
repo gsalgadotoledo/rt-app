@@ -97,9 +97,11 @@ func (s *Subscriptions) allowanceLeft(data map[string]any, productID string) flo
 	return math.Max(0, math.Min(math.Min(num(product["dailyLimit"])-num(c["day"]), num(product["weeklyLimit"])-num(c["week"])), num(product["credits"])-num(c["period"])))
 }
 
-// available is the allowance left plus the additional (non-expiring) credits.
+// available is the allowance left plus the additional (non-expiring) credits, minus the
+// credits held by active reservations (see free).
 func (s *Subscriptions) available(data map[string]any, productID string) float64 {
-	return s.allowanceLeft(data, productID) + numOr(obj(data["creditBalance"])[productID], 0)
+	free := s.free(data, productID)
+	return free.allowance + free.balance
 }
 
 // windows are the allowance windows of the active entitlement (nil without one).

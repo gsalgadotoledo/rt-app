@@ -165,11 +165,17 @@ func (s *Subscriptions) Maintenance(ctx context.Context) (map[string]any, error)
 		}
 		for _, row := range page.Items {
 			d := row.Data
-			if !truthy(d["plan"]) {
+			// Accounts without an own plan are skipped unless expired holds need releasing
+			// (reservations made on an administrator-assigned plan).
+			expiredHolds := false
+			for _, h := range holdsOf(d) {
+				expiredHolds = expiredHolds || s.now() >= num(h["expiresAt"])
+			}
+			if !truthy(d["plan"]) && !expiredHolds {
 				continue
 			}
 			now := s.now()
-			renew := d["mode"] == "none" && !truthy(d["cancelAtPeriodEnd"]) && now >= num(d["periodEnd"])
+			renew := truthy(d["plan"]) && d["mode"] == "none" && !truthy(d["cancelAtPeriodEnd"]) && now >= num(d["periodEnd"])
 			source := d
 			if renew {
 				step := num(obj(d["plan"])["periodDays"]) * day
@@ -178,9 +184,14 @@ func (s *Subscriptions) Maintenance(ctx context.Context) (map[string]any, error)
 			}
 			next := s.normalized(source)
 			settled := s.settle(row.SK, d, next)
-			if renew || len(settled) > 0 {
+			// Release expired reservations after the window rollover, in the same transaction.
+			swept, err := s.sweepHolds(ctx, row.SK, next, "")
+			if err != nil {
+				return nil, err
+			}
+			if renew || len(settled) > 0 || len(swept) > 0 {
 				r := row
-				if err := ignoreConflict(s.store.Transact(ctx, append([]nosql.Write{write(&r, row.PK, row.SK, next)}, settled...))); err != nil {
+				if err := ignoreConflict(s.store.Transact(ctx, append(append([]nosql.Write{write(&r, row.PK, row.SK, next)}, settled...), swept...))); err != nil {
 					return nil, err
 				}
 			}

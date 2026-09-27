@@ -13,11 +13,13 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 
 	"rt.local/core-go/apperr"
 	"rt.local/core-go/conformance"
 	"rt.local/core-go/internal/canonical"
 	"rt.local/core-go/internal/js"
+	"rt.local/core-go/nosql"
 	"rt.local/core-go/subscriptions"
 	"rt.local/core-go/web"
 )
@@ -47,6 +49,68 @@ func (f *fakeCatalog) Publish(_ context.Context, plan subscriptions.Plan, namesp
 	}
 	suffix := strings.ReplaceAll(js.String(plan["id"]), "-", "_") + "_" + strings.ReplaceAll(version, ".", "_")
 	return subscriptions.CatalogIDs{StripePriceID: "price_" + suffix, StripeProductID: "prod_" + suffix}, nil
+}
+
+// failingStore makes the next transactions fail with 503 "Injected store failure", "before"
+// committing (nothing written) or "after" (written, the reply is lost): failWrites.
+type failingStore struct {
+	*nosql.MemoryStore
+	mu       sync.Mutex
+	injected []string
+}
+
+func (f *failingStore) Transact(ctx context.Context, writes []nosql.Write) error {
+	f.mu.Lock()
+	mode := ""
+	if len(f.injected) > 0 {
+		mode, f.injected = f.injected[0], f.injected[1:]
+	}
+	f.mu.Unlock()
+	if mode == "before" {
+		return apperr.New(503, "Injected store failure")
+	}
+	if err := f.MemoryStore.Transact(ctx, writes); err != nil {
+		return err
+	}
+	if mode == "after" {
+		return apperr.New(503, "Injected store failure")
+	}
+	return nil
+}
+
+// outcome is a call's result for race and batch: nil on success, else {status, message}.
+func outcome(err error) map[string]any {
+	if err == nil {
+		return nil
+	}
+	if e, ok := apperr.As(err); ok {
+		return map[string]any{"status": e.Status, "message": e.Message}
+	}
+	return map[string]any{"status": nil, "message": err.Error()}
+}
+
+// outcomes summarizes race and batch results: {fulfilled, rejected (sorted by message)}.
+func outcomes(results []map[string]any) map[string]any {
+	rejected := []any{}
+	var sorted []map[string]any
+	for _, r := range results {
+		if r != nil {
+			sorted = append(sorted, r)
+		}
+	}
+	slices.SortStableFunc(sorted, func(a, b map[string]any) int { return strings.Compare(a["message"].(string), b["message"].(string)) })
+	for _, r := range sorted {
+		rejected = append(rejected, r)
+	}
+	return map[string]any{"fulfilled": float64(len(results) - len(sorted)), "rejected": rejected}
+}
+
+// meta reads a wire ReservationMeta {source, actorId} (null: the defaults).
+func metaFrom(v any) subscriptions.ReservationMeta {
+	o, _ := v.(map[string]any)
+	source, _ := o["source"].(string)
+	actor, _ := o["actorId"].(string)
+	return subscriptions.ReservationMeta{Source: source, ActorID: actor}
 }
 
 // userFrom reads a wire actor {id, email}.
@@ -133,10 +197,11 @@ func subscriptionsSubject(ctx context.Context, init json.RawMessage) (conformanc
 	}
 	now := float64(start.UnixMilli())
 	clock := func() float64 { return now }
-	store, err := memoryStore(ctx, init)
+	memory, err := memoryStore(ctx, init)
 	if err != nil {
 		return conformance.Instance{}, err
 	}
+	store := &failingStore{MemoryStore: memory}
 	var sent []any
 	catalog := &fakeCatalog{mode: "ok"}
 	options := []subscriptions.Option{
@@ -159,7 +224,20 @@ func subscriptionsSubject(ctx context.Context, init json.RawMessage) (conformanc
 	s := subscriptions.New(store, options...)
 	feature := s.Feature()
 	m := func(fn func(ctx context.Context, args []json.RawMessage) (any, error)) conformance.Method { return fn }
-	return conformance.Instance{Methods: map[string]conformance.Method{
+	type call struct {
+		Call string            `json:"call"`
+		Args []json.RawMessage `json:"args"`
+	}
+	var methods map[string]conformance.Method
+	run := func(ctx context.Context, c call) map[string]any {
+		method, ok := methods[c.Call]
+		if !ok {
+			return map[string]any{"status": nil, "message": "unknown method " + c.Call}
+		}
+		_, err := method(ctx, c.Args)
+		return outcome(err)
+	}
+	methods = map[string]conformance.Method{
 		"settings": m(func(ctx context.Context, _ []json.RawMessage) (any, error) { return s.Settings(ctx) }),
 		"saveSettings": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
 			return s.SaveSettings(ctx, argAny(a, 0), argString(a, 1), nil)
@@ -230,6 +308,134 @@ func subscriptionsSubject(ctx context.Context, init json.RawMessage) (conformanc
 		}),
 		"ledger": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
 			return s.Ledger(ctx, argString(a, 0), argString(a, 1))
+		}),
+		"reserve": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
+			return s.Reserve(ctx, argString(a, 0), argAny(a, 1), objectOr(argAny(a, 2)), metaFrom(argAny(a, 3)))
+		}),
+		"settle": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
+			return s.Settle(ctx, argString(a, 0), argAny(a, 1), objectOr(argAny(a, 2)), metaFrom(argAny(a, 3)))
+		}),
+		"release": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
+			return s.Release(ctx, argString(a, 0), argAny(a, 1), metaFrom(argAny(a, 2)))
+		}),
+		"preflight": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
+			return s.Preflight(ctx, argString(a, 0), argAny(a, 1), objectOr(argAny(a, 2)))
+		}),
+		"usageSummary": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
+			return s.UsageSummary(ctx, argString(a, 0))
+		}),
+		// failWrites(count, mode): the next count transactions fail ("before" or "after" commit).
+		"failWrites": m(func(_ context.Context, a []json.RawMessage) (any, error) {
+			mode := argString(a, 1)
+			if mode != "before" && mode != "after" {
+				return nil, errors.New(`failWrites mode is "before" or "after"`)
+			}
+			count, _ := argAny(a, 0).(float64)
+			store.mu.Lock()
+			for i := 0; i < int(count); i++ {
+				store.injected = append(store.injected, mode)
+			}
+			store.mu.Unlock()
+			return nil, nil
+		}),
+		// race([{call, args}]): the calls at once, one goroutine each.
+		"race": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
+			var calls []call
+			if err := json.Unmarshal(arg(a, 0), &calls); err != nil {
+				return nil, err
+			}
+			results := make([]map[string]any, len(calls))
+			var start, done sync.WaitGroup
+			start.Add(1)
+			for i, c := range calls {
+				done.Add(1)
+				go func() {
+					defer done.Done()
+					start.Wait()
+					results[i] = run(ctx, c)
+				}()
+			}
+			start.Done()
+			done.Wait()
+			return outcomes(results), nil
+		}),
+		// batch([{call, args}]): the calls one after the other.
+		"batch": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
+			var calls []call
+			if err := json.Unmarshal(arg(a, 0), &calls); err != nil {
+				return nil, err
+			}
+			results := make([]map[string]any, len(calls))
+			for i, c := range calls {
+				results[i] = run(ctx, c)
+			}
+			return outcomes(results), nil
+		}),
+		// ledgerCheck(userId): statement invariants (docs/polyglot/subscriptions-reservations.md).
+		"ledgerCheck": m(func(ctx context.Context, a []json.RawMessage) (any, error) {
+			userID := argString(a, 0)
+			var entries []map[string]any
+			cursor := ""
+			for {
+				page, err := store.List(ctx, "SUB_LEDGER#"+userID, cursor)
+				if err != nil {
+					return nil, err
+				}
+				for _, r := range page.Items {
+					entries = append(entries, r.Data)
+				}
+				if cursor = page.Cursor; cursor == "" {
+					break
+				}
+			}
+			row, err := store.Get(ctx, "SUB_ACCOUNTS", userID)
+			if err != nil {
+				return nil, err
+			}
+			account := map[string]any{}
+			if row != nil {
+				account = row.Data
+			}
+			n := func(v any) float64 { f, _ := v.(float64); return f }
+			windows, _ := account["ledgerWindows"].(map[string]any)
+			counters, _ := account["counters"].(map[string]any)
+			if key, _ := windows["key"].(string); strings.HasPrefix(key, "admin:") {
+				grant, _ := account["adminGrant"].(map[string]any)
+				counters, _ = grant["counters"].(map[string]any)
+			}
+			credits, held, reserved, allowance, additional := 0.0, 0.0, 0.0, 0.0, 0.0
+			negative := false
+			for _, e := range entries {
+				credits += n(e["credits"])
+				held += n(e["held"])
+				if v, ok := e["available"].(float64); ok && v < 0 {
+					negative = true
+				}
+			}
+			holds, _ := account["reservations"].([]any)
+			for _, h := range holds {
+				hold, _ := h.(map[string]any)
+				reserved += n(hold["credits"])
+			}
+			products, _ := windows["products"].(map[string]any)
+			for productID, w := range products {
+				window, _ := w.(map[string]any)
+				counter, _ := counters[productID].(map[string]any)
+				used := 0.0
+				if counter != nil && n(counter["weekStart"]) == n(window["start"]) {
+					used = n(counter["week"])
+				}
+				allowance += n(window["allowance"]) - used
+			}
+			balances, _ := account["creditBalance"].(map[string]any)
+			for _, v := range balances {
+				additional += n(v)
+				negative = negative || n(v) < 0
+			}
+			return map[string]any{
+				"entries": float64(len(entries)), "credits": credits, "held": held, "reserved": reserved, "allowance": allowance,
+				"additional": additional, "balanced": credits == allowance+additional && held == reserved, "negative": negative,
+			}, nil
 		}),
 		"overview":    m(func(ctx context.Context, a []json.RawMessage) (any, error) { return s.Overview(ctx, argAny(a, 0)) }),
 		"maintenance": m(func(ctx context.Context, _ []json.RawMessage) (any, error) { return s.Maintenance(ctx) }),
@@ -319,7 +525,8 @@ func subscriptionsSubject(ctx context.Context, init json.RawMessage) (conformanc
 			}
 			return out, nil
 		}),
-	}}, nil
+	}
+	return conformance.Instance{Methods: methods}, nil
 }
 
 func nonNil(items []any) []any {

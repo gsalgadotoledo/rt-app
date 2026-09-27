@@ -189,6 +189,57 @@ func (s *Subscriptions) Feature() web.Feature {
 			Tool:   &web.Tool{Name: "subscriptions_maintenance", Description: "Run subscription maintenance and configured notifications.", Example: map[string]any{}},
 			Handle: func(c *web.Context) (any, error) { return s.Maintenance(c.Ctx) }},
 	)
+	// Credit reservations. Personal endpoints act on the signed-in user's own reservations
+	// (source "user"); a backend that meters model calls uses the owner endpoints (admin token),
+	// whose reservations the user cannot settle or release.
+	asUser := func(c *web.Context) ReservationMeta {
+		return ReservationMeta{Source: string(SourceUser), ActorID: actorID(c.Actor)}
+	}
+	asAPI := func(c *web.Context) ReservationMeta {
+		return ReservationMeta{Source: string(SourceAPI), ActorID: actorID(c.Actor)}
+	}
+	endpoints = append(endpoints,
+		web.Endpoint{Method: "GET", Path: "/subscriptions/credits/usage", Resource: "subscriptions.me", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
+			return s.UsageSummary(c.Ctx, actorID(c.Actor))
+		}},
+		web.Endpoint{Method: "POST", Path: "/subscriptions/credits/preflight", Resource: "subscriptions.me", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
+			return s.Preflight(c.Ctx, actorID(c.Actor), c.Request.Body["productId"], amountBody(c.Request.Body))
+		}},
+		web.Endpoint{Method: "POST", Path: "/subscriptions/credits/reservations", Resource: "subscriptions.me", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
+			return s.Reserve(c.Ctx, actorID(c.Actor), c.Request.Body["productId"], reservationBody(c.Request.Body), asUser(c))
+		}},
+		web.Endpoint{Method: "POST", Path: "/subscriptions/credits/reservations/:key/settle", Resource: "subscriptions.me", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
+			return s.Settle(c.Ctx, actorID(c.Actor), c.Params["key"], usageBody(c.Request.Body), asUser(c))
+		}},
+		web.Endpoint{Method: "POST", Path: "/subscriptions/credits/reservations/:key/release", Resource: "subscriptions.me", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
+			return s.Release(c.Ctx, actorID(c.Actor), c.Params["key"], asUser(c))
+		}},
+		web.Endpoint{Method: "GET", Path: "/subscriptions/admin/accounts/:id/usage", Resource: manage, Access: web.Owner,
+			Tool:   &web.Tool{Name: "subscriptions_credits_usage", Description: "Usage against limits for a user: per product the day/week/period windows (used, reserved, limit, percent, threshold 0|80|95|100), active reservations, alerts at 80% or more and the credit pack for a top-up. params.id user. Never writes.", Example: map[string]any{"params": map[string]any{"id": "USER_ID"}}},
+			Handle: func(c *web.Context) (any, error) { return s.UsageSummary(c.Ctx, c.Params["id"]) }},
+		web.Endpoint{Method: "POST", Path: "/subscriptions/admin/accounts/:id/preflight", Resource: manage, Access: web.Owner,
+			Tool: &web.Tool{Name: "subscriptions_credits_preflight", Description: "Check whether a batch fits before running it. Body: productId and credits, or estimate {rateId, inputTokens, maxOutputTokens}. Returns fits, reason (inactive|payment|product|credits), available, missing, windows and a topUp offer. Never writes.",
+				Example: map[string]any{"params": map[string]any{"id": "USER_ID"}, "body": map[string]any{"productId": "api", "estimate": map[string]any{"rateId": "standard", "inputTokens": 1200, "maxOutputTokens": 800}}}},
+			Handle: func(c *web.Context) (any, error) {
+				return s.Preflight(c.Ctx, c.Params["id"], c.Request.Body["productId"], amountBody(c.Request.Body))
+			}},
+		web.Endpoint{Method: "POST", Path: "/subscriptions/admin/accounts/:id/reservations", Resource: manage, Access: web.Owner,
+			Tool: &web.Tool{Name: "subscriptions_credits_reserve", Description: "Hold credits before a model call. Body: key (stable, e.g. turnId:step), productId, credits or estimate {rateId, inputTokens, maxOutputTokens}, optional ttlMs (default 900000) and reason. Reuse the key for retries; the same key with another amount fails with 409.",
+				Example: map[string]any{"params": map[string]any{"id": "USER_ID"}, "body": map[string]any{"key": "turn-1:0", "productId": "api", "estimate": map[string]any{"rateId": "standard", "inputTokens": 1200, "maxOutputTokens": 800}}}},
+			Handle: func(c *web.Context) (any, error) {
+				return s.Reserve(c.Ctx, c.Params["id"], c.Request.Body["productId"], reservationBody(c.Request.Body), asAPI(c))
+			}},
+		web.Endpoint{Method: "POST", Path: "/subscriptions/admin/accounts/:id/reservations/:key/settle", Resource: manage, Access: web.Owner,
+			Tool: &web.Tool{Name: "subscriptions_credits_settle", Description: "Charge the real usage of a reservation and release the rest. Body: inputTokens and outputTokens (priced with the reserved rate) or credits. Works after the reservation expired; returns uncovered credits it could not charge. Idempotent per key.",
+				Example: map[string]any{"params": map[string]any{"id": "USER_ID", "key": "turn-1:0"}, "body": map[string]any{"inputTokens": 1200, "outputTokens": 150}}},
+			Handle: func(c *web.Context) (any, error) {
+				return s.Settle(c.Ctx, c.Params["id"], c.Params["key"], usageBody(c.Request.Body), asAPI(c))
+			}},
+		web.Endpoint{Method: "POST", Path: "/subscriptions/admin/accounts/:id/reservations/:key/release", Resource: manage, Access: web.Owner,
+			Tool: &web.Tool{Name: "subscriptions_credits_release", Description: "Release a reservation without charging it (the call did not run). Idempotent per key.",
+				Example: map[string]any{"params": map[string]any{"id": "USER_ID", "key": "turn-1:0"}}},
+			Handle: func(c *web.Context) (any, error) { return s.Release(c.Ctx, c.Params["id"], c.Params["key"], asAPI(c)) }},
+	)
 	return web.Feature{ID: "subscriptions", Endpoints: endpoints}
 }
 

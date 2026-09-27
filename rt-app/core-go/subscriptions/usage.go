@@ -48,27 +48,18 @@ func (s *Subscriptions) Consume(ctx context.Context, userID, productID string, c
 			return nil, err
 		}
 		data := s.normalized(rowData(old))
-		entitlement, _ := s.effective(data)
-		if !truthy(entitlement["plan"]) || entitlement["status"] != "active" || s.now() >= num(entitlement["periodEnd"]) {
-			return nil, apperr.New(402, "Subscription is inactive or expired")
-		}
-		settings, err := s.Settings(ctx)
+		entitlement, product, err := s.chargeable(ctx, data, productID)
 		if err != nil {
 			return nil, err
-		}
-		if settings["values"].(map[string]any)["paymentRequired"] == true && entitlement["mode"] != "admin" && !js.Equal(entitlement["mode"], s.providerMode()) {
-			return nil, apperr.New(402, "A paid subscription is required")
-		}
-		product := findProduct(obj(entitlement["plan"]), productID)
-		if product == nil {
-			return nil, apperr.New(403, "Product is not included in your plan")
 		}
 		settled := s.settle(userID, rowData(old), data)
 		counter := obj(obj(entitlement["counters"])[productID])
 		balance := numOr(obj(data["creditBalance"])[productID], 0)
-		fromAllowance := math.Min(amount, s.allowanceLeft(data, productID))
+		// Active reservations hold part of the allowance and balance: never spend them here.
+		free := s.free(data, productID)
+		fromAllowance := math.Min(amount, free.allowance)
 		fromBalance := amount - fromAllowance
-		if fromBalance > balance {
+		if fromBalance > free.balance {
 			window := "period"
 			if num(counter["day"]) >= num(product["dailyLimit"]) {
 				window = "day"
@@ -301,15 +292,15 @@ func (s *Subscriptions) Estimate(ctx context.Context, input map[string]any) (map
 			return nil, err
 		}
 		data := s.normalized(rowData(row))
-		allowance := s.allowanceLeft(data, productID)
-		balance := numOr(obj(data["creditBalance"])[productID], 0)
+		// Raw allowance and balance; the split and `available` are net of active reservations.
+		free := s.free(data, productID)
 		credits := estimate.Credits
-		fromAllowance := math.Min(credits, allowance)
+		fromAllowance := math.Min(credits, free.allowance)
 		fromBalance := credits - fromAllowance
 		result["account"] = map[string]any{
-			"userId": input["userId"], "productId": productID, "allowanceLeft": allowance, "additionalCredits": balance,
-			"available": allowance + balance, "fromAllowance": fromAllowance, "fromBalance": fromBalance,
-			"allowed": fromBalance <= balance && credits > 0, "availableAfter": math.Max(0, allowance+balance-credits),
+			"userId": input["userId"], "productId": productID, "allowanceLeft": free.rawAllowance, "additionalCredits": free.rawBalance,
+			"available": free.allowance + free.balance, "fromAllowance": fromAllowance, "fromBalance": fromBalance,
+			"allowed": fromBalance <= free.balance && credits > 0, "availableAfter": math.Max(0, free.allowance+free.balance-credits),
 		}
 	}
 	return result, nil
