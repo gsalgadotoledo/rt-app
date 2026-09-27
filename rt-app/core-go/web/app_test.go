@@ -189,3 +189,26 @@ func TestCLI(t *testing.T) {
 		t.Fatalf("usage error: exit %d", code)
 	}
 }
+
+func TestPerEndpointBodyLimit(t *testing.T) {
+	big := Endpoint{Method: "POST", Path: "/hooks", Access: Guest, Resource: "hooks", MaxBodyBytes: 64 << 10, Handle: func(*Context) (any, error) { return "ok", nil }}
+	huge := Endpoint{Method: "POST", Path: "/huge", Access: Guest, Resource: "huge", MaxBodyBytes: 50 << 20, Handle: func(*Context) (any, error) { return "ok", nil }}
+	small := Endpoint{Method: "POST", Path: "/small", Access: Guest, Resource: "small", Handle: func(*Context) (any, error) { return "ok", nil }}
+	app, err := New([]Feature{{ID: "t", Endpoints: []Endpoint{big, huge, small}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"a":"` + strings.Repeat("x", 32<<10) + `"}`
+	if w := call(t, app, "POST", "/hooks", body); w.Code != 200 {
+		t.Fatalf("endpoint limit: %d %s", w.Code, w.Body)
+	}
+	if w := call(t, app, "POST", "/small", body); w.Code != 413 {
+		t.Fatalf("default limit: %d", w.Code)
+	}
+	if got := app.BodyLimit("POST", "/huge?x=1"); got != MaxBodyLimit {
+		t.Fatalf("cap: %d", got)
+	}
+	if got := app.BodyLimit("GET", "/nope"); got != DefaultBodyLimit {
+		t.Fatalf("unknown route: %d", got)
+	}
+}

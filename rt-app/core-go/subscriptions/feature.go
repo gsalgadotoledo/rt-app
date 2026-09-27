@@ -9,9 +9,8 @@ import (
 	"rt.local/core-go/web"
 )
 
-// WebhookMaxBodyBytes is the body limit of POST /subscriptions/webhook in the TypeScript
-// framework (256 KiB). web.Endpoint has no per-endpoint limit yet, so the Go web layer applies
-// its app-wide limit (web.WithBodyLimit) to the webhook too.
+// WebhookMaxBodyBytes is the body limit of POST /subscriptions/webhook (256 KiB), as in the
+// TypeScript framework.
 const WebhookMaxBodyBytes = 262144
 
 // Migration describes a module migration.
@@ -118,7 +117,7 @@ func (s *Subscriptions) Feature() web.Feature {
 		web.Endpoint{Method: "PUT", Path: "/subscriptions/preferences", Resource: "subscriptions.me", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
 			return s.Preferences(c.Ctx, actorID(c.Actor), c.Request.Body["notifications"])
 		}},
-		web.Endpoint{Method: "POST", Path: "/subscriptions/webhook", Resource: "subscriptions.webhook", Access: web.Guest, Handle: func(c *web.Context) (any, error) {
+		web.Endpoint{Method: "POST", Path: "/subscriptions/webhook", Resource: "subscriptions.webhook", Access: web.Guest, MaxBodyBytes: WebhookMaxBodyBytes, Handle: func(c *web.Context) (any, error) {
 			return s.Webhook(c.Ctx, string(c.Request.Raw), c.Request.Headers.Get("stripe-signature"))
 		}},
 		web.Endpoint{Method: "GET", Path: "/subscriptions/admin/settings", Resource: manage, Access: web.Owner,

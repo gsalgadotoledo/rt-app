@@ -48,6 +48,9 @@ func AdminOnly(e Endpoint) bool {
 // DefaultBodyLimit is the largest accepted request body (16 KiB).
 const DefaultBodyLimit = 16 << 10
 
+// MaxBodyLimit caps per-endpoint body limits (5 MiB), like TypeScript's MAX_BODY_LIMIT.
+const MaxBodyLimit = 5 << 20
+
 // Feature is a module's HTTP surface.
 type Feature struct {
 	ID        string
@@ -65,6 +68,9 @@ type Endpoint struct {
 	ExplicitGrant bool
 	// Tool opts the endpoint into CLI/MCP exposure (metadata only; HTTP stays the authority).
 	Tool *Tool
+	// MaxBodyBytes raises (or lowers) the body limit for this endpoint, e.g. 256 KiB for
+	// webhooks; 0 uses the app limit. Capped at MaxBodyLimit, like TypeScript.
+	MaxBodyBytes int64
 }
 
 // Tool is the CLI/MCP description of an endpoint, as in TypeScript's ToolExposure.
@@ -217,6 +223,17 @@ func New(features []Feature, options ...Option) (*App, error) {
 	return a, nil
 }
 
+// BodyLimit is the body limit for a request, decided before reading it: the matching
+// endpoint's MaxBodyBytes, else the app limit, capped at MaxBodyLimit.
+func (a *App) BodyLimit(method, target string) int64 {
+	path, _, _ := strings.Cut(target, "?")
+	limit := a.bodyLimit
+	if found, _ := a.find(method, path); found != nil && found.MaxBodyBytes > 0 {
+		limit = found.MaxBodyBytes
+	}
+	return min(limit, MaxBodyLimit)
+}
+
 // ServeHTTP reads the JSON body, dispatches and writes a JSON response.
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a.fallback != nil {
@@ -226,7 +243,8 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, a.bodyLimit+1))
+	limit := a.BodyLimit(r.Method, RawTarget(r))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
@@ -236,7 +254,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody("Invalid request body"))
 		return
 	}
-	if int64(len(raw)) > a.bodyLimit {
+	if int64(len(raw)) > limit {
 		writeJSON(w, http.StatusRequestEntityTooLarge, errorBody("Request body too large"))
 		return
 	}
