@@ -14,7 +14,7 @@ from typing import Any, Final
 
 from ..errors import HttpError
 from .._jsnum import js_string, number_to_string, truthy, utf16_slice
-from .._js import utf16_length
+from .._js import is_safe_integer, utf16_length
 from .credits import DEFAULT_CREDITS, integer, validate_credits
 from .currency import valid_currency, valid_minor_amount
 
@@ -100,17 +100,24 @@ def _products(value: Any) -> list[dict[str, Any]]:
         raise HttpError(400, "A plan needs products")
     products = []
     for x in value:
-        products.append(
-            {
-                "id": identifier(prop(x, "id")),
-                "name": _text(prop(x, "name"), 80),
-                "credits": integer(prop(x, "credits")),
-                "dailyLimit": integer(prop(x, "dailyLimit")),
-                "weeklyLimit": integer(prop(x, "weeklyLimit")),
-                "daySeconds": integer(prop(x, "daySeconds"), 60, 86400 * 31),
-                "weekSeconds": integer(prop(x, "weekSeconds"), 60, 86400 * 366),
-            }
-        )
+        product = {
+            "id": identifier(prop(x, "id")),
+            "name": _text(prop(x, "name"), 80),
+            "credits": integer(prop(x, "credits")),
+            "dailyLimit": integer(prop(x, "dailyLimit")),
+            "weeklyLimit": integer(prop(x, "weeklyLimit")),
+            "daySeconds": integer(prop(x, "daySeconds"), 60, 86400 * 31),
+            "weekSeconds": integer(prop(x, "weekSeconds"), 60, 86400 * 366),
+        }
+        # Validated by `_validate_limits` once the credit rates are known (_RAW marks a given null).
+        short_limit, short_seconds = prop(x, "shortLimit"), prop(x, "shortSeconds")
+        if short_limit is not None or short_seconds is not None:
+            product["shortLimit"] = short_limit
+            product["shortSeconds"] = short_seconds
+        caps = prop(x, "rateCaps")
+        if caps is not None:
+            product["rateCaps"] = caps
+        products.append(product)
     return products
 
 
@@ -133,6 +140,9 @@ def _plan(p: Any) -> dict[str, Any]:
     plan["periodDays"] = integer(prop(p, "periodDays"), 1, 366)
     plan["enabled"] = prop(p, "enabled") is True and prop(p, "archived") is not True
     plan["archived"] = prop(p, "archived") is True
+    margin = prop(p, "maxProviderCostMinor")
+    if margin is not None:
+        plan["maxProviderCostMinor"] = margin
     price = prop(p, "stripePriceId")
     if truthy(price):
         plan["stripePriceId"] = identifier(price)
@@ -169,13 +179,65 @@ def validate_settings(values: Any) -> dict[str, Any]:
     reminder = integer(source.get("reminderDays"), 0, 30)
     credits = source.get("credits")
     # Settings saved before credit rates existed keep working with the defaults.
+    validated = validate_credits(DEFAULT_CREDITS if credits is None else credits)
+    _validate_limits(plans, validated)
     return {
         "paymentRequired": source["paymentRequired"],
         "notifications": source["notifications"],
         "reminderDays": reminder,
         "plans": plans,
-        "credits": validate_credits(DEFAULT_CREDITS if credits is None else credits),
+        "credits": validated,
     }
+
+
+#: Windows of a model cap, in check order.
+CAP_WINDOWS: Final = ("short", "day", "week", "period")
+
+
+def _cap_value(value: Any) -> bool:
+    return is_safe_integer(value) and 0 <= value <= 1e9
+
+
+def _validate_limits(plans: list[dict[str, Any]], credits: Mapping[str, Any]) -> None:
+    """Finance limits, after the rates are validated (plan, then product order): short window
+    (400 "Invalid short window"), model caps (400 "Invalid model cap"; an empty list is dropped)
+    and the margin rule (400 "Invalid margin rule"). Mutates ``plans``."""
+    rate_ids = [r["id"] for r in credits["rates"]]
+    for plan in plans:
+        for product in plan["products"]:
+            if "shortLimit" in product:
+                seconds = product["shortSeconds"]
+                if not _cap_value(product["shortLimit"]) or not is_safe_integer(seconds) or seconds < 60 or seconds > 604800:
+                    raise HttpError(400, "Invalid short window")
+            if "rateCaps" in product:
+                raw = product["rateCaps"]
+                if not isinstance(raw, list) or len(raw) > 20:
+                    raise HttpError(400, "Invalid model cap")
+                caps = []
+                for c in raw:
+                    if not isinstance(c, Mapping) or not isinstance(c.get("rateId"), str) or c.get("rateId") not in rate_ids:
+                        raise HttpError(400, "Invalid model cap")
+                    cap: dict[str, Any] = {"rateId": c["rateId"]}
+                    for window in CAP_WINDOWS:
+                        value = c.get(window)
+                        if value is None:
+                            continue
+                        if not _cap_value(value) or (window == "short" and "shortSeconds" not in product):
+                            raise HttpError(400, "Invalid model cap")
+                        cap[window] = value
+                    if len(cap) < 2:
+                        raise HttpError(400, "Invalid model cap")
+                    caps.append(cap)
+                if len({c["rateId"] for c in caps}) != len(caps):
+                    raise HttpError(400, "Invalid model cap")
+                if caps:
+                    product["rateCaps"] = caps
+                else:
+                    del product["rateCaps"]
+        if "maxProviderCostMinor" in plan:
+            value = plan["maxProviderCostMinor"]
+            if not is_safe_integer(value) or value < 0 or value > 1e12 or plan["currency"] != credits["pack"]["currency"]:
+                raise HttpError(400, "Invalid margin rule")
 
 
 def plan_content(plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -193,6 +255,7 @@ def plan_content(plan: Mapping[str, Any]) -> dict[str, Any]:
         "periodDays": plan.get("periodDays"),
         "products": plan.get("products"),
         "metadata": {} if metadata is None else metadata,
+        **({"maxProviderCostMinor": plan["maxProviderCostMinor"]} if plan.get("maxProviderCostMinor") is not None else {}),
     }
 
 

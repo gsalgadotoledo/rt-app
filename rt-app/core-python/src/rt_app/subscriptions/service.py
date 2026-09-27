@@ -25,7 +25,7 @@ from ..contracts import Clock, epoch_ms
 from ..errors import Conflict, HttpError
 from ..nosql import NoSQL, Row, Write
 from .credits import estimate as price_request
-from .credits import integer
+from .credits import integer, provider_cost, rate_credits, round4
 from .currency import valid_currency, valid_minor_amount
 from .ledger import apply_totals, empty_totals, js_own_keys, ledger, ledger_write, rollover
 from .reservations import (
@@ -37,9 +37,11 @@ from .reservations import (
     reservations,
     same_usage,
     settle_usage,
+    threshold_of,
     window_usage,
 )
 from .plans import (
+    CAP_WINDOWS,
     DEFAULTS,
     default_settings,
     identifier,
@@ -169,6 +171,34 @@ def _js_number(text: Any) -> float:
 def _js_str(value: Any) -> str:
     """``String(value)`` with undefined."""
     return "undefined" if value is UNDEFINED else js_string(value)
+
+
+def _has_short(product: Any) -> bool:
+    """Whether a (subscribed) product has a short window."""
+    return isinstance(product, Mapping) and product.get("shortSeconds") is not None
+
+
+def _reset_rate_window(counter: Mapping[str, Any], window: str) -> None:
+    """Zero one window of every per-model counter (``counters[productId].rates[rateId][window]``)."""
+    rates = counter.get("rates")
+    for r in rates.values() if isinstance(rates, Mapping) else []:
+        if isinstance(r, dict) and r.get(window) is not None:
+            r[window] = 0
+
+
+def _exceeded_window(windows: list[Mapping[str, Any]], credits: Any) -> str | None:
+    """The first window a charge of ``credits`` would overflow (used + reserved + credits > limit)."""
+    return next((w["kind"] for w in windows if w["used"] + w["reserved"] + credits > w["limit"]), None)
+
+
+def _model_limit(rate_name: Any, window: str) -> HttpError:
+    return HttpError(429, f"Model limit reached: {js_string(rate_name)} {window} limit. Use another model or wait for the reset.")
+
+
+def _sum_into(target: dict[str, Any], source: Mapping[str, Any], sign: int = 1) -> None:
+    """Add money per currency with round4 after every addition."""
+    for code in js_own_keys(source):
+        target[code] = round4(_nullish(target.get(code), 0) + sign * source[code])
 
 
 class Subscriptions:
@@ -455,6 +485,12 @@ class Subscriptions:
                 if _ge(now, _add(counter.get(field), seconds * 1000)):
                     counter[field] += math.floor((now - counter[field]) / (seconds * 1000)) * seconds * 1000
                     counter[window] = 0
+                    _reset_rate_window(counter, window)
+            # The short window starts with the first use after the previous one ended.
+            if _has_short(product) and (counter.get("shortStart") is None or now >= counter["shortStart"] + product["shortSeconds"] * 1000):
+                counter["short"] = 0
+                counter["shortStart"] = now
+                _reset_rate_window(counter, "short")
         if truthy(nxt.get("adminGrant")):
             nxt["adminGrant"] = self._normalized(nxt["adminGrant"])
         return nxt
@@ -476,7 +512,8 @@ class Subscriptions:
         counter = _get(entitlement.get("counters"), product_id)
         if product is None or not truthy(counter):
             return 0
-        return max(0, min(product["dailyLimit"] - counter["day"], product["weeklyLimit"] - counter["week"], product["credits"] - counter["period"]))
+        short = product["shortLimit"] - _nullish(counter.get("short"), 0) if _has_short(product) else math.inf
+        return max(0, min(product["dailyLimit"] - counter["day"], product["weeklyLimit"] - counter["week"], product["credits"] - counter["period"], short))
 
     def _balance(self, data: Mapping[str, Any], product_id: str) -> Any:
         return _nullish(_get(data.get("creditBalance"), product_id), 0)
@@ -525,6 +562,117 @@ class Subscriptions:
         entitlement = self._effective(data)
         product = next(p for p in entitlement["plan"].get("products") or [] if p.get("id") == product_id)
         return entitlement, product
+
+    # --- finance limits: model caps and the margin rule are read live from the settings ------
+
+    def _active(self, data: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """The active entitlement or None."""
+        entitlement = self._effective(data)
+        if truthy(entitlement.get("plan")) and entitlement.get("status") == "active" and _lt(self.now(), entitlement.get("periodEnd")):
+            return entitlement
+        return None
+
+    @staticmethod
+    def _live_plan(entitlement: Mapping[str, Any], values: Mapping[str, Any]) -> Mapping[str, Any]:
+        plan_id = entitlement["plan"].get("id")
+        return next((p for p in values["plans"] if p.get("id") == plan_id), entitlement["plan"])
+
+    def _rate_caps(self, data: Mapping[str, Any], values: Mapping[str, Any], product_id: str) -> list[Mapping[str, Any]]:
+        entitlement = self._active(data)
+        if entitlement is None:
+            return []
+        product = next((p for p in self._live_plan(entitlement, values).get("products") or [] if p.get("id") == product_id), None)
+        return list((product or {}).get("rateCaps") or [])
+
+    def _rate_cap(self, data: Mapping[str, Any], values: Mapping[str, Any], product_id: str, rate_id: Any) -> Mapping[str, Any] | None:
+        if rate_id is None:
+            return None
+        return next((c for c in self._rate_caps(data, values, product_id) if c.get("rateId") == rate_id), None)
+
+    def _rate_windows(self, data: Mapping[str, Any], product_id: str, cap: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+        """Usage of a capped rate per window with the active holds of that rate; [] without a cap."""
+        entitlement = self._active(data) if cap else None
+        if entitlement is None or cap is None:
+            return []
+        product = next((p for p in entitlement["plan"].get("products") or [] if p.get("id") == product_id), None)
+        c = _get(entitlement.get("counters"), product_id)
+        if product is None or not truthy(c):
+            return []
+        used = _get(c.get("rates"), cap["rateId"]) or {}
+        reserved = sum(
+            (h["credits"] for h in active_holds(data.get("reservations"), self.now()) if h.get("productId") == product_id and h.get("rateId") == cap["rateId"]),
+            0,
+        )
+        reset_at = {
+            "short": _nullish(c.get("shortStart"), 0) + _nullish(product.get("shortSeconds"), 0) * 1000,
+            "day": c["dayStart"] + product["daySeconds"] * 1000,
+            "week": c["weekStart"] + product["weekSeconds"] * 1000,
+            "period": entitlement["periodEnd"],
+        }
+        return [
+            window_usage(w, _nullish(used.get(w), 0), reserved, cap[w], reset_at[w])
+            for w in CAP_WINDOWS
+            if cap.get(w) is not None and (w != "short" or _has_short(product))
+        ]
+
+    def _count_rate(self, data: Mapping[str, Any], product_id: str, cap: Mapping[str, Any] | None, credits: Any) -> None:
+        """Count credits used at a capped rate on every window of the product (short only with one)."""
+        entitlement = self._active(data) if cap and credits > 0 else None
+        if entitlement is None or cap is None:
+            return
+        product = next((p for p in entitlement["plan"].get("products") or [] if p.get("id") == product_id), None)
+        c = _get(entitlement.get("counters"), product_id)
+        if product is None or not truthy(c):
+            return
+        rates = c.get("rates")
+        if rates is None:
+            rates = c["rates"] = {}
+        r = rates.get(cap["rateId"])
+        if r is None:
+            r = rates[cap["rateId"]] = {}
+        for w in CAP_WINDOWS:
+            if w != "short" or _has_short(product):
+                r[w] = _nullish(r.get(w), 0) + credits
+
+    def _add_cost(self, data: dict[str, Any], cost: Any, currency: str) -> None:
+        """Provider cost: all-time per currency and this entitlement period."""
+        if not (_js.is_number(cost) and cost > 0):
+            return
+        start = self._effective(data).get("periodStart")
+        c = data.get("providerCost")
+        if c is None:
+            c = data["providerCost"] = {"totalMinor": {}, "periodStart": start, "periodMinor": 0}
+        if c.get("periodStart") != start:
+            c["periodStart"] = start
+            c["periodMinor"] = 0
+        c["periodMinor"] = round4(c["periodMinor"] + cost)
+        c["totalMinor"][currency] = round4(_nullish(c["totalMinor"].get(currency), 0) + cost)
+
+    def _period_cost(self, data: Mapping[str, Any]) -> Any:
+        c = data.get("providerCost")
+        if isinstance(c, Mapping) and c.get("periodStart") == self._effective(data).get("periodStart"):
+            return c.get("periodMinor")
+        return 0
+
+    def _margin(self, data: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The margin rule of the active entitlement (live plan) or None."""
+        entitlement = self._active(data)
+        if entitlement is None:
+            return None
+        cap = self._live_plan(entitlement, values).get("maxProviderCostMinor")
+        if cap is None:
+            return None
+        cost = self._period_cost(data)
+        percent = math.floor((cost * 100) / cap) if cap > 0 else 100
+        return {
+            "currency": values["credits"]["pack"]["currency"],
+            "costMinor": cost,
+            "capMinor": cap,
+            "remainingMinor": round4(max(0, cap - cost)),
+            "percent": percent,
+            "threshold": threshold_of(percent),
+            "resetAt": entitlement["periodEnd"],
+        }
 
     def _windows(self, data: Mapping[str, Any]) -> dict[str, Any] | None:
         """Allowance windows of the active entitlement, keyed so a plan change closes the previous ones."""
@@ -616,6 +764,11 @@ class Subscriptions:
                     "weekUsed": counter["week"],
                     "dayResetAt": counter["dayStart"] + product["daySeconds"] * 1000,
                     "weekResetAt": counter["weekStart"] + product["weekSeconds"] * 1000,
+                    **(
+                        {"shortUsed": counter["short"], "shortResetAt": counter["shortStart"] + product["shortSeconds"] * 1000}
+                        if _has_short(product)
+                        else {}
+                    ),
                 }
             )
         return {
@@ -962,8 +1115,16 @@ class Subscriptions:
             from_allowance = min(credits, free["allowance"])
             from_balance = credits - from_allowance
             if from_balance > free["balance"]:
-                window = "day" if counter["day"] >= product["dailyLimit"] else "week" if counter["week"] >= product["weeklyLimit"] else "period"
+                if _has_short(product) and counter["short"] >= product["shortLimit"]:
+                    window = "short"
+                else:
+                    window = "day" if counter["day"] >= product["dailyLimit"] else "week" if counter["week"] >= product["weeklyLimit"] else "period"
                 raise HttpError(429, f"Subscription {window} limit reached. Add credits or wait for the reset.")
+            values = self.settings()["values"]
+            cap = self._rate_cap(data, values, product_id, meta.get("rateId"))
+            capped = _exceeded_window(self._rate_windows(data, product_id, cap), credits) if cap else None
+            if capped:
+                raise _model_limit(_nullish(meta.get("rateName"), meta.get("rateId")), capped)
             if data.get("creditBalance") is None:
                 data["creditBalance"] = {}
             data["creditBalance"][product_id] = balance - from_balance
@@ -971,6 +1132,10 @@ class Subscriptions:
             counter["period"] += from_allowance
             counter["day"] += from_allowance
             counter["week"] += from_allowance
+            if _has_short(product):
+                counter["short"] += from_allowance
+            self._count_rate(data, product_id, cap, credits)
+            self._add_cost(data, meta.get("costMinor"), values["credits"]["pack"]["currency"])
             data["totalConsumed"] = _nullish(data.get("totalConsumed"), 0) + credits
             at = self.now()
             receipt = {
@@ -1124,6 +1289,10 @@ class Subscriptions:
     def consume_usage(self, user_id: str, product_id: str, usage: Any, request_id: Any) -> dict[str, Any]:
         """Estimate a model request and charge it atomically (see ``estimate`` and ``consume``)."""
         priced = self.estimate(usage)
+        cost = provider_cost(priced["rate"], priced["inputTokens"], priced["outputTokens"])
+        details: dict[str, Any] = {"rateId": priced["rate"]["id"], "inputTokens": priced["inputTokens"], "outputTokens": priced["outputTokens"]}
+        if cost is not None:
+            details["costMinor"] = cost
         receipt = self.consume(
             user_id,
             product_id,
@@ -1131,10 +1300,13 @@ class Subscriptions:
             request_id,
             {
                 "reason": js_string(priced["rate"]["name"]) + " request",
-                "details": {"rateId": priced["rate"]["id"], "inputTokens": priced["inputTokens"], "outputTokens": priced["outputTokens"]},
+                "details": details,
+                "rateId": priced["rate"]["id"],
+                "rateName": priced["rate"]["name"],
+                "costMinor": cost,
             },
         )
-        return {**receipt, "valueMinor": priced["valueMinor"], "currency": priced["currency"]}
+        return {**receipt, "valueMinor": priced["valueMinor"], "currency": priced["currency"], **({"costMinor": cost} if cost is not None else {})}
 
     # --- credit reservations: reserve before a call, settle the real usage after it ----------
     # Holds live on the account row (`reservations`) and in SUB_RESERVATION#<userId>/<key>
@@ -1231,8 +1403,15 @@ class Subscriptions:
             available = self._available(data, product_id)
             if amount["credits"] > available:
                 raise HttpError(429, f"Not enough credits: {js_string(amount['credits'] - available)} missing. Add credits or wait for the reset.")
+            estimate = amount["estimate"]
+            cap = self._rate_cap(data, self.settings()["values"], product_id, estimate["rateId"] if estimate else None)
+            capped = _exceeded_window(self._rate_windows(data, product_id, cap), amount["credits"]) if cap else None
+            if capped:
+                raise _model_limit(amount["rateName"], capped)
             at = self.now()
             hold = {"key": key, "productId": product_id, "credits": amount["credits"], "at": at, "expiresAt": at + ttl}
+            if cap:
+                hold["rateId"] = cap["rateId"]
             data["reservations"] = [*holds, hold]
             text = reason if reason is not None else (js_string(amount["rateName"]) + " request" if amount["rateName"] is not None else js_string(product.get("name")) + " usage")
             entry: dict[str, Any] = {
@@ -1311,10 +1490,18 @@ class Subscriptions:
             charged = from_allowance + from_balance
             uncovered = used - charged
             if from_allowance > 0:
-                counter = self._effective(data)["counters"][product_id]
+                entitlement = self._effective(data)
+                counter = entitlement["counters"][product_id]
                 counter["period"] += from_allowance
                 counter["day"] += from_allowance
                 counter["week"] += from_allowance
+                if _has_short(next((p for p in entitlement["plan"].get("products") or [] if p.get("id") == product_id), None)):
+                    counter["short"] += from_allowance
+            # Model caps count what was used (uncovered included); provider cost is the full usage.
+            estimated = record.get("estimate")
+            self._count_rate(data, product_id, self._rate_cap(data, settings["values"], product_id, estimated.get("rateId") if isinstance(estimated, Mapping) else None), used)
+            cost = provider_cost(priced["rate"], priced["inputTokens"], priced["outputTokens"]) if priced is not None else None
+            self._add_cost(data, cost, settings["values"]["credits"]["pack"]["currency"])
             if data.get("creditBalance") is None:
                 data["creditBalance"] = {}
             data["creditBalance"][product_id] = free["rawBalance"] - from_balance
@@ -1325,6 +1512,8 @@ class Subscriptions:
             if priced is not None:
                 details.update({"rateId": priced["rate"]["id"], "inputTokens": priced["inputTokens"], "outputTokens": priced["outputTokens"]})
             details.update({"reserved": record["credits"], "used": used, "uncovered": uncovered})
+            if cost is not None:
+                details["costMinor"] = cost
             entry: dict[str, Any] = {
                 "at": at,
                 "kind": "settlement",
@@ -1357,6 +1546,7 @@ class Subscriptions:
                 "valueMinor": js_round(charged * pack["amountMinor"] / pack["credits"]),
                 "currency": pack["currency"],
                 "usage": reported,
+                **({"costMinor": cost} if cost is not None else {}),
             }
             self.store.transact(
                 [
@@ -1438,6 +1628,11 @@ class Subscriptions:
         # Holds sit on the allowance first: that part counts on every window once settled.
         reserved = min(self._held(data, product_id), self._allowance_left(data, product_id))
         return [
+            *(
+                [window_usage("short", c["short"], reserved, product["shortLimit"], c["shortStart"] + product["shortSeconds"] * 1000)]
+                if _has_short(product)
+                else []
+            ),
             window_usage("day", c["day"], reserved, product["dailyLimit"], c["dayStart"] + product["daySeconds"] * 1000),
             window_usage("week", c["week"], reserved, product["weeklyLimit"], c["weekStart"] + product["weekSeconds"] * 1000),
             window_usage("period", c["period"], reserved, product["credits"], entitlement["periodEnd"]),
@@ -1455,7 +1650,16 @@ class Subscriptions:
         free = self._free(data, product_id)
         available = 0 if blocked else free["allowance"] + free["balance"]
         missing = max(0, amount["credits"] - available)
-        fits = blocked is None and missing == 0
+        estimate = amount["estimate"]
+        values = settings["values"]
+        cap = None if blocked else self._rate_cap(data, values, product_id, estimate["rateId"] if estimate else None)
+        models = self._rate_windows(data, product_id, cap)
+        capped = _exceeded_window(models, amount["credits"]) if cap else None
+        fits = blocked is None and missing == 0 and not capped
+        rate = next((r for r in values["credits"]["rates"] if r["id"] == estimate["rateId"]), None) if estimate else None
+        cost = provider_cost(rate, estimate["inputTokens"], estimate["maxOutputTokens"]) if rate is not None else None
+        margin = None if blocked else self._margin(data, values)
+        exceeded = margin is not None and round4(margin["costMinor"] + _nullish(cost, 0)) > margin["capMinor"]
         pack = settings["values"]["credits"]["pack"]
         packs = math.ceil(missing / pack["credits"])
         top_up = (
@@ -1473,7 +1677,7 @@ class Subscriptions:
             "productId": product_id,
             "credits": amount["credits"],
             "fits": fits,
-            "reason": None if fits else (blocked or "credits"),
+            "reason": None if fits else (blocked or ("credits" if missing > 0 else "model")),
             "available": available,
             "missing": missing,
             "allowanceLeft": free["rawAllowance"],
@@ -1481,7 +1685,53 @@ class Subscriptions:
             "reserved": free["held"],
             "windows": self._usage_windows(data, product_id),
             "topUp": top_up,
+            "costMinor": cost,
+            "model": {"rateId": cap["rateId"], "windows": models, "exceeded": capped} if cap else None,
+            "margin": {**margin, "stepMinor": _nullish(cost, 0), "exceeded": exceeded} if margin is not None else None,
+            "degrade": self._degrade(data, values, product_id, rate, estimate, available, margin)
+            if rate is not None and not blocked and (missing > 0 or capped or exceeded)
+            else None,
         }
+
+    def _degrade(
+        self,
+        data: Mapping[str, Any],
+        values: Mapping[str, Any],
+        product_id: str,
+        current: Mapping[str, Any],
+        estimate: Mapping[str, Any],
+        available: Any,
+        margin: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """A cheaper rate for the same step (least degradation first): strictly cheaper by (cost,
+        credits), fitting the available credits, its own cap and the margin left; None if none."""
+        tokens_in, tokens_out = estimate["inputTokens"], _nullish(estimate.get("maxOutputTokens"), 0)
+
+        def price(r: Mapping[str, Any]) -> dict[str, Any]:
+            return {"rate": r, "credits": rate_credits(r, tokens_in, tokens_out), "cost": provider_cost(r, tokens_in, tokens_out)}
+
+        def cheaper(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+            ac, bc = _nullish(a["cost"], 0), _nullish(b["cost"], 0)
+            return ac < bc or (ac == bc and a["credits"] < b["credits"])
+
+        base = price(current)
+        best: dict[str, Any] | None = None
+        for r in values["credits"]["rates"]:
+            if r["id"] == current["id"]:
+                continue
+            option = price(r)
+            if not cheaper(option, base) or option["credits"] > available:
+                continue
+            cap = self._rate_cap(data, values, product_id, r["id"])
+            if cap and _exceeded_window(self._rate_windows(data, product_id, cap), option["credits"]):
+                continue
+            if margin is not None and round4(margin["costMinor"] + _nullish(option["cost"], 0)) > margin["capMinor"]:
+                continue
+            if best is None or cheaper(best, option):
+                best = option
+        if best is None:
+            return None
+        return {"rateId": best["rate"]["id"], "name": best["rate"]["name"], "credits": best["credits"], "costMinor": best["cost"]}
 
     def usage_summary(self, user_id: str) -> dict[str, Any]:
         """Usage against limits for each product of the user (windows with thresholds, active
@@ -1495,22 +1745,43 @@ class Subscriptions:
         for product_id in js_own_keys(balances) if isinstance(balances, Mapping) else []:
             if product_id not in products:
                 products.append(product_id)
+        values = settings["values"]
         items = []
         for product_id in products:
             free = self._free(data, product_id)
             windows = self._usage_windows(data, product_id)
-            items.append(
+            models = [
                 {
-                    "productId": product_id,
-                    "name": next((p.get("name") for p in plan if p.get("id") == product_id), None),
-                    "allowanceLeft": free["rawAllowance"],
-                    "additionalCredits": free["rawBalance"],
-                    "reserved": free["held"],
-                    "available": free["allowance"] + free["balance"],
-                    "threshold": max([0, *(w["threshold"] for w in windows)]),
-                    "windows": windows,
+                    "rateId": cap["rateId"],
+                    "name": next((r.get("name") for r in values["credits"]["rates"] if r.get("id") == cap["rateId"]), None),
+                    "windows": self._rate_windows(data, product_id, cap),
                 }
+                for cap in self._rate_caps(data, values, product_id)
+            ]
+            item: dict[str, Any] = {
+                "productId": product_id,
+                "name": next((p.get("name") for p in plan if p.get("id") == product_id), None),
+                "allowanceLeft": free["rawAllowance"],
+                "additionalCredits": free["rawBalance"],
+                "reserved": free["held"],
+                "available": free["allowance"] + free["balance"],
+                "threshold": max([0, *(w["threshold"] for w in windows)]),
+                "windows": windows,
+            }
+            if models:
+                item["models"] = models
+            items.append(item)
+        alerts: list[dict[str, Any]] = []
+        for p in items:
+            alerts.extend(
+                {"productId": p["productId"], "window": w["kind"], "percent": w["percent"], "threshold": w["threshold"]} for w in p["windows"] if w["threshold"] >= 80
             )
+            for m in p.get("models") or []:
+                alerts.extend(
+                    {"productId": p["productId"], "window": w["kind"], "percent": w["percent"], "threshold": w["threshold"], "rateId": m["rateId"]}
+                    for w in m["windows"]
+                    if w["threshold"] >= 80
+                )
         return {
             "userId": user_id,
             "active": self._blocked(data, None, settings["values"]["paymentRequired"]) is None,
@@ -1519,13 +1790,9 @@ class Subscriptions:
                 {"key": h["key"], "productId": h["productId"], "credits": h["credits"], "at": h["at"], "expiresAt": h["expiresAt"]}
                 for h in active_holds(data.get("reservations"), self.now())
             ],
-            "alerts": [
-                {"productId": p["productId"], "window": w["kind"], "percent": w["percent"], "threshold": w["threshold"]}
-                for p in items
-                for w in p["windows"]
-                if w["threshold"] >= 80
-            ],
+            "alerts": alerts,
             "pack": settings["values"]["credits"]["pack"],
+            "margin": self._margin(data, values),
         }
 
     def ledger(self, user_id: str, cursor: str | None = None) -> dict[str, Any]:
@@ -1647,11 +1914,65 @@ class Subscriptions:
             "series": series,
         }
 
+    def economics(self, limit: Any = 50) -> dict[str, Any]:
+        """Unit economics per user and per plan: provider cost, revenue (money paid) and margin per
+        currency (4 decimals). See ``spec/contracts/subscriptions-economics.contract.yaml``."""
+        integer(limit, 1, 200)
+        values = self.settings()["values"]
+        currency = values["credits"]["pack"]["currency"]
+        totals: dict[str, Any] = {"users": 0, "costMinor": {}, "revenueMinor": {}, "marginMinor": {}}
+        plans: dict[str, dict[str, Any]] = {}
+        users: list[dict[str, Any]] = []
+        for row in self._all("SUB_ACCOUNTS"):
+            data = self._normalized(row["data"])
+            entitlement = self._active(data)
+            cost = _get(data.get("providerCost"), "totalMinor") or {}
+            revenue = _get(data.get("ledgerTotals"), "paidMinor") or {}
+            if entitlement is None and not cost and not revenue:
+                continue
+            margin: dict[str, Any] = {}
+            _sum_into(margin, revenue)
+            _sum_into(margin, cost, -1)
+            live = self._live_plan(entitlement, values) if entitlement is not None else None
+            users.append(
+                {
+                    "userId": row["sk"],
+                    "planId": live.get("id") if live is not None else None,
+                    "costMinor": cost,
+                    "revenueMinor": revenue,
+                    "marginMinor": margin,
+                    "periodCostMinor": self._period_cost(data),
+                    "capMinor": live.get("maxProviderCostMinor") if live is not None else None,
+                }
+            )
+            key = live.get("id") if live is not None else "none"
+            group = plans.get(key)
+            if group is None:
+                group = plans[key] = {"planId": key, "name": live.get("name") if live is not None else None, "users": 0, "costMinor": {}, "revenueMinor": {}, "marginMinor": {}}
+            group["users"] += 1
+            _sum_into(group["costMinor"], cost)
+            _sum_into(group["revenueMinor"], revenue)
+            _sum_into(group["marginMinor"], margin)
+            totals["users"] += 1
+            _sum_into(totals["costMinor"], cost)
+            _sum_into(totals["revenueMinor"], revenue)
+            _sum_into(totals["marginMinor"], margin)
+        # Stable sorts: by user id first, then by cost descending.
+        users.sort(key=lambda u: u["userId"])
+        users.sort(key=lambda u: -_nullish(u["costMinor"].get(currency), 0))
+        return {
+            "asOf": self.now(),
+            "currency": currency,
+            "totals": totals,
+            "plans": sorted(plans.values(), key=lambda g: g["planId"]),
+            "users": users[: int(limit)],
+        }
+
     def reset(self, user_id: str, input: Any, actor_id: str) -> dict[str, Any]:
         """Courtesy reset of usage windows (day, week, period or all), once per request id."""
         key = identifier(_get(input, "requestId"))
         scope = _get(input, "scope")
-        if scope not in ("day", "week", "period", "all") or not isinstance(scope, str):
+        if scope not in ("short", "day", "week", "period", "all") or not isinstance(scope, str):
             raise HttpError(400, "Invalid reset scope")
         reason = js_trim(js_string(_nullish(_get(input, "reason"), "")))
         if not reason or _js.utf16_length(reason) > 300:
@@ -1673,9 +1994,10 @@ class Subscriptions:
             for product_id in js_own_keys(counters):
                 counter = counters[product_id]
                 before = self._allowance_left(data, product_id)
-                for field in ("day", "week", "period"):
-                    if scope in ("all", field):
+                for field in ("short", "day", "week", "period"):
+                    if scope in ("all", field) and (field != "short" or counter.get("short") is not None):
                         counter[field] = 0
+                        _reset_rate_window(counter, field)
                 restored = self._allowance_left(data, product_id) - before
                 entries.append(
                     self._ledger_entry(

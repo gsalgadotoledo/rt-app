@@ -125,15 +125,19 @@ def validate_credits(settings: Any) -> CreditSettings:
             raise TypeError("Cannot read properties of null (reading 'id')")
         name = _prop(item, "name")
         minimum = _prop(item, "minimum")
-        rates.append(
-            {
-                "id": _identifier(_prop(item, "id")),
-                "name": utf16_slice(js_trim(js_string("" if name is None else name)), 80),
-                "inputPer1k": rate(_prop(item, "inputPer1k")),
-                "outputPer1k": rate(_prop(item, "outputPer1k")),
-                "minimum": integer(0 if minimum is None else minimum),
-            }
-        )
+        entry: dict[str, Any] = {
+            "id": _identifier(_prop(item, "id")),
+            "name": utf16_slice(js_trim(js_string("" if name is None else name)), 80),
+            "inputPer1k": rate(_prop(item, "inputPer1k")),
+            "outputPer1k": rate(_prop(item, "outputPer1k")),
+            "minimum": integer(0 if minimum is None else minimum),
+        }
+        # Provider cost (minor units of the pack currency per 1k tokens): both written when either is given.
+        cost_in, cost_out = _prop(item, "costInputPer1k"), _prop(item, "costOutputPer1k")
+        if cost_in is not None or cost_out is not None:
+            entry["costInputPer1k"] = rate(0 if cost_in is None else cost_in)
+            entry["costOutputPer1k"] = rate(0 if cost_out is None else cost_out)
+        rates.append(entry)  # type: ignore[arg-type]
     if any(not r["name"] for r in rates) or len({r["id"] for r in rates}) != len(rates):
         raise HttpError(400, "Duplicate or unnamed credit rates")
     return {"pack": {"credits": integer(_prop(pack, "credits"), 1), "amountMinor": amount_minor, "currency": currency}, "rates": rates}
@@ -166,6 +170,26 @@ def estimate(settings: CreditSettings, rate_id: Any, input_tokens: Any, output_t
     }
 
 
+def round4(x: float) -> float:
+    """``Math.round(x * 1e4) / 1e4``: provider costs keep 4 decimals (minor units)."""
+    return js_round(float(x) * 1e4) / 1e4
+
+
+def rate_credits(selected: Mapping[str, Any], input_tokens: Any, output_tokens: Any) -> float:
+    """Credits of token usage at a rate: rounded up (float noise tolerated), at least the minimum."""
+    exact = (num(input_tokens) / 1000) * num(selected["inputPer1k"]) + (num(output_tokens) / 1000) * num(selected["outputPer1k"])
+    return max(num(selected["minimum"]), float(math.ceil(js_round(exact * 1e6) / 1e6)))
+
+
+def provider_cost(selected: Mapping[str, Any], input_tokens: Any, output_tokens: Any) -> float | None:
+    """Provider cost of token usage at a rate (minor units, 4 decimals); None without costs."""
+    cost_in = selected.get("costInputPer1k")
+    if cost_in is None:
+        return None
+    cost_out = selected.get("costOutputPer1k")
+    return round4((num(input_tokens) / 1000) * num(cost_in) + (num(output_tokens) / 1000) * num(0 if cost_out is None else cost_out))
+
+
 class CreditPricing:
     """Request pricing over stored credit settings (validated) or the defaults."""
 
@@ -188,4 +212,7 @@ __all__ = [
     "integer",
     "rate",
     "CreditPricing",
+    "round4",
+    "rate_credits",
+    "provider_cost",
 ]

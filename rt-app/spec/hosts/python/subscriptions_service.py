@@ -177,6 +177,9 @@ class SubscriptionsFacade:
     def overview(self, months: Any = None) -> Any:
         return self.service.overview(12 if months is None else months)
 
+    def economics(self, limit: Any = None) -> Any:
+        return self.service.economics(50 if limit is None else limit)
+
     def maintenance(self) -> Any:
         return self.service.maintenance()
 

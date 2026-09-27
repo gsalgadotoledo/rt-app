@@ -52,6 +52,8 @@ def migrate(store: NoSQL) -> None:
 
 MANAGE = "subscriptions.manage"
 ME = "subscriptions.me"
+#: Scope of the metering endpoints a service key may call (``rt_app.service_keys``).
+METER = "subscriptions.meter"
 
 
 def _body(c: Context) -> dict[str, Any]:
@@ -125,6 +127,38 @@ def feature(service: Subscriptions) -> Feature:
         months = c.request.query.get("months")
         return service.overview(_js_number(months) if months else 12)
 
+    def economics(c: Context) -> Any:
+        limit = c.request.query.get("limit")
+        return service.economics(_js_number(limit) if limit else 50)
+
+    # Metering for backends with a scoped service key: the owner calls on the account in the
+    # path, source "api" and actorId "service:<key id>". No user, settings or plan endpoint.
+    def meter(method: str, path: str, handle: Callable[[Context], Any]) -> Endpoint:
+        return Endpoint(method, "/service/subscriptions/accounts/:id" + path, METER, "service", handle)
+
+    def meter_account(c: Context) -> str:
+        return identifier(c.params["id"])
+
+    def meter_ledger(c: Context) -> Any:
+        body = _body(c)
+        user_id = meter_account(c)
+        credits = body.get("credits")
+        if isinstance(credits, (int, float)) and not isinstance(credits, bool) and credits > 0:
+            raise HttpError(403, "Service keys can only record debits")
+        return service.record_credits(
+            user_id,
+            {
+                "requestId": _field(c, "requestId"),
+                "productId": _field(c, "productId"),
+                "credits": _field(c, "credits"),
+                "kind": _field(c, "kind"),
+                "reason": _field(c, "reason"),
+                "details": _details(_field(c, "details")),
+                "source": "api",
+                "actorId": actor_id(c),
+            },
+        )
+
     def record(c: Context) -> Any:
         return service.record_credits(
             c.params["id"],
@@ -176,6 +210,15 @@ def feature(service: Subscriptions) -> Feature:
 
     def as_api(c: Context) -> dict[str, Any]:
         return {"source": "api", "actorId": actor_id(c)}
+
+    meter_endpoints = [
+        meter("GET", "/usage", lambda c: service.usage_summary(meter_account(c))),
+        meter("POST", "/preflight", lambda c: service.preflight(meter_account(c), _body(c).get("productId"), amount(c))),
+        meter("POST", "/reservations", lambda c: service.reserve(meter_account(c), _body(c).get("productId"), reservation(c), as_api(c))),
+        meter("POST", "/reservations/:key/settle", lambda c: service.settle(meter_account(c), c.params["key"], usage(c), as_api(c))),
+        meter("POST", "/reservations/:key/release", lambda c: service.release(meter_account(c), c.params["key"], as_api(c))),
+        meter("POST", "/ledger", meter_ledger),
+    ]
 
     endpoints = [
         *(plan_action(action) for action in ("create", "update", "archive", "unarchive", "version")),
@@ -261,6 +304,16 @@ def feature(service: Subscriptions) -> Feature:
                 "name": "subscriptions_overview",
                 "description": "Customers, paying customers, projected monthly revenue per currency (minor units), new and canceled subscriptions today, this month and per month. query.months (1-36, default 12).",
                 "example": {"query": {"months": "12"}},
+            },
+        ),
+        owner(
+            "GET",
+            "/subscriptions/admin/economics",
+            economics,
+            {
+                "name": "subscriptions_economics",
+                "description": "Unit economics: provider cost (settlements priced with the rates' costs), revenue (money paid) and margin per currency, per plan and for the users with the highest cost. query.limit (1-200, default 50). Never writes.",
+                "example": {"query": {"limit": "50"}},
             },
         ),
         owner(
@@ -389,8 +442,9 @@ def feature(service: Subscriptions) -> Feature:
                 "example": {"params": {"id": "USER_ID", "key": "turn-1:0"}},
             },
         ),
+        *meter_endpoints,
     ]
     return Feature(id="subscriptions", endpoints=endpoints, admin=ADMIN)
 
 
-__all__ = ["ADMIN", "MIGRATIONS", "Migration", "migrate", "feature"]
+__all__ = ["ADMIN", "METER", "MIGRATIONS", "Migration", "migrate", "feature"]
