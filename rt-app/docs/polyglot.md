@@ -110,7 +110,11 @@ No dependency-injection framework is needed:
   - Anything else answers 500 `{"error":"Internal error"}` and is logged.
 - **Owner and permission endpoints** are served at their path and again under `/admin/app<path>`.
   Only a few are admin-only (owner feature-flags/visits, `/health/report`, `/infra*`, `/aws/*`,
-  `/observer/report|logs`, `/subscriptions/admin/*`), the same list as the TypeScript framework.
+  `/observer/report|logs`, `/subscriptions/admin/*`, `/service-keys*`), the same list as the
+  TypeScript framework.
+- **Service endpoints** (`access: "service"`) live under `/service/` only, are never mounted under
+  `/admin/app` and take only service keys (`Bearer rtsk_<id>.<secret>`) holding their resource
+  as a scope; see `docs/polyglot/service-keys.md`.
   - In local mode (`local_admin`) the actor is `{id: "rt-app-root", role: "owner"}`.
   - Without an actor they return 401 `Sign in` (the TypeScript ACL message).
 - **Adapters:**
@@ -137,6 +141,9 @@ No dependency-injection framework is needed:
 
 Credit reservations (holds, settlement, pre-flight checks, thresholds):
 `docs/polyglot/subscriptions-reservations.md` and `spec/contracts/subscriptions-reservations*.contract.yaml`.
+
+Finance limits (short window, model caps, provider costs, margin rule) and unit economics:
+`docs/polyglot/subscriptions-limits.md` and `spec/contracts/subscriptions-{limits,economics,limits-api}.contract.yaml`.
 
 Contracts: `spec/contracts/subscriptions-ledger.contract.yaml` and
 `subscriptions-credits.contract.yaml`. Node host: `spec/hosts/node/billing.mjs`. The contract
@@ -196,6 +203,10 @@ contract.
 
 Refresh sessions (rotating refresh tokens, `SESSIONS#<userId>` rows, `/auth/refresh`,
 `/auth/sessions`): `docs/polyglot/auth-sessions.md` and `spec/contracts/auth-sessions*.contract.yaml`.
+
+Service keys (scoped backend credentials, `access: "service"` endpoints under `/service/`):
+`docs/polyglot/service-keys.md` and `spec/contracts/service-keys.contract.yaml`,
+`subscriptions-service-keys-api.contract.yaml`.
 
 Contracts: `spec/contracts/{jwt,users,acl,auth}.contract.yaml`. Node host:
 `spec/hosts/node/identity.mjs`. The contract descriptions hold the full algorithms (claim rules,

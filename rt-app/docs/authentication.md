@@ -97,6 +97,67 @@ Storage choices and XSS trade-offs:
   would hide the token from scripts, but it needs a same-site API and CSRF protection, which the
   split SPA/API deployment does not have; prefer a strict Content-Security-Policy.
 
+## Service keys (backend credentials)
+
+A backend that meters credits for users (an agent server) must not hold `ADMIN_PASSWORD`: the
+root session can manage users, settings and plans. It uses a **service key** instead.
+
+- **Format:** `Authorization: Bearer rtsk_<id>.<secret>` (id: `A-Z a-z 0-9 _ -`, up to 64;
+  secret: 32 to 128 of the same characters). Only `sha256hex(token)` is stored or configured;
+  the token is compared in constant time and never logged or returned after creation.
+- **Scopes:** a key authenticates ONLY endpoints declared with `access: "service"` (all under
+  `/service/`, never mounted under `/admin/app`) whose `resource` is one of its scopes. It is not
+  a user session and not an admin session: every other endpoint rejects it (401). Scopes today:
+  `subscriptions.meter` (the metering calls below) and `service-keys.self` (`GET
+  /service/keys/self`, the key's own id, scopes and limit, for a startup check).
+- **Errors:** no header → 401 `Service key required`; malformed, unknown, rotated-out or revoked →
+  401 `Invalid service key` (no detail); outside its scopes → 403 `Service key not allowed for
+  this resource`; over its limit → 429 `Too many attempts; wait one minute`.
+- **Rate limit:** per key, `rateLimit` requests per minute (default 600, up to 100000).
+- **Audit:** metering entries and reservation receipts carry `source: "api"` and `actorId:
+  "service:<id>"`; creating, rotating and revoking a key writes `SERVICE_KEY_AUDIT#<id>` rows;
+  the last use is kept per key (written at most once a minute).
+
+**Metering endpoints** (scope `subscriptions.meter`; the same calls as the owner endpoints
+`/admin/app/subscriptions/admin/accounts/:id/*`, acting on the account in the path):
+
+| Method | Path |
+| --- | --- |
+| GET | `/service/subscriptions/accounts/:id/usage` |
+| POST | `/service/subscriptions/accounts/:id/preflight` |
+| POST | `/service/subscriptions/accounts/:id/reservations` |
+| POST | `/service/subscriptions/accounts/:id/reservations/:key/settle` |
+| POST | `/service/subscriptions/accounts/:id/reservations/:key/release` |
+| POST | `/service/subscriptions/accounts/:id/ledger` (debits only: `credits < 0`; 403 for credits) |
+
+**Two ways to create keys** (both can be used at once):
+
+1. **Admin-managed (recommended):** Admin → Service keys (or `POST /admin/app/service-keys`
+   `{description, scopes, id?, rateLimit?}`): the token is shown once. Rotate (`POST
+   /admin/app/service-keys/:id/rotate`: new token, the old one stops at once) and revoke (`POST
+   .../revoke`: rejected from the next request) without touching `ADMIN_PASSWORD` or deploying.
+   For a rotation without downtime, create a second key, deploy it to the backend, then revoke
+   the first.
+2. **Configured:** `RT_APP_SERVICE_KEYS` (JSON) or `RT_APP_SERVICE_KEYS_FILE` (a secrets file with
+   the same JSON). Prefer `secretHash` so the secret never sits in the configuration:
+
+   ```sh
+   TOKEN="rtsk_agent-server.$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43)"
+   printf %s "$TOKEN" | shasum -a 256   # -> secretHash
+   ```
+
+   ```json
+   [{"id": "agent-server", "secretHash": "<64 hex>", "scopes": ["subscriptions.meter"],
+     "description": "Agent server", "rateLimit": 600}]
+   ```
+
+   An invalid configuration stops the application at startup (`Invalid service key
+   configuration`). Configured keys are listed in the admin but rotated or revoked in the
+   configuration.
+
+Python and Go serve the same endpoints (`rt_app.service_keys`, `core-go/servicekeys`). Wire formats
+and rows: `docs/polyglot/service-keys.md`.
+
 ## TOTP and recovery
 
 On the public frontend, sign in and open **Seguridad · Autenticador TOTP**. Re-enter the

@@ -92,7 +92,52 @@ try {
 - Holds expire after `ttlMs` (default 15 minutes, up to 24 hours). Expired credits are usable at once; the release is recorded on the statement by the next reservation or by maintenance. A process that crashed after the model call can still `settle` on resume with the provider's usage, even after the TTL.
 - `usageSummary(userId)` reports each product's day, week and period windows with `percent` and `threshold` (80, 95 or 100 reached) plus `alerts`, for warnings near the limits. `preflight` adds `missing` and a `topUp` offer priced with the credit pack.
 
-The statement shows `reservation` (0 credits, the amount held), `settlement` (the charge) and `release` entries. Signed-in users have `/subscriptions/credits/{usage,preflight,reservations}` for their own reservations; a backend meters on the user's behalf through the owner endpoints `/subscriptions/admin/accounts/:id/{usage,preflight,reservations}` (admin token), which users cannot release or settle. Details: `docs/polyglot/subscriptions-reservations.md`.
+The statement shows `reservation` (0 credits, the amount held), `settlement` (the charge) and `release` entries. Signed-in users have `/subscriptions/credits/{usage,preflight,reservations}` for their own reservations; a backend meters on the user's behalf with a **service key** (scope `subscriptions.meter`, see `docs/authentication.md` "Service keys") through `/service/subscriptions/accounts/:id/{usage,preflight,reservations,…}`, or through the owner endpoints `/admin/app/subscriptions/admin/accounts/:id/*` with the admin token; users cannot release or settle those reservations. Details: `docs/polyglot/subscriptions-reservations.md`.
+
+## Finance limits: short window, model caps and margin rules
+
+Configured in the subscription settings (Admin → Subscriptions, or `PUT
+/subscriptions/admin/settings`), validated and versioned like the rest; no deploy.
+
+- **Short window** (per plan product): `shortLimit` credits per `shortSeconds` (for example 30
+  credits per 5 hours, `18000`). The window starts with the first use after the previous one
+  ended, like the 5-hour window of chat products, and limits the plan allowance together with the
+  day, week and period windows (additional credits are not bound by them). It appears first in
+  `windows` (`kind: "short"`), in the 429 message and in `me().usage` (`shortUsed`,
+  `shortResetAt`). Courtesy resets accept `scope: "short"`. Like the other windows it applies to
+  new subscriptions and plan changes.
+- **Model caps** (per plan product): `rateCaps: [{rateId, short?, day?, week?, period?}]` limit the
+  credits one rate (model) may use per window, whatever pays for them. They are read **live**
+  from the current settings, so tightening a cap applies to current subscribers at once. A
+  reservation or model charge over a cap fails with 429 `Model limit reached: <rate> <window>
+  limit. …`; `preflight` says `reason: "model"`, reports the model windows and suggests a
+  `degrade` rate; `usageSummary` lists `models` per product and alerts at 80/95/100 %.
+- **Provider costs** (per rate): `costInputPer1k` / `costOutputPer1k`, what the provider charges
+  you in minor units of the pack currency per 1k tokens (up to 4 decimals, e.g. `0.3`).
+  Settlements with token usage and `consumeUsage` record the cost (`costMinor` in the result
+  and the entry details) on the account: all time per currency and for the current period.
+- **Margin rule** (per plan): `maxProviderCostMinor`, the most provider cost one user should
+  cause per period (the plan currency must be the pack currency). Advisory: `usageSummary` and
+  `preflight` report `margin` (cost, cap, remaining, percent, threshold) and `preflight` says
+  whether the step would exceed it (`margin.exceeded`) and recommends `degrade`: the least
+  downgrade among the cheaper rates that fit the credits, their caps and the margin left.
+
+```jsonc
+// preflight(userId, "api", {estimate: {rateId: "advanced", inputTokens: 2000, maxOutputTokens: 1000}})
+{ "fits": false, "reason": "model", "costMinor": 10.5,
+  "model": { "rateId": "advanced", "windows": [/* day, period */], "exceeded": "day" },
+  "margin": { "costMinor": 6.75, "capMinor": 10, "stepMinor": 10.5, "exceeded": true, /* … */ },
+  "degrade": { "rateId": "standard", "name": "Standard model", "credits": 5, "costMinor": 2.1 } }
+```
+
+## Unit economics
+
+`GET /admin/app/subscriptions/admin/economics?limit=50` (tool `subscriptions_economics`) and the
+**Overview** tab report provider cost (from the recorded costs), revenue (money paid: purchases
+and paid plans) and margin, per currency: totals, per plan (users grouped by their current plan)
+and the users with the highest cost with their period cost against the plan's cap. Rates
+without costs count as free, so configure costs before relying on it. Details:
+`docs/polyglot/subscriptions-limits.md`.
 
 ## Overview
 
@@ -100,7 +145,8 @@ Subscriptions opens on **Overview**:
 - customers with an active plan, and how many of them pay;
 - projected monthly revenue per currency (the monthly equivalent of active paid plans billed by the payment provider; subscriptions ending this period and admin assignments are excluded);
 - new and canceled subscriptions today and this month;
-- a monthly chart.
+- a monthly chart;
+- unit economics: provider cost, revenue and margin per plan and for the most expensive users.
 
 New and canceled subscriptions are counted per day in `SUB_STATS` when they happen. A payment problem is neither new nor canceled. The customer line uses a daily snapshot saved when the overview is opened, so there is no history before the first visit.
 
