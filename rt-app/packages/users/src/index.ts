@@ -1,7 +1,9 @@
 import type { NoSQL as Store } from "@gsalgadotoledo/rt-app-nosql";
 import { migrations } from "./migrations.js";
 import { seeds, DEMO_USERS } from "./seeds.js";
+import { viewAccount } from "./suspension.js";
 export { DEMO_USERS };
+export * from "./suspension.js";
 import admin from "./admin.json" with { type: "json" };
 import {
   randomUUID,
@@ -72,6 +74,12 @@ export class Users {
   private at() {
     return new Date(epochMs(this.options.now));
   }
+
+  /** The admin view of a row at the current time: viewUser plus banned and the ban in force. */
+  view(data: Data) {
+    return viewAccount(data, epochMs(this.options.now));
+  }
+
   get(id: string) {
     return this.store.get("USERS", id);
   }
@@ -206,8 +214,8 @@ export class Users {
               this.store,
               "USERS",
               c.request.query,
-              ["id", "email", "name", "role", "active"],
-              (row) => viewUser(row.data),
+              ["id", "email", "name", "role", "active", "banned"],
+              (row) => this.view(row.data),
             );
           },
         },
@@ -227,7 +235,7 @@ export class Users {
           handle: async (c) => {
             const row = await this.get(c.params.id);
             if (!row || row.data.deletedAt) throw new HttpError(404, "User not found");
-            return viewUser(row.data);
+            return this.view(row.data);
           },
         },
         {

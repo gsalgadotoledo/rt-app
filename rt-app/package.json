@@ -19,6 +19,7 @@
     "@gsalgadotoledo/rt-app-contracts": "0.2.3",
     "@gsalgadotoledo/rt-app-dynamodb": "0.2.3",
     "@gsalgadotoledo/rt-app-users": "0.2.3",
+    "@gsalgadotoledo/rt-app-users-bans": "0.2.3",
     "@gsalgadotoledo/rt-app-auth": "0.2.3",
     "@gsalgadotoledo/rt-app-jwt": "0.2.3",
     "@gsalgadotoledo/rt-app-acl": "0.2.3",

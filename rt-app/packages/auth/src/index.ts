@@ -23,7 +23,7 @@ import {
   epochMs,
   type Clock,
 } from "@gsalgadotoledo/rt-app-contracts";
-import { Users, hashPassword, verifyPassword, validatePassword } from "@gsalgadotoledo/rt-app-users";
+import { Users, hashPassword, verifyPassword, validatePassword, activeBan, ACCOUNT_SUSPENDED } from "@gsalgadotoledo/rt-app-users";
 import { JwtTokens } from "@gsalgadotoledo/rt-app-jwt";
 export interface Mailer {
   send?(message:{to:string;subject:string;text:string}):Promise<void>;
@@ -133,6 +133,7 @@ export class Auth {
     const user = await this.users.get(claims.id);
     if (!user || !user.data.active || user.data.tokenVersion !== claims.version || (user.data.credentialProvider ?? 'local') !== this.providerId)
       throw new HttpError(401, "Invalid session");
+    this.gate(user);
     if (claims.sid === undefined) return publicUser(user.data);
     if (!sessionLive(await this.refreshSessions.get(claims.id, claims.sid), this.now()))
       throw new HttpError(401, "Invalid session");
@@ -141,6 +142,15 @@ export class Auth {
 
   private get providerId() {
     return this.provider?.id ?? "local";
+  }
+
+  /**
+   * Refuse a banned account (see activeBan in rt-app-users): 403 "Account suspended". Called only
+   * after the caller proved the credential (password, code, TOTP, token), so the answer never
+   * reveals a ban to someone who does not hold the account's credentials.
+   */
+  private gate(user: Row) {
+    if (activeBan(user.data, this.now())) throw new HttpError(403, ACCOUNT_SUSPENDED);
   }
 
   /** Build the session response for a user row and its refresh session. */
@@ -179,7 +189,8 @@ export class Auth {
   /**
    * POST /auth/refresh: rotate a refresh token and issue a new access token for the same session
    * (same absolute expiry). Limits refresh-ip:<ip> 60 then refresh-session:<sessionId> 10 per
-   * minute; every failure is 401 "Invalid session".
+   * minute; every failure is 401 "Invalid session", except 403 "Account suspended" for the
+   * holder of a session of a banned account.
    * @example refresh("<sessionId>.<secret>", "1.1.1.1")
    *   → {token, expiresIn: 900, refreshToken, refreshExpiresAt, sessionId, user}
    */
@@ -189,10 +200,19 @@ export class Auth {
     if (!parsed) throw new HttpError(401, INVALID_REFRESH);
     await this.limit(`refresh-session:${parsed.sessionId}`, 10);
     let user: Row | undefined;
-    const rotated = await this.refreshSessions.rotate(refreshToken, async (session) => {
-      user = await this.sessionUser(session);
-      return !!user;
-    });
+    const rotated = await this.refreshSessions.rotate(
+      refreshToken,
+      async (session) => {
+        user = await this.sessionUser(session);
+        return !!user;
+      },
+      // A banned account: 403 for the holder of the session's secret, 401 for anyone else; never a write.
+      async (session, holder) => {
+        const owner = await this.users.get(session.data.userId);
+        if (owner?.data.active === true && activeBan(owner.data, this.now()))
+          throw holder ? new HttpError(403, ACCOUNT_SUSPENDED) : new HttpError(401, INVALID_REFRESH);
+      },
+    );
     return this.respond(user!, rotated);
   }
 
@@ -255,6 +275,7 @@ export class Auth {
       if (!row?.data.active || row.data.credentialProvider !== this.provider.id) throw new HttpError(401, "Incorrect email or password");
       validatePassword(password);
       const result = await this.provider.password(row.data.id, password);
+      this.gate(row);
       if ('challenge' in result) return this.pending(row, 'totp', {providerSession:result.session});
       return this.session(row, { ip, userAgent });
     }
@@ -265,6 +286,7 @@ export class Auth {
     );
     if (!row || !row.data.active || !valid)
       throw new HttpError(401, "Incorrect email or password");
+    this.gate(row);
     if ((await this.store.get("MFA", row.data.id))?.data.enabled) return this.pending(row, 'totp', {});
     return this.session(row, { ip, userAgent });
   }
@@ -337,6 +359,7 @@ export class Auth {
       const pending = await this.readPending(challengeId, 'email');
       if(pending.data.userId !== user.data.id) throw new HttpError(400,"Invalid code");
       await this.provider.verifyEmailCode(user.data.id, this.vault.open(pending.data.sealed).providerSession, code);
+      this.gate(user);
       await this.finishPending(pending);
       return this.session(user, { ip, userAgent });
     }
@@ -396,6 +419,8 @@ export class Auth {
       ]);
       return { message: "Password updated. Sign in to continue." };
     }
+    // A banned account is refused after the code matched; the code stays unused.
+    this.gate(user);
     if(await this.hasMfa(user.data.id)) throw new HttpError(403,"Use your password and authenticator");
     await this.store.transact([consumed]);
     return this.session(user, { ip, userAgent });
@@ -531,6 +556,7 @@ export class Auth {
     await this.limit('mfa-user:'+pending.data.userId,5);
     if(typeof code!=='string'||!/^\d{6}$/.test(code)) throw new HttpError(400,"Invalid code");
     const user=(await this.users.get(pending.data.userId))!;
+    this.gate(user);
     if(this.provider) {
       await this.provider.verifyTotp(user.data.id,this.vault.open(pending.data.sealed).providerSession,code);
       await this.finishPending(pending);

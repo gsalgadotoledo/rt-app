@@ -9,7 +9,8 @@
     "email",
     "name",
     "role",
-    "active"
+    "active",
+    "banned"
   ],
   "actions": [
     "list",

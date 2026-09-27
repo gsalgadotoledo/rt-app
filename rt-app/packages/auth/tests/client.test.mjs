@@ -128,3 +128,22 @@ test('absolute URLs, custom refresh paths and dynamic base URLs',async()=>{
   assert.equal(await client.accessToken(),'t2');
   client.dispose();
 });
+
+test('a banned account (403 Account suspended) ends the session; other 403s keep it',async()=>{
+  const banned=harness({server:{...fakeServer(),async handle(url){
+    if(url.endsWith('/auth/refresh')) return json(403,{error:'Account suspended'});
+    return json(401,{error:'Invalid session'});
+  }}});
+  banned.client.set({token:'access-1',expiresIn:900,refreshToken:'refresh-1',sessionId:'s1',user:{id:'u'}});
+  assert.equal(await banned.client.refresh(),undefined);
+  assert.equal(banned.client.session,undefined);
+  banned.client.dispose();
+  const other=harness({server:{...fakeServer(),async handle(url){
+    if(url.endsWith('/auth/refresh')) return new Response('not json',{status:403});
+    return json(200,{ok:true});
+  }}});
+  other.client.set({token:'access-1',expiresIn:900,refreshToken:'refresh-1',sessionId:'s1',user:{id:'u'}});
+  await assert.rejects(other.client.refresh(),{status:403});
+  assert.equal(other.client.session.refreshToken,'refresh-1');
+  other.client.dispose();
+});

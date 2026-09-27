@@ -199,8 +199,9 @@ export function createSessionClient(options: SessionClientOptions): SessionClien
       apply(await response.json(), true);
       return current;
     }
-    // Only a rejection of the token ends the session; 429 and 5xx are retried later.
-    if (response.status === 401 || response.status === 400) {
+    // Only a rejection of the token ends the session; 429 and 5xx are retried later. A banned
+    // account (403 "Account suspended") is a rejection too: retrying would never succeed.
+    if (response.status === 401 || response.status === 400 || (response.status === 403 && (await suspended(response)))) {
       apply(undefined, true);
       return undefined;
     }
@@ -229,6 +230,15 @@ export function createSessionClient(options: SessionClientOptions): SessionClien
       }
     }
     return current?.token;
+  }
+
+  /** Whether a 403 answer is the banned-account refusal (ACCOUNT_SUSPENDED of rt-app-users). */
+  async function suspended(response: Response) {
+    try {
+      return (await response.clone().json())?.error === "Account suspended";
+    } catch {
+      return false;
+    }
   }
 
   // --- requests -----------------------------------------------------------------------------

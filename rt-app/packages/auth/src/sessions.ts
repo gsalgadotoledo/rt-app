@@ -169,14 +169,24 @@ export class RefreshSessions {
    * Throws 401 "Invalid session" for anything invalid; reusing a superseded token (other
    * than the previous one inside the grace window) revokes the whole session first.
    * Concurrent rotations are version-guarded; a loser re-reads and normally lands in the grace path.
+   * `blocked(row, holder)` runs first on any existing row (live or not) and may throw to refuse
+   * with another error; holder tells whether the token's secret is the current or previous one.
    */
-  async rotate(token: unknown, valid: (row: Row) => Promise<boolean>): Promise<IssuedRefresh> {
+  async rotate(
+    token: unknown,
+    valid: (row: Row) => Promise<boolean>,
+    blocked?: (row: Row, holder: boolean) => Promise<void>,
+  ): Promise<IssuedRefresh> {
     const parsed = parseRefreshToken(token);
     if (!parsed) throw new HttpError(401, INVALID_REFRESH);
     for (let attempt = 0; attempt < 4; attempt++) {
       const row = await this.find(parsed.sessionId), now = this.now();
-      if (!sessionLive(row, now) || !(await valid(row))) throw new HttpError(401, INVALID_REFRESH);
       const presented = this.hash(parsed.sessionId, parsed.secret);
+      // Before liveness: a banned account answers 403 to whoever holds this session's current or
+      // previous secret (the hook throws), even though the ban already revoked the session.
+      if (row && blocked)
+        await blocked(row, this.matches(row.data.secretHash, presented) || this.matches(row.data.previousHash, presented));
+      if (!sessionLive(row, now) || !(await valid(row))) throw new HttpError(401, INVALID_REFRESH);
       let data: Record<string, unknown>;
       if (this.matches(row.data.secretHash, presented)) {
         // Normal rotation: the presented secret becomes the previous one.
@@ -229,6 +239,19 @@ export class RefreshSessions {
       }
     }
     throw new Conflict();
+  }
+
+  /**
+   * Revoke every live session of a user with reason (for example "ban"). Returns how many were
+   * revoked. Each session is a separate version-guarded write, so this is not atomic; callers
+   * bump the user's tokenVersion first, which already makes every session unusable.
+   */
+  async revokeAll(userId: string, reason: string) {
+    let revoked = 0;
+    const now = this.now();
+    for (const row of await this.rows(userId))
+      if (sessionLive(row, now) && (await this.revoke(userId, row.sk, reason))) revoked++;
+    return revoked;
   }
 
   /** Every stored session row of a user, across all pages (live or not). */

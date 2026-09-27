@@ -215,7 +215,7 @@ test("password reset revokes existing sessions and has generic account responses
 test("rate limits, unique email transactions, filters and repeatable migrations", async () => {
   const { app, store, call, login } = await setup();
   await app.migrate();
-  assert.equal((await store.list("MIGRATIONS")).items.length, 7);
+  assert.equal((await store.list("MIGRATIONS")).items.length, 8); // includes users-bans:001
   const races = await Promise.allSettled(
     [1, 2].map(() =>
       app.users.create({ name: "New", email: "unique@example.test", password }),

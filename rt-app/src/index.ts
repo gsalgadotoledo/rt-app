@@ -128,6 +128,7 @@ import {
   type RunnerOptions,
 } from "@gsalgadotoledo/rt-app-migrations";
 import { Users, DEMO_USERS } from "@gsalgadotoledo/rt-app-users";
+import { UserBans } from "@gsalgadotoledo/rt-app-users-bans";
 import { Auth, type Mailer, SesMailer, ServiceKeys, serviceKeysFromEnv } from "@gsalgadotoledo/rt-app-auth";
 import { JwtTokens } from "@gsalgadotoledo/rt-app-jwt";
 import { ACL } from "@gsalgadotoledo/rt-app-acl";
@@ -266,6 +267,8 @@ export function createApplication(options: {
       options.secret,
       options.identityProvider,
     );
+  // Account bans (module "users-bans"): the ban lives on the user row and auth enforces it.
+  const bans = new UserBans(users, { sessions: auth.refreshSessions });
   // Context handed to application modules: clock, environment and core services.
   const coreServices: Record<string, unknown> = { users, subscriptions, observer, analytics, cache, flags };
   const featureContext: FeatureContext = {
@@ -298,6 +301,7 @@ export function createApplication(options: {
     ).feature(),
     new AwsMonitor(undefined, options.store).feature(),
     users.feature(),
+    bans.feature(),
     auth.feature(),
     acl.feature(),
     serviceKeys.feature(),
@@ -525,6 +529,7 @@ export function createApplication(options: {
     features,
     endpoints,
     users,
+    bans,
     auth,
     admin,
     serviceKeys,

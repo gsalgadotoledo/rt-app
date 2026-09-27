@@ -3,6 +3,7 @@
     "content",
     "infra",
     "users",
+    "users-bans",
     "auth",
     "acl",
     "feature-flags",

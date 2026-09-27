@@ -35,6 +35,7 @@
   "devDependencies": {
     "typescript": "^5.7.2",
     "@types/node": "^22.0.0",
+    "@gsalgadotoledo/rt-app-dynamodb": "0.2.3",
     "@gsalgadotoledo/rt-app-json": "0.2.3"
   },
   "peerDependencies": {

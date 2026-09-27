@@ -1,5 +1,5 @@
 {
-  "name": "@gsalgadotoledo/rt-app-users",
+  "name": "@gsalgadotoledo/rt-app-users-bans",
   "version": "0.2.3",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,11 +19,14 @@
   "dependencies": {
     "@gsalgadotoledo/rt-app-contracts": "0.2.3",
     "@gsalgadotoledo/rt-app-admin-ui": "0.2.3",
-    "@gsalgadotoledo/rt-app-nosql": "0.2.3"
+    "@gsalgadotoledo/rt-app-nosql": "0.2.3",
+    "@gsalgadotoledo/rt-app-users": "0.2.3"
   },
   "devDependencies": {
     "typescript": "^5.7.2",
     "@types/node": "^22.0.0",
+    "@gsalgadotoledo/rt-app-auth": "0.2.3",
+    "@gsalgadotoledo/rt-app-jwt": "0.2.3",
     "@gsalgadotoledo/rt-app-dynamodb": "0.2.3"
   },
   "peerDependencies": {
@@ -37,7 +40,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gsalgadotoledo/rt-app.git",
-    "directory": "rt-app/packages/users"
+    "directory": "rt-app/packages/users-bans"
   },
   "engines": {
     "node": ">=22.14"
