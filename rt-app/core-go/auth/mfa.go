@@ -72,7 +72,7 @@ func (a *Auth) readPending(ctx context.Context, id any, kind string) (*nosql.Row
 
 // VerifyMFA completes a password sign-in with a TOTP code and returns the session. Codes of a
 // step not newer than the last used one are refused, so a code works once.
-func (a *Auth) VerifyMFA(ctx context.Context, challengeID, code any, ip string) (*Session, error) {
+func (a *Auth) VerifyMFA(ctx context.Context, challengeID, code any, ip string, userAgent ...string) (*Session, error) {
 	if err := a.Limit(ctx, "mfa-ip:"+ip, 20); err != nil {
 		return nil, err
 	}
@@ -121,7 +121,7 @@ func (a *Auth) VerifyMFA(ctx context.Context, challengeID, code any, ip string) 
 	if err := a.store.Transact(ctx, []nosql.Write{{Row: next, Expected: nosql.Expect(mfa.Version)}, markUsed(pending)}); err != nil {
 		return nil, err
 	}
-	return a.session(user)
+	return a.session(ctx, user, ip, userAgent)
 }
 
 // SetupMFA starts enrollment for user id after checking the password again. It needs

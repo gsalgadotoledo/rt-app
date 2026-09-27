@@ -76,3 +76,28 @@ func TestShortSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSessionIDClaim(t *testing.T) {
+	tokens, _ := New(secret, WithClock(clock("2026-01-02T03:04:05Z")))
+	// Issued by the TypeScript reference: payload {"v":1,"sid":"sessionAlice0000000001","sub":"user-1",…}.
+	want := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOiJzZXNzaW9uQWxpY2UwMDAwMDAwMDAxIiwic3ViIjoidXNlci0xIiwiaXNzIjoicnQtYXBwIiwiYXVkIjoicnQtYXBwLWFwaSIsImlhdCI6MTc2NzMyMzA0NSwiZXhwIjoxNzY3MzIzOTQ1fQ.FEeOrOavus06FFxuxPg0uzGYC_oNKiPzd6WxWf9FJbU"
+	if got := tokens.Issue(User{ID: "user-1", TokenVersion: 1, SID: "sessionAlice0000000001"}); got != want {
+		t.Fatalf("got %s", got)
+	}
+	if claims, err := tokens.Verify(want); err != nil || claims != (Claims{ID: "user-1", Version: 1, SID: "sessionAlice0000000001"}) {
+		t.Fatalf("verify: %+v %v", claims, err)
+	}
+	if got := tokens.Issue(User{ID: "user-1", TokenVersion: 1}); got != reference {
+		t.Fatal("tokens without a session id changed")
+	}
+	// sid 7, "" and null are rejected.
+	for _, token := range []string{
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOjcsInN1YiI6InVzZXItMSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.xbIUwMtAP1WxrxZPivaAl_BUWvzAPa4IFf-QMeVCRMc",
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOiIiLCJzdWIiOiJ1c2VyLTEiLCJpc3MiOiJydC1hcHAiLCJhdWQiOiJydC1hcHAtYXBpIiwiaWF0IjoxNzY3MzIzMDQ1LCJleHAiOjE3NjczMjM5NDV9.Fd1ruPb77Y7Y15AH1KCPo8nLvSSRTX0QZejejnAyWTY",
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoxLCJzaWQiOm51bGwsInN1YiI6InVzZXItMSIsImlzcyI6InJ0LWFwcCIsImF1ZCI6InJ0LWFwcC1hcGkiLCJpYXQiOjE3NjczMjMwNDUsImV4cCI6MTc2NzMyMzk0NX0.0vSxIDvxoevMJrRk2Y9jCgcw1qZFsaWGtFKbhjvDfo8",
+	} {
+		if _, err := tokens.Verify(token); err == nil {
+			t.Errorf("accepted %s", token)
+		}
+	}
+}

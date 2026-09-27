@@ -1,6 +1,6 @@
 // Package auth is local RT-App authentication over package users: password sign-in, emailed
-// codes (sign-in, password reset, email change), rate limits, JWT sessions, sign-in settings
-// and TOTP MFA with sealed secrets. It is the Go port of @gsalgadotoledo/rt-app-auth without
+// codes (sign-in, password reset, email change), rate limits, JWT access tokens with rotating
+// refresh sessions (sessions.go), sign-in settings and TOTP MFA with sealed secrets. It is the Go port of @gsalgadotoledo/rt-app-auth without
 // external identity providers; rows and HMAC keys are interchangeable with the TypeScript and
 // Python ports. See rt-app/spec/contracts/auth.contract.yaml.
 package auth
@@ -45,14 +45,22 @@ const (
 	msgWrongCredential = "Incorrect email or password"
 )
 
+// providerLocal is the credential provider of this port (no external identity providers).
+const providerLocal = "local"
+
 // dummyHash is verified when the user is missing, so unknown emails cost the same work.
 var dummyHash = "scrypt$" + strings.Repeat("0", 32) + "$" + strings.Repeat("00", 64)
 
-// Session is a signed-in session.
+// Session is a signed-in session: a 15-minute access token tied (sid) to a refresh session.
 type Session struct {
-	Token     string         `json:"token"`
-	ExpiresIn int            `json:"expiresIn"`
-	User      map[string]any `json:"user"`
+	Token     string `json:"token"`
+	ExpiresIn int    `json:"expiresIn"`
+	// RefreshToken is "<sessionId>.<secret>"; POST /auth/refresh rotates it.
+	RefreshToken string `json:"refreshToken"`
+	// RefreshExpiresAt is the absolute session expiry (ISO 8601, milliseconds, Z).
+	RefreshExpiresAt string         `json:"refreshExpiresAt"`
+	SessionID        string         `json:"sessionId"`
+	User             map[string]any `json:"user"`
 }
 
 // Pending is a challenge the user must complete before a session is issued.
@@ -88,6 +96,9 @@ type Auth struct {
 	secret []byte
 	vault  *Vault
 	now    func() time.Time
+
+	sessionTTL   time.Duration
+	refreshGrace time.Duration
 }
 
 // Option configures Auth.
@@ -100,7 +111,8 @@ func WithClock(now func() time.Time) Option { return func(a *Auth) { a.now = now
 // New returns Auth over accounts, signing sessions with tokens and mailing codes with mail.
 // secret is the application secret: it keys every HMAC and the vault.
 func New(accounts *users.Users, tokens *jwt.Tokens, mail Mailer, secret string, options ...Option) *Auth {
-	a := &Auth{users: accounts, store: accounts.Store(), tokens: tokens, mail: mail, secret: []byte(secret), vault: NewVault(secret), now: time.Now}
+	a := &Auth{users: accounts, store: accounts.Store(), tokens: tokens, mail: mail, secret: []byte(secret), vault: NewVault(secret), now: time.Now,
+		sessionTTL: SessionTTL, refreshGrace: RefreshGrace}
 	for _, option := range options {
 		option(a)
 	}
@@ -149,45 +161,65 @@ func (a *Auth) Limit(ctx context.Context, key string, max int) error {
 }
 
 // Actor resolves an Authorization header: "" is anonymous (nil); otherwise it must be
-// "Bearer <jwt>" for an active user whose tokenVersion matches the token, or 401. The result
-// is the public actor {id, email, name, role, grants, tokenVersion, active}.
+// "Bearer <jwt>" for an active user whose tokenVersion matches the token, or 401. A token with
+// a sid claim also needs its refresh session to be live (one read), so revoking a session cuts
+// its access tokens at once. The result is the public actor {id, email, name, role, grants,
+// tokenVersion, active}, plus sessionId for tokens with sid.
 func (a *Auth) Actor(ctx context.Context, header string) (map[string]any, error) {
-	row, err := a.sessionUser(ctx, header)
+	row, sid, err := a.sessionUser(ctx, header)
 	if err != nil || row == nil {
 		return nil, err
 	}
-	return users.PublicUser(row.Data), nil
+	actor := users.PublicUser(row.Data)
+	if sid != "" {
+		actor["sessionId"] = sid
+	}
+	return actor, nil
 }
 
-// Authenticate is a web.Authenticator that resolves the session of r's Authorization header.
+// Authenticate is a web.Authenticator that resolves the session of r's Authorization header
+// (with the same checks as Actor; Actor.SessionID is the token's sid).
 func (a *Auth) Authenticate(r *http.Request) (*web.Actor, error) {
-	row, err := a.sessionUser(r.Context(), r.Header.Get("Authorization"))
+	row, sid, err := a.sessionUser(r.Context(), r.Header.Get("Authorization"))
 	if err != nil || row == nil {
 		return nil, err
 	}
-	return users.Actor(row.Data), nil
+	actor := users.Actor(row.Data)
+	actor.SessionID = sid
+	return actor, nil
 }
 
-func (a *Auth) sessionUser(ctx context.Context, header string) (*nosql.Row, error) {
+// sessionUser returns the user of an Authorization header and the token's session id.
+func (a *Auth) sessionUser(ctx context.Context, header string) (*nosql.Row, string, error) {
 	if header == "" {
-		return nil, nil
+		return nil, "", nil
 	}
 	token, ok := strings.CutPrefix(header, "Bearer ")
 	if !ok {
-		return nil, apperr.New(http.StatusUnauthorized, "Invalid token")
+		return nil, "", apperr.New(http.StatusUnauthorized, "Invalid token")
 	}
 	claims, err := a.tokens.Verify(token)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	row, err := a.users.Get(ctx, claims.ID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if row == nil || !js.Truthy(row.Data["active"]) || !js.Equal(row.Data["tokenVersion"], float64(claims.Version)) || !localProvider(row.Data) {
-		return nil, apperr.New(http.StatusUnauthorized, msgInvalidSession)
+		return nil, "", apperr.New(http.StatusUnauthorized, msgInvalidSession)
 	}
-	return row, nil
+	if claims.SID == "" {
+		return row, "", nil
+	}
+	session, err := a.store.Get(ctx, SessionPartition(claims.ID), claims.SID)
+	if err != nil {
+		return nil, "", err
+	}
+	if !sessionLive(session, a.nowMs()) {
+		return nil, "", apperr.New(http.StatusUnauthorized, msgInvalidSession)
+	}
+	return row, claims.SID, nil
 }
 
 // localProvider: accounts of an external identity provider cannot use local sessions.
@@ -196,19 +228,49 @@ func localProvider(data map[string]any) bool {
 	return !present || provider == nil || provider == "local"
 }
 
-func (a *Auth) session(row *nosql.Row) (*Session, error) {
-	id, ok := row.Data["id"].(string)
-	version, isInt := js.Integer(row.Data["tokenVersion"])
-	if !ok || !isInt {
-		return nil, errors.New("auth: user row needs a string id and an integer tokenVersion")
+// session starts a refresh session for a user who just signed in and returns the session
+// response. userAgent is the optional trailing argument of the sign-in methods.
+func (a *Auth) session(ctx context.Context, row *nosql.Row, ip string, userAgent []string) (*Session, error) {
+	if err := checkUser(row); err != nil {
+		return nil, err
 	}
-	token := a.tokens.Issue(jwt.User{ID: id, TokenVersion: int(version)})
-	return &Session{Token: token, ExpiresIn: sessionSeconds, User: users.ViewUser(row.Data)}, nil
+	agent := ""
+	if len(userAgent) > 0 {
+		agent = userAgent[0]
+	}
+	refresh, err := a.createSession(ctx, row, ip, agent)
+	if err != nil {
+		return nil, err
+	}
+	return a.respond(row, refresh)
+}
+
+// checkUser: sessions need a string id and an integer tokenVersion.
+func checkUser(row *nosql.Row) error {
+	_, ok := row.Data["id"].(string)
+	_, isInt := js.Integer(row.Data["tokenVersion"])
+	if !ok || !isInt {
+		return errors.New("auth: user row needs a string id and an integer tokenVersion")
+	}
+	return nil
+}
+
+// respond builds the session response for a user row and its refresh session.
+func (a *Auth) respond(row *nosql.Row, refresh issued) (*Session, error) {
+	if err := checkUser(row); err != nil {
+		return nil, err
+	}
+	version, _ := js.Integer(row.Data["tokenVersion"])
+	token := a.tokens.Issue(jwt.User{ID: row.Data["id"].(string), TokenVersion: int(version), SID: refresh.sessionID})
+	return &Session{Token: token, ExpiresIn: sessionSeconds, RefreshToken: refresh.token,
+		RefreshExpiresAt: users.ISOTime(time.UnixMilli(refresh.expiresAt)), SessionID: refresh.sessionID,
+		User: users.ViewUser(row.Data)}, nil
 }
 
 // Login signs in with a password (emails are already normalized). Unknown, inactive and
-// wrong credentials are the same 401; accounts with MFA get a Pending TOTP challenge.
-func (a *Auth) Login(ctx context.Context, email string, password any, ip string) (LoginResult, error) {
+// wrong credentials are the same 401; accounts with MFA get a Pending TOTP challenge. The
+// optional userAgent is stored on the refresh session (informational only).
+func (a *Auth) Login(ctx context.Context, email string, password any, ip string, userAgent ...string) (LoginResult, error) {
 	settings, err := a.Settings(ctx)
 	if err != nil {
 		return LoginResult{}, err
@@ -244,7 +306,7 @@ func (a *Auth) Login(ctx context.Context, email string, password any, ip string)
 		pending, err := a.pending(ctx, row, "totp", map[string]any{})
 		return LoginResult{Pending: pending}, err
 	}
-	session, err := a.session(row)
+	session, err := a.session(ctx, row, ip, userAgent)
 	return LoginResult{Session: session}, err
 }
 
@@ -345,8 +407,9 @@ func newCode() string {
 
 // Consume checks an emailed code. For "login" it returns a Session (403 for accounts with
 // MFA, leaving the code unused); for "reset" it validates and stores password, revokes
-// sessions and returns a Reply. Wrong codes count as attempts; five lock the challenge.
-func (a *Auth) Consume(ctx context.Context, email string, code any, purpose, ip string, password any) (CodeResult, error) {
+// sessions and returns a Reply. Wrong codes count as attempts; five lock the challenge. The
+// optional userAgent is stored on the refresh session of a sign-in.
+func (a *Auth) Consume(ctx context.Context, email string, code any, purpose, ip string, password any, userAgent ...string) (CodeResult, error) {
 	if purpose == "login" {
 		if err := a.emailCodeGate(ctx); err != nil {
 			return CodeResult{}, err
@@ -394,7 +457,7 @@ func (a *Auth) Consume(ctx context.Context, email string, code any, purpose, ip 
 	if err := a.store.Transact(ctx, []nosql.Write{consumed}); err != nil {
 		return CodeResult{}, err
 	}
-	session, err := a.session(user)
+	session, err := a.session(ctx, user, ip, userAgent)
 	return CodeResult{Session: session}, err
 }
 
@@ -476,7 +539,7 @@ func (a *Auth) RequestEmailChange(ctx context.Context, userID, email, ip string)
 
 // ConfirmEmailChange applies a requested email change with its code: the challenge is used,
 // the user gets the new email and tokenVersion+1, and the EMAIL index moves, atomically.
-func (a *Auth) ConfirmEmailChange(ctx context.Context, userID string, code any, ip string) (*Session, error) {
+func (a *Auth) ConfirmEmailChange(ctx context.Context, userID string, code any, ip string, userAgent ...string) (*Session, error) {
 	if err := a.limits(ctx, rate{"email-confirm:" + userID, 8}, rate{"email-confirm-ip:" + ip, 20}); err != nil {
 		return nil, err
 	}
@@ -517,7 +580,7 @@ func (a *Auth) ConfirmEmailChange(ctx context.Context, userID string, code any, 
 	if err != nil {
 		return nil, err
 	}
-	return a.session(&updated)
+	return a.session(ctx, &updated, ip, userAgent)
 }
 
 // looseHex decodes like Node's Buffer.from(s, "hex"): byte pairs until the first invalid one.

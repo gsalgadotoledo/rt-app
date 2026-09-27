@@ -28,6 +28,9 @@ import (
 // DynamoDB…); modules only see the nosql.Store interface.
 type Components struct {
 	Store *rtcore.Singleton[nosql.Store]
+	// Authenticator resolves the actor of endpoints outside /admin/ (set by the auth module;
+	// without it every authenticated endpoint answers 401).
+	Authenticator web.Authenticator
 }
 
 // Module builds the HTTP features of one module from the shared components. Each module file
@@ -51,6 +54,9 @@ func Compose(localAdmin bool) (*web.App, *Components, error) {
 		features = append(features, f...)
 	}
 	var options []web.Option
+	if c.Authenticator != nil {
+		options = append(options, web.WithAuthenticator(c.Authenticator))
+	}
 	if localAdmin {
 		options = append(options, web.WithLocalAdmin())
 	}

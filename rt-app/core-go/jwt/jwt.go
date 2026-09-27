@@ -2,7 +2,8 @@
 //
 // Tokens are byte-identical to the TypeScript reference (jose): the header is exactly
 // {"alg":"HS256","typ":"JWT"} and the payload {"v","sub","iss","aud","iat","exp"} in that key
-// order, compact JSON, base64url without padding. Verification follows the jose defaults the
+// order ({"v","sid","sub",...} for tokens tied to a refresh session), compact JSON, base64url
+// without padding. Verification follows the jose defaults the
 // reference uses; see rt-app/spec/contracts/jwt.contract.yaml.
 package jwt
 
@@ -39,16 +40,20 @@ var ErrShortSecret = errors.New("JWT_SECRET must contain at least 32 bytes")
 const header = `{"alg":"HS256","typ":"JWT"}`
 
 // User is what a session token carries: the user id (sub) and the token version (v) that
-// lets the server revoke every session of a user by bumping it.
+// lets the server revoke every session of a user by bumping it. A non-empty SID ties the
+// token to a refresh session (the sid claim, right after v); "" issues a token without it.
 type User struct {
 	ID           string
 	TokenVersion int
+	SID          string
 }
 
-// Claims are the verified contents of a session token.
+// Claims are the verified contents of a session token. SID is the refresh session of tokens
+// that carry a sid claim ("" otherwise).
 type Claims struct {
 	ID      string `json:"id"`
 	Version int    `json:"version"`
+	SID     string `json:"sid,omitempty"`
 }
 
 // Tokens issues and verifies session tokens. It is safe for concurrent use.
@@ -83,13 +88,18 @@ func New(secret string, options ...Option) (*Tokens, error) {
 	return t, nil
 }
 
-// Issue signs a session for user valid for Lifetime from now (whole seconds).
+// Issue signs a session for user valid for Lifetime from now (whole seconds). Without a SID
+// the token is byte-identical to earlier releases.
 func (t *Tokens) Issue(user User) string {
 	now := t.now().UnixMilli()
 	iat := floorDiv(now, 1000)
 	var payload strings.Builder
 	payload.WriteString(`{"v":`)
 	payload.WriteString(strconv.Itoa(user.TokenVersion))
+	if user.SID != "" {
+		payload.WriteString(`,"sid":`)
+		payload.WriteString(quote(user.SID))
+	}
 	payload.WriteString(`,"sub":`)
 	payload.WriteString(quote(user.ID))
 	payload.WriteString(`,"iss":`)
@@ -106,7 +116,8 @@ func (t *Tokens) Issue(user User) string {
 }
 
 // Verify checks token (the bare compact JWS, without "Bearer ") and returns its claims.
-// Every failure is the same 401 "Invalid or expired session", so no detail leaks.
+// A sid claim that is not a non-empty string is invalid. Every failure is the same 401
+// "Invalid or expired session", so no detail leaks.
 func (t *Tokens) Verify(token string) (Claims, error) {
 	claims, ok := t.verify(token)
 	if !ok {
@@ -178,7 +189,16 @@ func (t *Tokens) verify(token string) (Claims, bool) {
 	if sub == "" || !ok || v != math.Trunc(v) || math.Abs(v) > 1<<53 {
 		return Claims{}, false
 	}
-	return Claims{ID: sub, Version: int(v)}, true
+	// A sid claim, wherever it appears, must be a non-empty string.
+	claims := Claims{ID: sub, Version: int(v)}
+	if raw, present := payload["sid"]; present {
+		sid, ok := raw.(string)
+		if !ok || sid == "" {
+			return Claims{}, false
+		}
+		claims.SID = sid
+	}
+	return claims, true
 }
 
 // validCrit applies jose's "crit" rules: only "b64" is recognized, it must be present and

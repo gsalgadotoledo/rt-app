@@ -110,7 +110,8 @@ func jwtSubject(_ context.Context, init json.RawMessage) (conformance.Instance, 
 		return conformance.Instance{}, err
 	}
 	return conformance.Instance{Methods: map[string]conformance.Method{
-		// issue({id, tokenVersion}) → token; other user fields are ignored
+		// issue({id, tokenVersion, sid?}) → token; other user fields are ignored, and so is a
+		// sid that is not a non-empty string
 		"issue": func(_ context.Context, args []json.RawMessage) (any, error) {
 			user, _ := argAny(args, 0).(map[string]any)
 			id, ok := user["id"].(string)
@@ -121,9 +122,10 @@ func jwtSubject(_ context.Context, init json.RawMessage) (conformance.Instance, 
 			if !ok {
 				return nil, errors.New("tokenVersion must be an integer")
 			}
-			return tokens.Issue(jwt.User{ID: id, TokenVersion: int(version)}), nil
+			sid, _ := user["sid"].(string)
+			return tokens.Issue(jwt.User{ID: id, TokenVersion: int(version), SID: sid}), nil
 		},
-		// verify(token) → {id, version}; any non-string is an invalid token
+		// verify(token) → {id, version, sid?}; any non-string is an invalid token
 		"verify": func(_ context.Context, args []json.RawMessage) (any, error) {
 			token, _ := argAny(args, 0).(string)
 			return tokens.Verify(token)
@@ -263,7 +265,8 @@ func authSubject(ctx context.Context, init json.RawMessage) (conformance.Instanc
 		return conformance.Instance{}, err
 	}
 	var config struct {
-		Secret string `json:"secret"`
+		Secret       string   `json:"secret"`
+		SessionTTLMs *float64 `json:"sessionTtlMs"`
 	}
 	if err := json.Unmarshal(init, &config); err != nil {
 		return conformance.Instance{}, fmt.Errorf("init: %w", err)
@@ -274,21 +277,26 @@ func authSubject(ctx context.Context, init json.RawMessage) (conformance.Instanc
 	}
 	mailbox := &auth.LocalMailbox{}
 	accounts := users.New(store, users.WithClock(now.Now))
-	a := auth.New(accounts, tokens, mailbox, config.Secret, auth.WithClock(now.Now))
+	options := []auth.Option{auth.WithClock(now.Now)}
+	if config.SessionTTLMs != nil {
+		options = append(options, auth.WithSessionTTL(time.Duration(*config.SessionTTLMs)*time.Millisecond))
+	}
+	a := auth.New(accounts, tokens, mailbox, config.Secret, options...)
 	vault := auth.NewVault(config.Secret)
 	str := argString
 	return conformance.Instance{Methods: map[string]conformance.Method{
-		// login(email, password, ip) → session | {challenge, challengeId}
+		// login(email, password, ip, userAgent?) → session | {challenge, challengeId}
 		"login": func(ctx context.Context, args []json.RawMessage) (any, error) {
-			return a.Login(ctx, str(args, 0), argAny(args, 1), str(args, 2))
+			return a.Login(ctx, str(args, 0), argAny(args, 1), str(args, 2), str(args, 3))
 		},
 		// issue(email, purpose, ip) → {message}
 		"issue": func(ctx context.Context, args []json.RawMessage) (any, error) {
 			return a.Issue(ctx, str(args, 0), str(args, 1), str(args, 2))
 		},
-		// consume(email, code, purpose, ip, password?, challengeId?) → session | {message}
+		// consume(email, code, purpose, ip, password?, challengeId?, userAgent?) → session | {message}
+		// (challengeId is for identity providers, which this port does not have)
 		"consume": func(ctx context.Context, args []json.RawMessage) (any, error) {
-			return a.Consume(ctx, str(args, 0), argAny(args, 1), str(args, 2), str(args, 3), argAny(args, 4))
+			return a.Consume(ctx, str(args, 0), argAny(args, 1), str(args, 2), str(args, 3), argAny(args, 4), str(args, 6))
 		},
 		// actor(header?) → actor | null
 		"actor": func(ctx context.Context, args []json.RawMessage) (any, error) {
@@ -321,9 +329,9 @@ func authSubject(ctx context.Context, init json.RawMessage) (conformance.Instanc
 		"enableMfa": func(ctx context.Context, args []json.RawMessage) (any, error) {
 			return a.EnableMFA(ctx, str(args, 0), argAny(args, 1), argAny(args, 2), str(args, 3))
 		},
-		// verifyMfa(challengeId, code, ip) → session
+		// verifyMfa(challengeId, code, ip, userAgent?) → session
 		"verifyMfa": func(ctx context.Context, args []json.RawMessage) (any, error) {
-			return a.VerifyMFA(ctx, argAny(args, 0), argAny(args, 1), str(args, 2))
+			return a.VerifyMFA(ctx, argAny(args, 0), argAny(args, 1), str(args, 2), str(args, 3))
 		},
 		"resetMfa": func(ctx context.Context, args []json.RawMessage) (any, error) {
 			return a.ResetMFA(ctx, argAny(args, 0))
@@ -332,9 +340,26 @@ func authSubject(ctx context.Context, init json.RawMessage) (conformance.Instanc
 		"requestEmailChange": func(ctx context.Context, args []json.RawMessage) (any, error) {
 			return a.RequestEmailChange(ctx, str(args, 0), str(args, 1), str(args, 2))
 		},
-		// confirmEmailChange(id, code, ip) → session
+		// confirmEmailChange(id, code, ip, userAgent?) → session
 		"confirmEmailChange": func(ctx context.Context, args []json.RawMessage) (any, error) {
-			return a.ConfirmEmailChange(ctx, str(args, 0), argAny(args, 1), str(args, 2))
+			return a.ConfirmEmailChange(ctx, str(args, 0), argAny(args, 1), str(args, 2), str(args, 3))
+		},
+		// Refresh sessions (POST /auth/refresh, GET/DELETE /auth/sessions, POST /auth/logout).
+		// refresh(refreshToken, ip) → session
+		"refresh": func(ctx context.Context, args []json.RawMessage) (any, error) {
+			return a.Refresh(ctx, argAny(args, 0), str(args, 1))
+		},
+		// sessions(userId, currentSessionId?) → {items}
+		"sessions": func(ctx context.Context, args []json.RawMessage) (any, error) {
+			return a.Sessions(ctx, str(args, 0), str(args, 1))
+		},
+		// revokeSession(userId, sessionId) → {ok: true}
+		"revokeSession": func(ctx context.Context, args []json.RawMessage) (any, error) {
+			return a.RevokeSession(ctx, str(args, 0), argAny(args, 1))
+		},
+		// logout(userId, sessionId?, all?) → {ok: true}
+		"logout": func(ctx context.Context, args []json.RawMessage) (any, error) {
+			return a.Logout(ctx, str(args, 0), str(args, 1), argAny(args, 2))
 		},
 		// Helpers (not Auth methods): captured mail, stored rows, clock, TOTP and vault.
 		"mailbox": func(context.Context, []json.RawMessage) (any, error) {

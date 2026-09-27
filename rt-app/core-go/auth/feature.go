@@ -1,9 +1,6 @@
 package auth
 
 import (
-	"errors"
-
-	"rt.local/core-go/nosql"
 	"rt.local/core-go/users"
 	"rt.local/core-go/web"
 )
@@ -24,21 +21,28 @@ import (
 //	POST /auth/mfa/enable            authenticated  {challengeId, code}
 //	POST /auth/email-change          authenticated  {email}
 //	POST /auth/email-change/verify   authenticated  {code}
-//	POST /auth/logout                authenticated  revokes every session of the caller
+//	POST /auth/refresh               guest          {refreshToken}     rotates a refresh token
+//	GET  /auth/sessions              authenticated  the caller's live sessions
+//	DELETE /auth/sessions/:id        authenticated  revokes one of the caller's sessions
+//	POST /auth/logout                authenticated  {all?}             ends the current session;
+//	                                                                    all: true (or a token
+//	                                                                    without sid) ends every one
 //	POST /auth/mfa/reset             owner          {userId}
 //	GET  /auth/settings              permission     auth.settings.read
 //	PUT  /auth/settings              owner          {version, values}
 //
-// Use Authenticate as the app's authenticator: web.WithAuthenticator(a.Authenticate).
+// Sign-in endpoints pass the User-Agent header to the refresh session. Use Authenticate as the
+// app's authenticator: web.WithAuthenticator(a.Authenticate).
 func (a *Auth) Feature() web.Feature {
 	body := func(c *web.Context, key string) any { return c.Request.Body[key] }
+	agent := func(c *web.Context) string { return c.Request.Headers.Get("User-Agent") }
 	email := func(c *web.Context) (string, error) { return users.EmailAddress(body(c, "email")) }
 	return web.Feature{ID: "auth", Endpoints: []web.Endpoint{
 		{Method: "POST", Path: "/auth/mfa/reset", Resource: "auth.mfa.reset", Access: web.Owner, Handle: func(c *web.Context) (any, error) {
 			return a.ResetMFA(c.Ctx, body(c, "userId"))
 		}},
 		{Method: "POST", Path: "/auth/mfa/verify", Resource: "auth.mfa.verify", Access: web.Guest, Handle: func(c *web.Context) (any, error) {
-			return a.VerifyMFA(c.Ctx, body(c, "challengeId"), body(c, "code"), c.Request.IP)
+			return a.VerifyMFA(c.Ctx, body(c, "challengeId"), body(c, "code"), c.Request.IP, agent(c))
 		}},
 		{Method: "GET", Path: "/auth/mfa", Resource: "auth.mfa.status", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
 			on, err := a.HasMFA(c.Ctx, c.Actor.ID)
@@ -55,7 +59,7 @@ func (a *Auth) Feature() web.Feature {
 			if err != nil {
 				return nil, err
 			}
-			return users.With(settings.Values, map[string]any{"provider": "local", "totp": true, "selfRegistration": false, "refreshTokens": false}), nil
+			return users.With(settings.Values, map[string]any{"provider": "local", "totp": true, "selfRegistration": false, "refreshTokens": true}), nil
 		}},
 		{Method: "GET", Path: "/auth/settings", Resource: "auth.settings.read", Access: web.Permission, Handle: func(c *web.Context) (any, error) {
 			return a.Settings(c.Ctx)
@@ -68,7 +72,7 @@ func (a *Auth) Feature() web.Feature {
 			if err != nil {
 				return nil, err
 			}
-			return a.Login(c.Ctx, address, body(c, "password"), c.Request.IP)
+			return a.Login(c.Ctx, address, body(c, "password"), c.Request.IP, agent(c))
 		}},
 		{Method: "POST", Path: "/auth/code", Resource: "auth.code", Access: web.Guest, Handle: func(c *web.Context) (any, error) {
 			address, err := email(c)
@@ -82,7 +86,7 @@ func (a *Auth) Feature() web.Feature {
 			if err != nil {
 				return nil, err
 			}
-			return a.Consume(c.Ctx, address, body(c, "code"), "login", c.Request.IP, nil)
+			return a.Consume(c.Ctx, address, body(c, "code"), "login", c.Request.IP, nil, agent(c))
 		}},
 		{Method: "POST", Path: "/auth/forgot-password", Resource: "auth.forgot", Access: web.Guest, Handle: func(c *web.Context) (any, error) {
 			address, err := email(c)
@@ -106,20 +110,19 @@ func (a *Auth) Feature() web.Feature {
 			return a.RequestEmailChange(c.Ctx, c.Actor.ID, address, c.Request.IP)
 		}},
 		{Method: "POST", Path: "/auth/email-change/verify", Resource: "auth.email.verify", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
-			return a.ConfirmEmailChange(c.Ctx, c.Actor.ID, body(c, "code"), c.Request.IP)
+			return a.ConfirmEmailChange(c.Ctx, c.Actor.ID, body(c, "code"), c.Request.IP, agent(c))
+		}},
+		{Method: "POST", Path: "/auth/refresh", Resource: "auth.refresh", Access: web.Guest, Handle: func(c *web.Context) (any, error) {
+			return a.Refresh(c.Ctx, body(c, "refreshToken"), c.Request.IP)
+		}},
+		{Method: "GET", Path: "/auth/sessions", Resource: "auth.sessions.list", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
+			return a.Sessions(c.Ctx, c.Actor.ID, c.Actor.SessionID)
+		}},
+		{Method: "DELETE", Path: "/auth/sessions/:id", Resource: "auth.sessions.revoke", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
+			return a.RevokeSession(c.Ctx, c.Actor.ID, c.Params["id"])
 		}},
 		{Method: "POST", Path: "/auth/logout", Resource: "auth.logout", Access: web.Authenticated, Handle: func(c *web.Context) (any, error) {
-			row, err := a.users.Get(c.Ctx, c.Actor.ID)
-			if err != nil {
-				return nil, err
-			}
-			if row == nil {
-				return nil, errors.New("auth: the session's user disappeared")
-			}
-			if err := a.store.Transact(c.Ctx, []nosql.Write{revoke(row)}); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
+			return a.Logout(c.Ctx, c.Actor.ID, c.Actor.SessionID, body(c, "all"))
 		}},
 	}}
 }

@@ -90,6 +90,9 @@ type Actor struct {
 	Grants       []string `json:"grants,omitempty"`
 	TokenVersion int      `json:"tokenVersion,omitempty"`
 	Active       bool     `json:"active,omitempty"`
+	// SessionID is the refresh session behind the access token (its sid claim); "" for
+	// tokens without one.
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 // LocalOwner is the actor of local admin mode.

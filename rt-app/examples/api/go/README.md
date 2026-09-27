@@ -5,6 +5,12 @@ mode: owner endpoints are mounted under `/admin/app` and act as `rt-app-root`. `
 composition root: one `rtcore.New(...)` provider per component. Swap the store by changing the
 `nosql.NewMemoryStore()` line.
 
+Accounts and sign-in (`auth.go`): `POST /admin/app/users` creates users, `POST /auth/login`
+returns a 15-minute access token plus a rotating refresh token (`POST /auth/refresh`),
+`GET/DELETE /auth/sessions` lists and revokes sessions and `POST /auth/logout` ends the current
+session (`{"all": true}` ends every one). Set `RT_APP_SECRET` (32+ characters) so tokens survive
+restarts and work across instances; codes go to a local mailbox.
+
 ```sh
 # HTTP server on 127.0.0.1:$PORT (default 4010)
 PORT=4010 go run . -mode=serve
