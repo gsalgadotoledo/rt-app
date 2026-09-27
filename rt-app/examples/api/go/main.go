@@ -31,6 +31,8 @@ type Components struct {
 	// Authenticator resolves the actor of endpoints outside /admin/ (set by the auth module;
 	// without it every authenticated endpoint answers 401).
 	Authenticator web.Authenticator
+	// ServiceKeys authenticates /service/* endpoints (set by the service keys module).
+	ServiceKeys web.ServicePolicy
 }
 
 // Module builds the HTTP features of one module from the shared components. Each module file
@@ -56,6 +58,9 @@ func Compose(localAdmin bool) (*web.App, *Components, error) {
 	var options []web.Option
 	if c.Authenticator != nil {
 		options = append(options, web.WithAuthenticator(c.Authenticator))
+	}
+	if c.ServiceKeys != nil {
+		options = append(options, web.WithServiceKeys(c.ServiceKeys))
 	}
 	if localAdmin {
 		options = append(options, web.WithLocalAdmin())

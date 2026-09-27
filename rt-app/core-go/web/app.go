@@ -30,7 +30,24 @@ const (
 	Authenticated = "authenticated" // any actor
 	Permission    = "permission"    // owners, or actors granted Resource; also under /admin/app
 	Owner         = "owner"         // owners only; also under /admin/app
+	// Service is for scoped service keys only (Bearer rtsk_<id>.<secret>) holding Resource as a
+	// scope; the path must start with /service/ and it is never mounted under /admin/app.
+	Service = "service"
 )
+
+// Service key messages (see package servicekeys).
+const (
+	msgServiceKeyRequired = "Service key required"
+	msgInvalidServiceKey  = "Invalid service key"
+)
+
+// ServicePolicy authenticates and authorizes service endpoints (package servicekeys).
+type ServicePolicy interface {
+	// Actor resolves the service actor of a request (401/429 errors).
+	Actor(r *http.Request) (*Actor, error)
+	// Check authorizes the actor for the endpoint (401/403 errors).
+	Check(e Endpoint, actor *Actor) error
+}
 
 // AdminPrefix is where owner and permission endpoints are also mounted.
 const AdminPrefix = "/admin/app"
@@ -42,7 +59,8 @@ func AdminOnly(e Endpoint) bool {
 	p := e.Path
 	return e.Access == Owner && (strings.HasPrefix(p, "/feature-flags") || strings.HasPrefix(p, "/visits") || p == "/health/report") ||
 		strings.HasPrefix(p, "/infra") || strings.HasPrefix(p, "/aws/") ||
-		p == "/observer/report" || p == "/observer/logs" || strings.HasPrefix(p, "/subscriptions/admin/")
+		p == "/observer/report" || p == "/observer/logs" || strings.HasPrefix(p, "/subscriptions/admin/") ||
+		strings.HasPrefix(p, "/service-keys")
 }
 
 // DefaultBodyLimit is the largest accepted request body (16 KiB).
@@ -147,6 +165,9 @@ func WithAdminAuthenticator(auth Authenticator) Option {
 	return func(a *App) { a.adminAuth = auth }
 }
 
+// WithServiceKeys authenticates endpoints with access Service (package servicekeys).
+func WithServiceKeys(policy ServicePolicy) Option { return func(a *App) { a.service = policy } }
+
 // WithBodyLimit changes the body limit (default DefaultBodyLimit).
 func WithBodyLimit(bytes int64) Option { return func(a *App) { a.bodyLimit = bytes } }
 
@@ -163,6 +184,7 @@ type App struct {
 	routes    []route
 	auth      Authenticator
 	adminAuth Authenticator
+	service   ServicePolicy
 	bodyLimit int64
 	logger    *slog.Logger
 	fallback  http.Handler
@@ -187,12 +209,16 @@ func New(features []Feature, options ...Option) (*App, error) {
 	for _, f := range features {
 		for _, e := range f.Endpoints {
 			switch e.Access {
-			case Guest, Authenticated, Owner, Permission:
+			case Guest, Authenticated, Owner, Permission, Service:
 			default:
 				return nil, fmt.Errorf("web: %s %s %s: unknown access %q", f.ID, e.Method, e.Path, e.Access)
 			}
 			if e.Handle == nil || !strings.HasPrefix(e.Path, "/") {
 				return nil, fmt.Errorf("web: %s %s %s: needs a handler and an absolute path", f.ID, e.Method, e.Path)
+			}
+			// Service endpoints live under /service/ and nothing else does: one prefix, one credential.
+			if (e.Access == Service) != strings.HasPrefix(e.Path, "/service/") {
+				return nil, fmt.Errorf("web: %s %s %s: service endpoints must use /service/ paths", f.ID, e.Method, e.Path)
 			}
 			if !AdminOnly(e) {
 				plain = append(plain, e)
@@ -326,7 +352,15 @@ func (a *App) run(r *http.Request, req Request) (any, error) {
 		params[name] = decoded
 	}
 	var actor *Actor
-	if found.Access != Guest {
+	if found.Access == Service {
+		var err error
+		if actor, err = a.serviceActor(r); err != nil {
+			return nil, err
+		}
+		if err := a.service.Check(found.Endpoint, actor); err != nil {
+			return nil, err
+		}
+	} else if found.Access != Guest {
 		auth := a.auth
 		if strings.HasPrefix(found.Path, "/admin/") {
 			auth = a.adminAuth
@@ -342,6 +376,17 @@ func (a *App) run(r *http.Request, req Request) (any, error) {
 		}
 	}
 	return found.Handle(&Context{Ctx: r.Context(), Request: req, Params: params, Actor: actor})
+}
+
+// serviceActor resolves the actor of a service endpoint; without a policy no key is valid.
+func (a *App) serviceActor(r *http.Request) (*Actor, error) {
+	if a.service == nil {
+		if r.Header.Get("Authorization") == "" {
+			return nil, apperr.New(http.StatusUnauthorized, msgServiceKeyRequired)
+		}
+		return nil, apperr.New(http.StatusUnauthorized, msgInvalidServiceKey)
+	}
+	return a.service.Actor(r)
 }
 
 // clientIP is the host part of r.RemoteAddr ("unknown" when empty).
