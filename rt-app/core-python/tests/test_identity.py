@@ -307,7 +307,7 @@ class IdentityAppTests(unittest.TestCase):
         self.assertEqual(self.call("GET", "/users/me"), (401, {"error": "Sign in"}))
         self.assertEqual(self.call("GET", "/users/me", token="garbage"), (401, {"error": "Invalid or expired session"}))
         self.assertEqual(self.call("GET", "/admin/app/users", token=alice)[0], 403)
-        self.assertEqual(self.call("GET", "/users", token=owner)[0], 404)  # permission routes live under /admin/app
+        self.assertEqual(self.call("GET", "/users", token=owner)[0], 200)  # permission routes: plain path and /admin/app
         listed = self.call("GET", "/admin/app/users", token=owner)[1]
         self.assertEqual(sorted(u["id"] for u in listed["items"]), ["u-alice", "u-owner"])
         resources = self.call("GET", "/admin/app/acl/resources", token=owner)[1]

@@ -51,9 +51,11 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self.call(app, "GET", "/items/a%20b").body, {"id": "a b"})
         self.assertEqual(self.call(app, "GET", "/items/%E0%A4%A").body, {"error": "Invalid URL"})
         self.assertEqual(self.call(app, "GET", "/items/%FF").status, 400)
-        for method, path in [("GET", "/nope"), ("DELETE", "/health/live"), ("GET", "/feature-flags"), ("GET", "/reports")]:
+        for method, path in [("GET", "/nope"), ("DELETE", "/health/live"), ("GET", "/feature-flags")]:
             response = self.call(app, method, path)
             self.assertEqual((response.status, response.body), (404, {"error": "Endpoint not found"}))
+        # Owner/permission endpoints are also served at their path (sign-in required), like TypeScript.
+        self.assertEqual(self.call(app, "GET", "/reports").status, 401)
 
     def test_admin_mount_and_actors(self):
         local = make_app(local_admin=True)

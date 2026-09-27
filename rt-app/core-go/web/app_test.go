@@ -74,7 +74,7 @@ func TestDispatch(t *testing.T) {
 		{"GET", "/items/x?a=1&a=2", "", 200, `"query":{"a":"2"}`},
 		{"DELETE", "/items/x", "", 404, `{"error":"Endpoint not found"}`},
 		{"GET", "/items/", "", 404, `{"error":"Endpoint not found"}`},
-		{"PUT", "/items/x", "{}", 404, `{"error":"Endpoint not found"}`},
+		{"PUT", "/items/x", "{}", 401, `{"error":"Sign in"}`}, // also at its plain path, like TypeScript
 		{"GET", "/me", "", 401, `{"error":"Sign in"}`},
 		{"PUT", "/admin/app/items/x", "", 401, `{"error":"Sign in"}`},
 		{"GET", "/fail", "", 500, `{"error":"Internal error"}`},

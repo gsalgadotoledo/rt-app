@@ -93,7 +93,7 @@ func TestLocalBridge(t *testing.T) {
 	}
 	body, _ = io.ReadAll(res.Body)
 	res.Body.Close()
-	if res.StatusCode != 404 || string(body) != `{"error":"Endpoint not found"}` {
-		t.Fatalf("owner route outside /admin/app: %d %s", res.StatusCode, body)
+	if res.StatusCode != 401 || string(body) != `{"error":"Sign in"}` {
+		t.Fatalf("owner route at its plain path needs a session: %d %s", res.StatusCode, body)
 	}
 }

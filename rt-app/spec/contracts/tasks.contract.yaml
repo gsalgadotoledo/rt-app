@@ -1,0 +1,484 @@
+contract: 1
+module: tasks
+title: Tasks
+description: |
+  Personal tasks with soft delete (trash) and restore, stored under partition TASKS with the task
+  id as sort key. The subject calls the endpoint handlers directly; `actor` is {id, role, grants}.
+
+  Endpoints (permission endpoints are mounted under /admin/app by the framework):
+    GET    /tasks                      authenticated  tasks.mine     list(query, actor)
+    GET    /tasks/admin                permission     tasks.list     listAll(query, actor)
+    POST   /tasks                      authenticated  tasks.create   create(body, actor)
+    PATCH  /tasks/:id                  authenticated  tasks.edit     update(id, body, actor)
+    DELETE /tasks/:id                  authenticated  tasks.delete   remove(id, actor)
+    POST   /tasks/:id/restore          authenticated  tasks.restore  restore(id, actor)
+    PATCH  /tasks/admin/:id            permission     tasks.manage   manage(id, body, actor)
+    DELETE /tasks/admin/:id            permission     tasks.remove   adminRemove(id, actor)
+    POST   /tasks/admin/:id/restore    permission     tasks.restore  adminRestore(id, actor)
+
+  create: title = text(body.title, "title", 200) (a string, not blank after JavaScript trim(), at
+  most 200 UTF-16 units BEFORE trimming; stored trimmed; else 400 "Invalid field: title"). The id
+  is a random UUID v4. Data: {id, title, done: false, ownerId: actor.id} + audit create fields
+  {createdAt, createdBy, updatedAt, updatedBy, deletedAt: null, deletedBy: null}; written as
+  version 1 (must not exist). Other body fields are ignored. Returns the data (no version).
+
+  Lists (searchPage): the query may hold the filters id, title, done, ownerId (case-insensitive
+  substrings of String(value), JavaScript toLowerCase; empty values are ignored), `cursor` and
+  `trash`. Checks: trash other than "true"/"false" is 400 "Invalid trash filter" (checked first),
+  any other name is 400 "Unsupported filter: <name>", a foreign or malformed cursor is 400
+  "Invalid cursor". Rows are live when data.deletedAt is falsy; trash=true lists only deleted
+  rows. list keeps the rows whose ownerId is actor.id; listAll keeps all. Items are the stored
+  data. The search reads store pages (50 rows each in the memory store) in sort-key order and
+  returns the first page with matches, with the store cursor when more rows remain; after 10
+  pages without matches it returns {items: [], cursor}.
+
+  update / remove / restore (and manage / adminRestore), in this order:
+    1. The row must exist; it must be live (deleted for restore): 404 "Task not found".
+    2. The actor must own the task, be role "owner" or hold the grant "tasks.manage": 403
+       "This task belongs to another user".
+    3. Audit fields are merged over the stored data: update {updatedAt, updatedBy}; remove
+       {updatedAt, updatedBy, deletedAt, deletedBy} (one instant); restore {updatedAt, updatedBy,
+       deletedAt: null, deletedBy: null, restoredAt, restoredBy}.
+    4. update only: body.title, when present (null counts), is text(title, "title", 200); then
+       body.done, when present, must be a boolean: 400 "done must be a boolean".
+    5. The row is rewritten with version + 1, guarded by the read version (lost race: 409), other
+       row fields (ttl) and unknown data fields kept.
+    Returns the new data; remove returns {ok: true}.
+  adminRemove first requires role "owner" or the grant "tasks.manage" (403 "Requires
+  tasks.manage"), before looking the task up, then behaves like remove.
+
+  Audit timestamps come from the clock (init.now, moved with setNow(iso)), written like
+  Date.toISOString(). Helpers: endpoints(), admin(), migrations(), migrate(), seeds() (metadata),
+  seedRows(users) (the rows the welcome seed inserts for the given demo user rows), row(pk, sk).
+subject: tasks
+init: { rows: [], now: "2026-01-02T03:04:05.678Z" }
+cases:
+  # --- create -------------------------------------------------------------------
+  - name: create stores an open task owned by the actor
+    steps:
+      - call: create
+        args: [ { title: "  Buy milk  " }, { id: alice, role: user, grants: [] } ]
+        expect:
+          value:
+            id: { $regex: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" }
+            title: Buy milk
+            done: false
+            ownerId: alice
+            createdAt: "2026-01-02T03:04:05.678Z"
+            createdBy: alice
+            updatedAt: "2026-01-02T03:04:05.678Z"
+            updatedBy: alice
+            deletedAt: null
+            deletedBy: null
+      - call: row
+        args: [ TASKS, { $ref: "0.value.id" } ]
+        expect: { value: { pk: TASKS, sk: { $ref: "0.value.id" }, version: 1, data: { $ref: "0.value" } } }
+      - call: list
+        args: [ {}, { id: alice, role: user, grants: [] } ]
+        expect: { value: { items: [ { $ref: "0.value" } ] } }
+
+  - name: create ignores every body field but the title
+    steps:
+      - call: create
+        args: [ { title: T, id: mine, done: true, ownerId: bob, createdBy: bob, deletedAt: "2020-01-01T00:00:00.000Z" }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { $partial: { id: { $regex: "^[0-9a-f-]{36}$" }, title: T, done: false, ownerId: alice, createdBy: alice, deletedAt: null } } }
+      - { call: row, args: [ TASKS, mine ], expect: { value: null } }
+
+  - name: every create gets a new id
+    steps:
+      - { call: create, args: [ { title: A }, { id: alice, role: user, grants: [] } ] , expect: { value: { $partial: { title: A } } } }
+      - { call: create, args: [ { title: A }, { id: alice, role: user, grants: [] } ] , expect: { value: { $partial: { title: A } } } }
+      - { call: list, args: [ {}, { id: alice, role: user, grants: [] } ], expect: { value: { items: { $length: 2 } } } }
+
+  - name: the title is required text of at most 200 UTF-16 units
+    tags: [ edge, validation, unicode ]
+    steps:
+      - { call: create, args: [ {}, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ null, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ { title: null }, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ { title: "" }, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ { title: " 　﻿" }, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ { title: 7 }, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ { title: true }, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ { title: { $text: { repeat: x, count: 201 } } }, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ { title: { $text: { repeat: "🙂", count: 101 } } }, { id: a, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: create, args: [ { title: { $text: { repeat: "🙂", count: 100 } } }, { id: a, role: user, grants: [] } ], expect: { value: { $partial: { title: { $length: 200 } } } } }
+      - { call: create, args: [ { title: { $text: { repeat: x, count: 200 } } }, { id: a, role: user, grants: [] } ], expect: { value: { $partial: { title: { $length: 200 } } } } }
+      - { call: create, args: [ { title: " ​x\u0085 " }, { id: a, role: user, grants: [] } ], expect: { value: { $partial: { title: "​x\u0085" } } } }
+
+  # --- lists --------------------------------------------------------------------
+  - name: list returns the actor's live tasks in id order
+    init:
+      rows:
+        - { pk: TASKS, sk: t1, version: 1, data: { id: t1, title: Alpha, done: false, ownerId: alice } }
+        - { pk: TASKS, sk: t2, version: 1, data: { id: t2, title: Beta, done: true, ownerId: bob } }
+        - { pk: TASKS, sk: t3, version: 2, data: { id: t3, title: Gamma, done: true, ownerId: alice, deletedAt: "2026-01-01T00:00:00.000Z", deletedBy: alice } }
+        - { pk: TASKS, sk: t0, version: 1, data: { id: t0, title: Zero, done: false, ownerId: alice } }
+        - { pk: OTHER, sk: t9, version: 1, data: { id: t9, title: Other, done: false, ownerId: alice } }
+    steps:
+      - call: list
+        args: [ {}, { id: alice, role: user, grants: [] } ]
+        expect:
+          value:
+            items:
+              - { id: t0, title: Zero, done: false, ownerId: alice }
+              - { id: t1, title: Alpha, done: false, ownerId: alice }
+      - call: list
+        args: [ { trash: "true" }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { items: [ { id: t3, title: Gamma, done: true, ownerId: alice, deletedAt: "2026-01-01T00:00:00.000Z", deletedBy: alice } ] } }
+      - call: list
+        args: [ { trash: "false" }, { id: bob, role: user, grants: [] } ]
+        expect: { value: { items: [ { id: t2, title: Beta, done: true, ownerId: bob } ] } }
+      - call: list
+        args: [ {}, { id: root, role: owner, grants: [ tasks.manage ] } ]
+        expect: { value: { items: [] } }
+        note: list only returns the actor's own tasks, whatever the role
+      - call: listAll
+        args: [ {}, { id: root, role: owner, grants: [] } ]
+        expect: { value: { items: [ { $partial: { id: t0 } }, { $partial: { id: t1 } }, { $partial: { id: t2 } } ] } }
+      - call: listAll
+        args: [ { trash: "true" }, { id: root, role: owner, grants: [] } ]
+        expect: { value: { items: [ { $partial: { id: t3 } } ] } }
+
+  - name: filters are case-insensitive substrings
+    init:
+      rows:
+        - { pk: TASKS, sk: a1, version: 1, data: { id: a1, title: Ärger im Büro, done: false, ownerId: alice } }
+        - { pk: TASKS, sk: a2, version: 1, data: { id: a2, title: ΟΔΟΣ, done: true, ownerId: alice } }
+        - { pk: TASKS, sk: a3, version: 1, data: { id: a3, title: Plain, done: true, ownerId: bob } }
+        - { pk: TASKS, sk: a4, version: 1, data: { id: a4, done: false, ownerId: bob } }
+    steps:
+      - { call: listAll, args: [ { title: äR }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [ { $partial: { id: a1 } } ] } } }
+      - { call: listAll, args: [ { title: BÜRO }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [ { $partial: { id: a1 } } ] } } }
+      - { call: listAll, args: [ { title: "δος" }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [ { $partial: { id: a2 } } ] } }, note: "ΟΔΟΣ lowercases to οδος (final sigma)" }
+      - { call: listAll, args: [ { title: "δοσ" }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [] } } }
+      - { call: listAll, args: [ { done: "TRUE" }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [ { $partial: { id: a2 } }, { $partial: { id: a3 } } ] } } }
+      - { call: listAll, args: [ { done: fal }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [ { $partial: { id: a1 } }, { $partial: { id: a4 } } ] } } }
+      - { call: listAll, args: [ { done: "true", ownerId: ALI }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [ { $partial: { id: a2 } } ] } } }
+      - { call: listAll, args: [ { id: "3" }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [ { $partial: { id: a3 } } ] } } }
+      - { call: listAll, args: [ { title: "", done: "" }, { id: root, role: owner, grants: [] } ], expect: { value: { items: { $length: 4 } } }, note: empty values are ignored }
+      - { call: listAll, args: [ { title: "undefined" }, { id: root, role: owner, grants: [] } ], expect: { value: { items: [] } }, note: a missing field reads as the empty string }
+      - { call: list, args: [ { title: plain }, { id: alice, role: user, grants: [] } ], expect: { value: { items: [] } } }
+      - { call: list, args: [ { title: plain }, { id: bob, role: user, grants: [] } ], expect: { value: { items: [ { $partial: { id: a3 } } ] } } }
+
+  - name: unknown filters and bad trash values are rejected
+    tags: [ edge, validation ]
+    steps:
+      - { call: list, args: [ { status: open }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: "Unsupported filter: status" } } }
+      - { call: listAll, args: [ { createdBy: x }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 400, message: "Unsupported filter: createdBy" } } }
+      - { call: list, args: [ { trash: "yes" }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: Invalid trash filter } } }
+      - { call: list, args: [ { trash: "" }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: Invalid trash filter } } }
+      - { call: list, args: [ { trash: "TRUE" }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: Invalid trash filter } } }
+      - { call: list, args: [ { trash: "1", status: x }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: Invalid trash filter } }, note: trash is checked first }
+      - { call: list, args: [ { cursor: bad }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: Invalid cursor } } }
+      - { call: list, args: [ { cursor: "eyJwayI6IlVTRVJTIiwic2siOiJ4In0" }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: Invalid cursor } }, note: a cursor of partition USERS }
+      - { call: list, args: [ { cursor: "" }, { id: alice, role: user, grants: [] } ], expect: { value: { items: [] } }, note: an empty cursor starts from the beginning }
+
+  - name: pages follow the store cursor
+    tags: [ pagination ]
+    init:
+      now: "2026-01-02T03:04:05.678Z"
+      rows:
+        - $repeat: { count: 60, item: { pk: TASKS, sk: "t{i:03}", version: 1, data: { id: "t{i:03}", title: "Task {i}", done: false, ownerId: alice } } }
+    steps:
+      - call: list
+        args: [ {}, { id: alice, role: user, grants: [] } ]
+        expect: { value: { items: { $length: 50 }, cursor: { $type: string } } }
+      - call: list
+        args: [ { cursor: { $ref: "0.value.cursor" } }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { items: { $length: 10 } } }
+      - call: list
+        args: [ { cursor: { $ref: "0.value.cursor" } }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { $partial: { items: [ { $partial: { id: t050 } }, { $any: 1 }, { $any: 1 }, { $any: 1 }, { $any: 1 }, { $any: 1 }, { $any: 1 }, { $any: 1 }, { $any: 1 }, { $partial: { id: t059 } } ] } } }
+      - call: listAll
+        args: [ { title: "task 5" }, { id: root, role: owner, grants: [] } ]
+        expect: { value: { items: [ { $partial: { id: t005 } } ], cursor: { $type: string } } }
+        note: the first page with matches is returned with its cursor
+      - call: listAll
+        args: [ { title: "task 5", cursor: { $ref: "3.value.cursor" } }, { id: root, role: owner, grants: [] } ]
+        expect: { value: { items: [ { $partial: { id: t050 } }, { $partial: { id: t051 } }, { $partial: { id: t052 } }, { $partial: { id: t053 } }, { $partial: { id: t054 } }, { $partial: { id: t055 } }, { $partial: { id: t056 } }, { $partial: { id: t057 } }, { $partial: { id: t058 } }, { $partial: { id: t059 } } ] } }
+
+  - name: the search skips pages without matches
+    tags: [ pagination ]
+    init:
+      rows:
+        - $repeat: { count: 50, item: { pk: TASKS, sk: "b{i:03}", version: 1, data: { id: "b{i:03}", title: Other, done: false, ownerId: bob } } }
+        - { pk: TASKS, sk: c000, version: 1, data: { id: c000, title: Mine, done: false, ownerId: alice } }
+    steps:
+      - call: list
+        args: [ {}, { id: alice, role: user, grants: [] } ]
+        expect: { value: { items: [ { id: c000, title: Mine, done: false, ownerId: alice } ] } }
+
+  - name: the search stops after 10 pages
+    tags: [ pagination, edge ]
+    init:
+      rows:
+        - $repeat: { count: 501, item: { pk: TASKS, sk: "b{i:03}", version: 1, data: { id: "b{i:03}", title: Other, done: false, ownerId: bob } } }
+        - { pk: TASKS, sk: c000, version: 1, data: { id: c000, title: Mine, done: false, ownerId: alice } }
+    steps:
+      - call: list
+        args: [ {}, { id: alice, role: user, grants: [] } ]
+        expect: { value: { items: [], cursor: { $type: string } } }
+      - call: list
+        args: [ { cursor: { $ref: "0.value.cursor" } }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { items: [ { $partial: { id: c000 } } ] } }
+
+  # --- update -------------------------------------------------------------------
+  - name: update changes title and done with audit fields
+    steps:
+      - call: create
+        args: [ { title: Draft }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { $partial: { title: Draft } } }
+      - { call: setNow, args: [ "2026-03-04T05:06:07.089Z" ], expect: { value: null } }
+      - call: update
+        args: [ { $ref: "0.value.id" }, { title: " Final ", done: true, ownerId: bob, createdAt: x }, { id: alice, role: user, grants: [] } ]
+        expect:
+          value:
+            id: { $ref: "0.value.id" }
+            title: Final
+            done: true
+            ownerId: alice
+            createdAt: "2026-01-02T03:04:05.678Z"
+            createdBy: alice
+            updatedAt: "2026-03-04T05:06:07.089Z"
+            updatedBy: alice
+            deletedAt: null
+            deletedBy: null
+      - call: row
+        args: [ TASKS, { $ref: "0.value.id" } ]
+        expect: { value: { pk: TASKS, sk: { $ref: "0.value.id" }, version: 2, data: { $ref: "2.value" } } }
+      - call: update
+        args: [ { $ref: "0.value.id" }, { done: false }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { $partial: { title: Final, done: false } } }
+      - call: update
+        args: [ { $ref: "0.value.id" }, {}, { id: alice, role: user, grants: [] } ]
+        expect: { value: { $partial: { title: Final, done: false, updatedAt: "2026-03-04T05:06:07.089Z" } } }
+        note: an empty body still bumps the version and the audit fields
+      - call: row
+        args: [ TASKS, { $ref: "0.value.id" } ]
+        expect: { value: { $partial: { version: 4 } } }
+
+  - name: update validates the title before done
+    tags: [ edge, validation ]
+    init:
+      rows:
+        - { pk: TASKS, sk: t1, version: 1, data: { id: t1, title: Keep, done: false, ownerId: alice } }
+    steps:
+      - { call: update, args: [ t1, { title: null }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } }, note: a present null title is validated }
+      - { call: update, args: [ t1, { title: "  " }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: update, args: [ t1, { title: { $text: { repeat: x, count: 201 } } }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: update, args: [ t1, { title: "", done: "yes" }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: update, args: [ t1, { done: "true" }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: done must be a boolean } } }
+      - { call: update, args: [ t1, { done: 1 }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: done must be a boolean } } }
+      - { call: update, args: [ t1, { done: null }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: done must be a boolean } } }
+      - { call: update, args: [ t1, { title: New, done: 0 }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 400, message: done must be a boolean } } }
+      - { call: row, args: [ TASKS, t1 ], expect: { value: { pk: TASKS, sk: t1, version: 1, data: { id: t1, title: Keep, done: false, ownerId: alice } } } }
+
+  - name: stored rows keep unknown fields and ttl
+    tags: [ edge ]
+    init:
+      now: "2026-01-02T03:04:05.678Z"
+      rows:
+        - { pk: TASKS, sk: welcome-alice, version: 3, ttl: 1900000000, data: { id: welcome-alice, title: Explore my first task in RT-App, done: false, ownerId: alice, createdAt: "2025-12-31T23:59:59.999Z", color: red } }
+    steps:
+      - call: update
+        args: [ welcome-alice, { done: true }, { id: alice, role: user, grants: [] } ]
+        expect:
+          value:
+            id: welcome-alice
+            title: Explore my first task in RT-App
+            done: true
+            ownerId: alice
+            createdAt: "2025-12-31T23:59:59.999Z"
+            color: red
+            updatedAt: "2026-01-02T03:04:05.678Z"
+            updatedBy: alice
+      - call: row
+        args: [ TASKS, welcome-alice ]
+        expect: { value: { pk: TASKS, sk: welcome-alice, version: 4, ttl: 1900000000, data: { $ref: "0.value" } } }
+
+  - name: only the owner of a task, owners and managers may change it
+    tags: [ security ]
+    init:
+      rows:
+        - { pk: TASKS, sk: t1, version: 1, data: { id: t1, title: Private, done: false, ownerId: alice } }
+    steps:
+      - { call: update, args: [ t1, { title: Hacked }, { id: bob, role: user, grants: [] } ], expect: { error: { status: 403, message: This task belongs to another user } } }
+      - { call: update, args: [ t1, { title: Hacked }, { id: bob, role: admin, grants: [ tasks.edit, tasks.list, tasks.restore ] } ], expect: { error: { status: 403, message: This task belongs to another user } } }
+      - { call: update, args: [ t1, { done: "bad" }, { id: bob, role: user, grants: [] } ], expect: { error: { status: 403, message: This task belongs to another user } }, note: ownership is checked before the body }
+      - { call: remove, args: [ t1, { id: bob, role: user, grants: [] } ], expect: { error: { status: 403, message: This task belongs to another user } } }
+      - { call: update, args: [ t1, { title: By owner }, { id: root, role: owner, grants: [] } ], expect: { value: { $partial: { title: By owner, ownerId: alice, updatedBy: root } } } }
+      - { call: update, args: [ t1, { title: By manager }, { id: mgr, role: user, grants: [ tasks.manage ] } ], expect: { value: { $partial: { title: By manager, ownerId: alice, updatedBy: mgr } } } }
+      - { call: manage, args: [ t1, { done: true }, { id: mgr, role: admin, grants: [ tasks.manage ] } ], expect: { value: { $partial: { done: true, updatedBy: mgr } } } }
+      - { call: manage, args: [ t1, { done: false }, { id: bob, role: admin, grants: [ tasks.list ] } ], expect: { error: { status: 403, message: This task belongs to another user } } }
+      - { call: manage, args: [ t1, { title: Mine }, { id: alice, role: user, grants: [] } ], expect: { value: { $partial: { title: Mine, updatedBy: alice } } } }
+      - { call: row, args: [ TASKS, t1 ], expect: { value: { $partial: { version: 5 } } } }
+
+  - name: missing and deleted tasks are not found
+    tags: [ edge ]
+    init:
+      rows:
+        - { pk: TASKS, sk: gone, version: 2, data: { id: gone, title: Gone, done: false, ownerId: alice, deletedAt: "2026-01-01T00:00:00.000Z", deletedBy: alice } }
+        - { pk: TASKS, sk: live, version: 1, data: { id: live, title: Live, done: false, ownerId: alice } }
+    steps:
+      - { call: update, args: [ nope, { title: X }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: update, args: [ gone, { title: X }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: update, args: [ gone, { title: X }, { id: bob, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } }, note: existence is checked before ownership }
+      - { call: remove, args: [ gone, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: remove, args: [ nope, { id: bob, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: restore, args: [ live, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } }, note: only deleted tasks can be restored }
+      - { call: restore, args: [ nope, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: manage, args: [ gone, { title: X }, { id: root, role: owner, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: adminRestore, args: [ live, { id: root, role: owner, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: update, args: [ "", {}, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+
+  - name: a falsy deletedAt is a live task
+    tags: [ edge ]
+    init:
+      rows:
+        - { pk: TASKS, sk: t1, version: 1, data: { id: t1, title: Empty mark, done: false, ownerId: alice, deletedAt: "" } }
+    steps:
+      - { call: list, args: [ {}, { id: alice, role: user, grants: [] } ], expect: { value: { items: [ { $partial: { id: t1 } } ] } } }
+      - { call: list, args: [ { trash: "true" }, { id: alice, role: user, grants: [] } ], expect: { value: { items: [] } } }
+      - { call: restore, args: [ t1, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: update, args: [ t1, { done: true }, { id: alice, role: user, grants: [] } ], expect: { value: { $partial: { done: true, deletedAt: "" } } } }
+
+  # --- trash and restore --------------------------------------------------------
+  - name: remove moves a task to the trash and restore brings it back
+    steps:
+      - call: create
+        args: [ { title: Trash me }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { $partial: { title: Trash me } } }
+      - { call: setNow, args: [ "2026-02-01T00:00:00.000Z" ], expect: { value: null } }
+      - call: remove
+        args: [ { $ref: "0.value.id" }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { ok: true } }
+      - call: row
+        args: [ TASKS, { $ref: "0.value.id" } ]
+        expect:
+          value:
+            pk: TASKS
+            sk: { $ref: "0.value.id" }
+            version: 2
+            data:
+              id: { $ref: "0.value.id" }
+              title: Trash me
+              done: false
+              ownerId: alice
+              createdAt: "2026-01-02T03:04:05.678Z"
+              createdBy: alice
+              updatedAt: "2026-02-01T00:00:00.000Z"
+              updatedBy: alice
+              deletedAt: "2026-02-01T00:00:00.000Z"
+              deletedBy: alice
+      - { call: list, args: [ {}, { id: alice, role: user, grants: [] } ], expect: { value: { items: [] } } }
+      - { call: list, args: [ { trash: "true" }, { id: alice, role: user, grants: [] } ], expect: { value: { items: [ { $ref: "3.value.data" } ] } } }
+      - { call: remove, args: [ { $ref: "0.value.id" }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: restore, args: [ { $ref: "0.value.id" }, { id: bob, role: user, grants: [ tasks.restore ] } ], expect: { error: { status: 403, message: This task belongs to another user } } }
+      - { call: setNow, args: [ "2026-02-02T00:00:00.000Z" ], expect: { value: null } }
+      - call: restore
+        args: [ { $ref: "0.value.id" }, { id: alice, role: user, grants: [] } ]
+        expect:
+          value:
+            id: { $ref: "0.value.id" }
+            title: Trash me
+            done: false
+            ownerId: alice
+            createdAt: "2026-01-02T03:04:05.678Z"
+            createdBy: alice
+            updatedAt: "2026-02-02T00:00:00.000Z"
+            updatedBy: alice
+            deletedAt: null
+            deletedBy: null
+            restoredAt: "2026-02-02T00:00:00.000Z"
+            restoredBy: alice
+      - { call: row, args: [ TASKS, { $ref: "0.value.id" } ], expect: { value: { $partial: { version: 3, data: { $ref: "9.value" } } } } }
+      - { call: list, args: [ {}, { id: alice, role: user, grants: [] } ], expect: { value: { items: [ { $ref: "9.value" } ] } } }
+      - { call: restore, args: [ { $ref: "0.value.id" }, { id: alice, role: user, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - call: update
+        args: [ { $ref: "0.value.id" }, { title: Again }, { id: alice, role: user, grants: [] } ]
+        expect: { value: { $partial: { title: Again, restoredAt: "2026-02-02T00:00:00.000Z", restoredBy: alice } } }
+        note: restore fields stay after later edits
+
+  - name: owners and managers restore any task
+    tags: [ security ]
+    init:
+      now: "2026-05-05T05:05:05.005Z"
+      rows:
+        - { pk: TASKS, sk: t1, version: 2, data: { id: t1, title: One, done: false, ownerId: alice, deletedAt: "2026-01-01T00:00:00.000Z", deletedBy: alice } }
+        - { pk: TASKS, sk: t2, version: 2, data: { id: t2, title: Two, done: false, ownerId: alice, deletedAt: "2026-01-01T00:00:00.000Z", deletedBy: alice } }
+        - { pk: TASKS, sk: t3, version: 2, data: { id: t3, title: Three, done: false, ownerId: alice, deletedAt: "2026-01-01T00:00:00.000Z", deletedBy: alice } }
+    steps:
+      - { call: adminRestore, args: [ t1, { id: root, role: owner, grants: [] } ], expect: { value: { $partial: { id: t1, restoredBy: root, restoredAt: "2026-05-05T05:05:05.005Z", deletedAt: null } } } }
+      - { call: adminRestore, args: [ t2, { id: r, role: admin, grants: [ tasks.restore ] } ], expect: { error: { status: 403, message: This task belongs to another user } } }
+      - { call: adminRestore, args: [ t2, { id: m, role: admin, grants: [ tasks.manage ] } ], expect: { value: { $partial: { id: t2, restoredBy: m } } } }
+      - { call: restore, args: [ t3, { id: m, role: user, grants: [ tasks.manage ] } ], expect: { value: { $partial: { id: t3, restoredBy: m, updatedBy: m } } } }
+
+  - name: admin removal requires tasks.manage first
+    tags: [ security ]
+    init:
+      now: "2026-06-01T00:00:00.000Z"
+      rows:
+        - { pk: TASKS, sk: t1, version: 1, data: { id: t1, title: One, done: false, ownerId: alice } }
+        - { pk: TASKS, sk: t2, version: 1, data: { id: t2, title: Two, done: false, ownerId: alice } }
+    steps:
+      - { call: adminRemove, args: [ t1, { id: alice, role: user, grants: [] } ], expect: { error: { status: 403, message: Requires tasks.manage } }, note: even the owner of the task }
+      - { call: adminRemove, args: [ t1, { id: x, role: admin, grants: [ tasks.remove ] } ], expect: { error: { status: 403, message: Requires tasks.manage } } }
+      - { call: adminRemove, args: [ nope, { id: x, role: user, grants: [] } ], expect: { error: { status: 403, message: Requires tasks.manage } }, note: checked before the lookup }
+      - { call: adminRemove, args: [ nope, { id: root, role: owner, grants: [] } ], expect: { error: { status: 404, message: Task not found } } }
+      - { call: adminRemove, args: [ t1, { id: root, role: owner, grants: [] } ], expect: { value: { ok: true } } }
+      - { call: adminRemove, args: [ t2, { id: m, role: user, grants: [ tasks.manage ] } ], expect: { value: { ok: true } } }
+      - { call: adminRemove, args: [ t2, { id: m, role: user, grants: [ tasks.manage ] } ], expect: { error: { status: 404, message: Task not found } } }
+      - call: listAll
+        args: [ { trash: "true" }, { id: root, role: owner, grants: [] } ]
+        expect:
+          value:
+            items:
+              - { id: t1, title: One, done: false, ownerId: alice, updatedAt: "2026-06-01T00:00:00.000Z", updatedBy: root, deletedAt: "2026-06-01T00:00:00.000Z", deletedBy: root }
+              - { id: t2, title: Two, done: false, ownerId: alice, updatedAt: "2026-06-01T00:00:00.000Z", updatedBy: m, deletedAt: "2026-06-01T00:00:00.000Z", deletedBy: m }
+
+  # --- module surface -----------------------------------------------------------
+  - name: endpoints, admin manifest, migrations and seeds
+    steps:
+      - call: endpoints
+        expect:
+          value:
+            - { method: POST, path: "/tasks/:id/restore", resource: tasks.restore, access: authenticated }
+            - { method: POST, path: "/tasks/admin/:id/restore", resource: tasks.restore, access: permission }
+            - { method: GET, path: /tasks, resource: tasks.mine, access: authenticated }
+            - { method: GET, path: /tasks/admin, resource: tasks.list, access: permission }
+            - { method: POST, path: /tasks, resource: tasks.create, access: authenticated }
+            - { method: PATCH, path: "/tasks/:id", resource: tasks.edit, access: authenticated }
+            - { method: DELETE, path: "/tasks/:id", resource: tasks.delete, access: authenticated }
+            - { method: PATCH, path: "/tasks/admin/:id", resource: tasks.manage, access: permission }
+            - { method: DELETE, path: "/tasks/admin/:id", resource: tasks.remove, access: permission }
+      - call: admin
+        expect:
+          value:
+            id: tasks
+            title: Tasks
+            resource: tasks.list
+            path: /tasks/admin
+            component: tasks
+            fields: [ id, title, done, ownerId ]
+            actions: [ list, create, edit, delete ]
+      - call: migrations
+        expect: { value: [ { id: "tasks:001", checksum: tasks-document-v1, description: Register the tasks document schema } ] }
+      - call: seeds
+        expect: { value: [ { id: "tasks:welcome", description: A welcome task for each demo user, version: null, environments: [ local, develop, stage ] } ] }
+
+  - name: the schema migration records version 1 once
+    steps:
+      - { call: migrate, expect: { value: null } }
+      - { call: migrate, expect: { value: null } }
+      - { call: row, args: [ SCHEMA, tasks ], expect: { value: { pk: SCHEMA, sk: tasks, version: 1, data: { schemaVersion: 1 } } } }
+
+  - name: the welcome seed has one task per demo user
+    steps:
+      - call: seedRows
+        args: [ [ { pk: USERS, sk: u1, version: 1, data: { id: u1, email: a@example.com } }, { pk: USERS, sk: u2, version: 1, data: { id: u2 } } ] ]
+        expect:
+          value:
+            - { pk: TASKS, sk: welcome-u1, data: { id: welcome-u1, title: Explore my first task in RT-App, done: false, ownerId: u1, createdAt: { $type: iso-date } } }
+            - { pk: TASKS, sk: welcome-u2, data: { id: welcome-u2, title: Explore my first task in RT-App, done: false, ownerId: u2, createdAt: { $type: iso-date } } }
+      - { call: seedRows, args: [ [] ], expect: { value: [] } }

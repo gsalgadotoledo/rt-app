@@ -1,0 +1,254 @@
+contract: 1
+module: content
+title: Home content
+description: |
+  The editable home page of an application: one row CONTENT/home whose data is {title, content}.
+  Nothing is stored until the first save; reads then return version 0 and the defaults
+  {title: "Welcome to RT-App", content: "A small starting point for building great applications."}.
+
+  Endpoints (the subject calls their handlers directly):
+    GET /                   guest       content.home   → {title, content}
+    GET /content/settings   permission  content.read   → {version, values, fields}
+    PUT /content/settings   permission  content.write  {version, values: {title, content}} → settings
+
+  settings: version is the stored row version (0 without a row); values is the stored data AS IS
+  (unknown stored fields included), or the defaults. home copies only title and content.
+
+  save(body), checks in this order:
+    1. body.version must be an integer (Number.isInteger: 1.0 counts; 1.5, "1", true, null and a
+       missing version do not): 400 "Version is required".
+    2. body.version must equal the stored version (0 without a row): 409
+       "Conflict: refresh and try again". This runs BEFORE the fields are validated.
+    3. values.title: text(value, "title", 120), then values.content: text(value, "content", 2000).
+       text() needs a string that is not blank after JavaScript trim() and has at most max UTF-16
+       code units BEFORE trimming; it returns the trimmed string. Failure: 400
+       "Invalid field: <name>". A missing or null `values` fails on title.
+    4. Write {pk: CONTENT, sk: home, version: version + 1, data: {title, content}} (only these two
+       fields) guarded by the stored version (null when creating); a lost race is 409.
+    5. Return settings.
+
+  JavaScript trim() removes WhiteSpace and LineTerminator characters: U+0009-000D, U+0020, U+00A0,
+  U+1680, U+2000-200A, U+2028, U+2029, U+202F, U+205F, U+3000 and U+FEFF; never U+0085 or U+200B.
+
+  Helpers of the subject: endpoints() (method, path, resource, access as registered, before
+  mounting under /admin/app), admin() (the admin manifest), migrations() ({id, checksum,
+  description}), migrate() (runs them on the store) and row(pk, sk) (the raw stored row or null).
+subject: content
+init: { rows: [] }
+cases:
+  # --- reading ------------------------------------------------------------------
+  - name: defaults before the first save
+    steps:
+      - call: home
+        expect: { value: { title: Welcome to RT-App, content: A small starting point for building great applications. } }
+      - call: settings
+        expect:
+          value:
+            version: 0
+            values: { title: Welcome to RT-App, content: A small starting point for building great applications. }
+            fields:
+              - { name: title, label: Title, type: text, maxLength: 120 }
+              - { name: content, label: Description, type: textarea, maxLength: 2000 }
+      - { call: row, args: [ CONTENT, home ], expect: { value: null } }
+
+  - name: stored data is returned as stored
+    init:
+      rows:
+        - { pk: CONTENT, sk: home, version: 7, data: { title: Stored, content: Body, extra: 1 } }
+    steps:
+      - { call: home, expect: { value: { title: Stored, content: Body } } }
+      - call: settings
+        expect: { value: { $partial: { version: 7, values: { title: Stored, content: Body, extra: 1 } } } }
+      - call: save
+        args: [ { version: 7, values: { title: Next, content: Body } } ]
+        expect: { value: { $partial: { version: 8, values: { title: Next, content: Body } } } }
+      - call: row
+        args: [ CONTENT, home ]
+        expect: { value: { pk: CONTENT, sk: home, version: 8, data: { title: Next, content: Body } } }
+
+  - name: a stored row without title reads as missing fields
+    tags: [ edge ]
+    init:
+      rows:
+        - { pk: CONTENT, sk: home, version: 1, data: { content: Only body } }
+    steps:
+      - { call: home, expect: { value: { title: null, content: Only body } } }
+      - { call: settings, expect: { value: { $partial: { version: 1, values: { content: Only body } } } } }
+
+  # --- saving -------------------------------------------------------------------
+  - name: the first save creates version 1 with trimmed values
+    steps:
+      - call: save
+        args: [ { version: 0, values: { title: "  Hello  ", content: "\tWorld\n" } } ]
+        expect:
+          value:
+            version: 1
+            values: { title: Hello, content: World }
+            fields:
+              - { name: title, label: Title, type: text, maxLength: 120 }
+              - { name: content, label: Description, type: textarea, maxLength: 2000 }
+      - { call: home, expect: { value: { title: Hello, content: World } } }
+      - call: row
+        args: [ CONTENT, home ]
+        expect: { value: { pk: CONTENT, sk: home, version: 1, data: { title: Hello, content: World } } }
+
+  - name: consecutive saves increment the version
+    steps:
+      - { call: save, args: [ { version: 0, values: { title: A, content: a } } ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: save, args: [ { version: 1, values: { title: B, content: b } } ], expect: { value: { $partial: { version: 2, values: { title: B, content: b } } } } }
+      - { call: save, args: [ { version: 2.0, values: { title: C, content: c } } ], expect: { value: { $partial: { version: 3 } } } }
+      - { call: settings, expect: { value: { $partial: { version: 3, values: { title: C, content: c } } } } }
+
+  - name: unknown value and body fields are dropped
+    steps:
+      - call: save
+        args: [ { version: 0, values: { title: T, content: C, extra: x, version: 9 }, other: true } ]
+        expect: { value: { $partial: { version: 1, values: { title: T, content: C } } } }
+      - call: row
+        args: [ CONTENT, home ]
+        expect: { value: { pk: CONTENT, sk: home, version: 1, data: { title: T, content: C } } }
+
+  - name: the version must be an integer
+    tags: [ edge, validation ]
+    steps:
+      - { call: save, args: [ { values: { title: T, content: C } } ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ { version: null, values: { title: T, content: C } } ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ { version: "0", values: { title: T, content: C } } ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ { version: 0.5, values: { title: T, content: C } } ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ { version: true, values: { title: T, content: C } } ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ { version: false, values: { title: T, content: C } } ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ { version: [ 0 ], values: { title: T, content: C } } ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ { version: {}, values: { title: T, content: C } } ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ null ], expect: { error: { status: 400, message: Version is required } } }
+      - { call: save, args: [ { version: "", values: { title: "", content: "" } } ], expect: { error: { status: 400, message: Version is required } }, note: the version is checked before the values }
+      - { call: row, args: [ CONTENT, home ], expect: { value: null } }
+
+  - name: stale versions are conflicts
+    tags: [ concurrency ]
+    steps:
+      - { call: save, args: [ { version: 1, values: { title: T, content: C } } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: save, args: [ { version: -1, values: { title: T, content: C } } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: save, args: [ { version: 1e300, values: { title: T, content: C } } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: save, args: [ { version: 0, values: { title: T, content: C } } ], expect: { value: { $partial: { version: 1 } } } }
+      - { call: save, args: [ { version: 0, values: { title: Stale, content: C } } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: save, args: [ { version: 2, values: { title: Ahead, content: C } } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: home, expect: { value: { title: T, content: C } } }
+
+  - name: the version is checked before the values
+    tags: [ concurrency, validation ]
+    steps:
+      - { call: save, args: [ { version: 3, values: { title: "", content: "" } } ], expect: { error: { status: 409, message: "Conflict: refresh and try again" } } }
+      - { call: save, args: [ { version: 0, values: { title: "", content: "" } } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+
+  - name: values are validated title first
+    tags: [ edge, validation ]
+    steps:
+      - { call: save, args: [ { version: 0 } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: save, args: [ { version: 0, values: null } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: save, args: [ { version: 0, values: "Title" } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: save, args: [ { version: 0, values: {} } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: save, args: [ { version: 0, values: { title: "", content: C } } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: save, args: [ { version: 0, values: { title: " \t\n ", content: C } } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: save, args: [ { version: 0, values: { title: 5, content: C } } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: save, args: [ { version: 0, values: { title: [ T ], content: C } } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: save, args: [ { version: 0, values: { title: T } } ], expect: { error: { status: 400, message: "Invalid field: content" } } }
+      - { call: save, args: [ { version: 0, values: { title: T, content: " " } } ], expect: { error: { status: 400, message: "Invalid field: content" } } }
+      - { call: save, args: [ { version: 0, values: { title: T, content: false } } ], expect: { error: { status: 400, message: "Invalid field: content" } } }
+      - { call: save, args: [ { version: 0, values: { content: "" } } ], expect: { error: { status: 400, message: "Invalid field: title" } } }
+      - { call: row, args: [ CONTENT, home ], expect: { value: null } }
+
+  - name: the title allows 120 UTF-16 units before trimming
+    tags: [ edge, validation, unicode ]
+    steps:
+      - call: save
+        args: [ { version: 0, values: { title: { $text: { repeat: t, count: 121 } }, content: C } } ]
+        expect: { error: { status: 400, message: "Invalid field: title" } }
+      - call: save
+        args: [ { version: 0, values: { title: "a                                                                                                                        ", content: C } } ]
+        expect: { error: { status: 400, message: "Invalid field: title" } }
+        note: the letter a plus 120 spaces is 121 units even though it trims to one
+      - call: save
+        args: [ { version: 0, values: { title: { $text: { repeat: "😀", count: 61 } }, content: C } } ]
+        expect: { error: { status: 400, message: "Invalid field: title" } }
+        note: 61 emoji are 122 UTF-16 units
+      - call: save
+        args: [ { version: 0, values: { title: { $text: { repeat: "😀", count: 60 } }, content: C } } ]
+        expect: { value: { $partial: { version: 1, values: { title: { $length: 120 }, content: C } } } }
+      - call: save
+        args: [ { version: 1, values: { title: { $text: { repeat: é, count: 120 } }, content: C } } ]
+        expect: { value: { $partial: { version: 2, values: { title: { $length: 120 }, content: C } } } }
+        note: é (U+00E9) is one unit although UTF-8 needs two bytes
+
+  - name: the content allows 2000 UTF-16 units
+    tags: [ edge, validation, unicode ]
+    steps:
+      - call: save
+        args: [ { version: 0, values: { title: T, content: { $text: { repeat: c, count: 2001 } } } } ]
+        expect: { error: { status: 400, message: "Invalid field: content" } }
+      - call: save
+        args: [ { version: 0, values: { title: T, content: { $text: { repeat: "𝄞", count: 1001 } } } } ]
+        expect: { error: { status: 400, message: "Invalid field: content" } }
+      - call: save
+        args: [ { version: 0, values: { title: T, content: { $text: { repeat: "𝄞", count: 1000 } } } } ]
+        expect: { value: { $partial: { version: 1, values: { title: T, content: { $length: 2000 } } } } }
+
+  - name: trimming follows JavaScript whitespace
+    tags: [ edge, unicode ]
+    steps:
+      - call: save
+        args: [ { version: 0, values: { title: "  Hola　﻿", content: " Body  " } } ]
+        expect: { value: { $partial: { version: 1, values: { title: Hola, content: Body } } } }
+      - call: save
+        args: [ { version: 1, values: { title: "​Zero​", content: "\u0085Next\u0085" } } ]
+        expect: { value: { $partial: { version: 2, values: { title: "​Zero​", content: "\u0085Next\u0085" } } } }
+        note: U+200B and U+0085 are not JavaScript whitespace
+      - call: save
+        args: [ { version: 2, values: { title: "﻿ ", content: C } } ]
+        expect: { error: { status: 400, message: "Invalid field: title" } }
+      - call: save
+        args: [ { version: 2, values: { title: "​", content: "\u0085" } } ]
+        expect: { value: { $partial: { version: 3, values: { title: "​", content: "\u0085" } } } }
+
+  # --- module surface -----------------------------------------------------------
+  - name: endpoints, admin manifest and migrations
+    steps:
+      - call: endpoints
+        expect:
+          value:
+            - { method: GET, path: /, resource: content.home, access: guest }
+            - { method: GET, path: /content/settings, resource: content.read, access: permission }
+            - { method: PUT, path: /content/settings, resource: content.write, access: permission }
+      - call: admin
+        expect:
+          value:
+            id: content
+            group: content
+            title: Home
+            resource: content.read
+            path: /content/settings
+            component: content
+            fields: []
+            actions: []
+            settings: { path: /content/settings, resource: content.write }
+      - call: migrations
+        expect: { value: [ { id: "content:001", checksum: content-document-v1, description: Register the content document schema } ] }
+
+  - name: the schema migration records version 1 once
+    init:
+      rows:
+        - { pk: SCHEMA, sk: tasks, version: 3, data: { schemaVersion: 3 } }
+    steps:
+      - { call: migrate, expect: { value: null } }
+      - { call: row, args: [ SCHEMA, content ], expect: { value: { pk: SCHEMA, sk: content, version: 1, data: { schemaVersion: 1 } } } }
+      - { call: migrate, expect: { value: null } }
+      - { call: row, args: [ SCHEMA, content ], expect: { value: { pk: SCHEMA, sk: content, version: 1, data: { schemaVersion: 1 } } } }
+      - { call: row, args: [ SCHEMA, tasks ], expect: { value: { pk: SCHEMA, sk: tasks, version: 3, data: { schemaVersion: 3 } } } }
+
+  - name: an existing schema row is left untouched
+    tags: [ edge ]
+    init:
+      rows:
+        - { pk: SCHEMA, sk: content, version: 4, data: { schemaVersion: 2 } }
+    steps:
+      - { call: migrate, expect: { value: null } }
+      - { call: row, args: [ SCHEMA, content ], expect: { value: { pk: SCHEMA, sk: content, version: 4, data: { schemaVersion: 2 } } } }

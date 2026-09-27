@@ -127,11 +127,23 @@ def _compile(endpoint: Endpoint) -> _Route:
     return _Route(endpoint, tuple(names), re.compile("/".join(parts) + "/?"))
 
 
+def admin_only(endpoint: Endpoint) -> bool:
+    """Endpoints the TypeScript framework serves only under /admin/app (same list)."""
+    path = endpoint.path
+    return (
+        (endpoint.access == "owner" and (path.startswith("/feature-flags") or path.startswith("/visits") or path == "/health/report"))
+        or path.startswith("/infra")
+        or path.startswith("/aws/")
+        or path in ("/observer/report", "/observer/logs")
+        or path.startswith("/subscriptions/admin/")
+    )
+
+
 class App:
     """Features mounted into one API with the dispatch rules of the TypeScript framework.
 
-    - guest and authenticated endpoints are served at their path;
-    - owner and permission endpoints are served only under ``/admin/app<path>``;
+    - every endpoint is served at its path, except the admin-only ones (``admin_only``);
+    - owner and permission endpoints are also served under ``/admin/app<path>``;
     - literal routes win over ``:param`` routes; params are URL-decoded (400 "Invalid URL");
     - ``local_admin`` makes admin routes run as ``{"id": "rt-app-root", "role": "owner"}``;
     - ``authenticate(request)`` returns the actor for other protected routes (or None), e.g.
@@ -155,12 +167,10 @@ class App:
         self.authenticate = authenticate
         self.acl = acl
         self.fallback = fallback
-        endpoints: list[Endpoint] = []
-        for feature in self.features:
-            for endpoint in feature.endpoints:
-                if endpoint.access in ("owner", "permission"):
-                    endpoint = replace(endpoint, path=ADMIN_PREFIX + endpoint.path)
-                endpoints.append(endpoint)
+        declared = [endpoint for feature in self.features for endpoint in feature.endpoints]
+        endpoints: list[Endpoint] = [e for e in declared if not admin_only(e)] + [
+            replace(e, path=ADMIN_PREFIX + e.path) for e in declared if e.access in ("owner", "permission")
+        ]
         seen: set[str] = set()
         for endpoint in endpoints:
             signature = f"{endpoint.method} {endpoint.path}"

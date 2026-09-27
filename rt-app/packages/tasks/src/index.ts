@@ -7,12 +7,19 @@ import {
   auditCreate, auditUpdate, auditDelete, auditRestore,
   type Data, type Feature,
   type Context,
+  type FeatureContext,
   HttpError,
   text,
   searchPage,
   schemaMigration,
 } from "@gsalgadotoledo/rt-app-contracts";
-export function tasksFeature(store: Store): Feature {
+/**
+ * Personal tasks with soft delete (trash) and restore, stored under partition TASKS.
+ * `context.now` is the clock of audit timestamps (the system clock when omitted), so the
+ * function is also a FeatureFactory.
+ */
+export function tasksFeature(store: Store, context: Partial<Pick<FeatureContext, "now">> = {}): Feature {
+  const now = () => context.now?.() ?? new Date();
   async function list(c: Context, all: boolean) {
     return searchPage(store,'TASKS',c.request.query,['id','title','done','ownerId'],row=>all||row.data.ownerId===c.actor!.id?row.data:undefined);
   }
@@ -26,7 +33,7 @@ export function tasksFeature(store: Store): Feature {
       !c.actor!.grants.includes("tasks.manage")
     )
       throw new HttpError(403, "This task belongs to another user");
-    const data: Data = { ...row.data, ...(restore ? auditRestore(c.actor!.id) : remove ? auditDelete(c.actor!.id) : auditUpdate(c.actor!.id)) };
+    const data: Data = { ...row.data, ...(restore ? auditRestore(c.actor!.id, now()) : remove ? auditDelete(c.actor!.id, now()) : auditUpdate(c.actor!.id, now())) };
     if (!remove && !restore) {
       if (c.request.body.title !== undefined)
         data.title = text(c.request.body.title, "title");
@@ -80,7 +87,7 @@ export function tasksFeature(store: Store): Feature {
               title: text(c.request.body.title, "title"),
               done: false,
               ownerId: c.actor!.id,
-              ...auditCreate(c.actor!.id),
+              ...auditCreate(c.actor!.id, now()),
             };
           await store.transact([
             { row: { pk: "TASKS", sk: id, version: 1, data }, expected: null },

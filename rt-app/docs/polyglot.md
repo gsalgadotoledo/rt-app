@@ -106,7 +106,9 @@ No dependency-injection framework is needed:
 - **Error responses:**
   - An `HttpError` answers with its status and `{"error": message}`.
   - Anything else answers 500 `{"error":"Internal error"}` and is logged.
-- **Owner and permission endpoints** are mounted under `/admin/app<path>` only.
+- **Owner and permission endpoints** are served at their path and again under `/admin/app<path>`.
+  Only a few are admin-only (owner feature-flags/visits, `/health/report`, `/infra*`, `/aws/*`,
+  `/observer/report|logs`, `/subscriptions/admin/*`), the same list as the TypeScript framework.
   - In local mode (`local_admin`) the actor is `{id: "rt-app-root", role: "owner"}`.
   - Without an actor they return 401 `Sign in` (the TypeScript ACL message).
 - **Adapters:**

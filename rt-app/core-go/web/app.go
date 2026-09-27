@@ -28,12 +28,22 @@ import (
 const (
 	Guest         = "guest"         // anyone; no actor is resolved
 	Authenticated = "authenticated" // any actor
-	Permission    = "permission"    // owners, or actors granted Resource; mounted under /admin/app
-	Owner         = "owner"         // owners only; mounted under /admin/app
+	Permission    = "permission"    // owners, or actors granted Resource; also under /admin/app
+	Owner         = "owner"         // owners only; also under /admin/app
 )
 
-// AdminPrefix is where owner and permission endpoints are mounted.
+// AdminPrefix is where owner and permission endpoints are also mounted.
 const AdminPrefix = "/admin/app"
+
+// AdminOnly reports the endpoints the TypeScript framework serves only under AdminPrefix
+// (same list): owner feature-flags, visits and /health/report; /infra, /aws/, observer
+// report/logs and /subscriptions/admin/.
+func AdminOnly(e Endpoint) bool {
+	p := e.Path
+	return e.Access == Owner && (strings.HasPrefix(p, "/feature-flags") || strings.HasPrefix(p, "/visits") || p == "/health/report") ||
+		strings.HasPrefix(p, "/infra") || strings.HasPrefix(p, "/aws/") ||
+		p == "/observer/report" || p == "/observer/logs" || strings.HasPrefix(p, "/subscriptions/admin/")
+}
 
 // DefaultBodyLimit is the largest accepted request body (16 KiB).
 const DefaultBodyLimit = 16 << 10
@@ -151,26 +161,36 @@ func New(features []Feature, options ...Option) (*App, error) {
 	for _, option := range options {
 		option(a)
 	}
-	seen := map[string]bool{}
+	// Every endpoint at its path (except admin-only ones), then owner and permission endpoints
+	// again under AdminPrefix, like the TypeScript framework.
+	var plain, admin []Endpoint
 	for _, f := range features {
 		for _, e := range f.Endpoints {
 			switch e.Access {
-			case Guest, Authenticated:
-			case Owner, Permission:
-				e.Path = AdminPrefix + e.Path
+			case Guest, Authenticated, Owner, Permission:
 			default:
 				return nil, fmt.Errorf("web: %s %s %s: unknown access %q", f.ID, e.Method, e.Path, e.Access)
 			}
 			if e.Handle == nil || !strings.HasPrefix(e.Path, "/") {
 				return nil, fmt.Errorf("web: %s %s %s: needs a handler and an absolute path", f.ID, e.Method, e.Path)
 			}
-			signature := e.Method + " " + e.Path
-			if seen[signature] {
-				return nil, fmt.Errorf("web: duplicate endpoint %s", signature)
+			if !AdminOnly(e) {
+				plain = append(plain, e)
 			}
-			seen[signature] = true
-			a.routes = append(a.routes, route{Endpoint: e, segments: strings.Split(e.Path, "/"), params: strings.Contains(e.Path, ":")})
+			if e.Access == Owner || e.Access == Permission {
+				e.Path = AdminPrefix + e.Path
+				admin = append(admin, e)
+			}
 		}
+	}
+	seen := map[string]bool{}
+	for _, e := range append(plain, admin...) {
+		signature := e.Method + " " + e.Path
+		if seen[signature] {
+			return nil, fmt.Errorf("web: duplicate endpoint %s", signature)
+		}
+		seen[signature] = true
+		a.routes = append(a.routes, route{Endpoint: e, segments: strings.Split(e.Path, "/"), params: strings.Contains(e.Path, ":")})
 	}
 	// Literal routes take precedence over parameter routes.
 	slices.SortStableFunc(a.routes, func(x, y route) int {

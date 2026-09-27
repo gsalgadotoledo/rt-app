@@ -1,0 +1,59 @@
+contract: 1
+kind: http
+module: tasks-api
+title: Tasks HTTP API (local mode)
+description: |
+  The tasks module as every backend serves it in local mode, without a session authenticator:
+  the personal endpoints (/tasks…) need a signed-in actor and answer 401 "Sign in"; the
+  permission endpoints are mounted only under /admin/app, where the local owner "rt-app-root"
+  may use them. Local mode cannot create tasks (creation is a personal endpoint), so these cases
+  pin routing, access and validation over an empty TASKS partition. See tasks.contract.yaml.
+
+  Not pinned: the TypeScript framework also serves permission endpoints at their plain path
+  (/tasks/admin…, for signed-in actors with the grant: 401 "Sign in" without a session), while
+  the Python and Go web layers mount them only under /admin/app (404 there).
+cases:
+  - name: personal endpoints need a signed-in actor
+    tags: [ security ]
+    requests:
+      - { request: { method: GET, path: /tasks }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: /tasks, body: { title: Nope } }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: PATCH, path: /tasks/api-task, body: { done: true } }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: DELETE, path: /tasks/api-task }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: POST, path: /tasks/api-task/restore }, expect: { status: 401, body: { error: Sign in } } }
+      - { request: { method: DELETE, path: /tasks/admin }, expect: { status: 401, body: { error: Sign in } }, note: "matches DELETE /tasks/:id with id admin" }
+
+  - name: personal endpoints are not mounted under /admin/app
+    tags: [ security ]
+    requests:
+      - { request: { method: GET, path: /admin/app/tasks }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: POST, path: /admin/app/tasks, body: { title: Nope } }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /admin/app/tasks/admin/api-task }, expect: { status: 404, body: { error: Endpoint not found } } }
+
+  - name: the admin list searches every task
+    requests:
+      - request: { method: GET, path: /admin/app/tasks/admin }
+        expect: { status: 200, body: { items: [] }, headers: { cache-control: no-store } }
+      - request: { method: GET, path: /admin/app/tasks/admin/, query: { title: milk, done: "false", ownerId: x, id: y } }
+        expect: { status: 200, body: { items: [] } }
+      - request: { method: GET, path: /admin/app/tasks/admin, query: { trash: "true" } }
+        expect: { status: 200, body: { items: [] } }
+
+  - name: list filters are validated
+    tags: [ edge, validation ]
+    requests:
+      - { request: { method: GET, path: /admin/app/tasks/admin, query: { status: open } }, expect: { status: 400, body: { error: "Unsupported filter: status" } } }
+      - { request: { method: GET, path: /admin/app/tasks/admin, query: { trash: "yes" } }, expect: { status: 400, body: { error: Invalid trash filter } } }
+      - { request: { method: GET, path: /admin/app/tasks/admin, query: { trash: "" } }, expect: { status: 400, body: { error: Invalid trash filter } } }
+      - { request: { method: GET, path: /admin/app/tasks/admin, query: { cursor: bad } }, expect: { status: 400, body: { error: Invalid cursor } } }
+
+  - name: admin edits of unknown tasks are not found
+    tags: [ edge ]
+    requests:
+      - { request: { method: PATCH, path: /admin/app/tasks/admin/api-missing, body: { title: X } }, expect: { status: 404, body: { error: Task not found } } }
+      - { request: { method: PATCH, path: /admin/app/tasks/admin/api-missing, body: { done: "no" } }, expect: { status: 404, body: { error: Task not found } } }
+      - { request: { method: DELETE, path: /admin/app/tasks/admin/api-missing }, expect: { status: 404, body: { error: Task not found } } }
+      - { request: { method: POST, path: /admin/app/tasks/admin/api-missing/restore }, expect: { status: 404, body: { error: Task not found } } }
+      - { request: { method: PATCH, path: "/admin/app/tasks/admin/a%20b", body: {} }, expect: { status: 404, body: { error: Task not found } } }
+      - { request: { method: PATCH, path: "/admin/app/tasks/admin/%E0%A4%A", body: {} }, expect: { status: 400, body: { error: Invalid URL } } }
+      - { request: { method: PATCH, path: /admin/app/tasks/admin/api-missing, headers: { content-type: application/json }, raw: "{bad" }, expect: { status: 400, body: { error: Invalid JSON } } }

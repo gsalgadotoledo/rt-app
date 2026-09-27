@@ -1,0 +1,67 @@
+contract: 1
+kind: http
+module: content-api
+title: Home content HTTP API (local mode)
+description: |
+  The content module as every backend serves it in local mode: GET / is public; the settings
+  endpoints are permission endpoints, mounted only under /admin/app, where the local owner
+  "rt-app-root" may use them. The home row is shared by the whole server, so the cases read the
+  current version first instead of assuming a fresh store. See content.contract.yaml for the rules.
+
+  Not pinned: the TypeScript framework also serves permission endpoints at their plain path
+  (/content/settings, for signed-in actors with the grant: 401 "Sign in" without a session),
+  while the Python and Go web layers mount them only under /admin/app (404 there).
+cases:
+  - name: the home page is public
+    requests:
+      - request: { method: GET, path: / }
+        expect: { status: 200, body: { title: { $type: string }, content: { $type: string } }, headers: { cache-control: no-store } }
+
+  - name: the local owner uses the settings under /admin/app
+    tags: [ security ]
+    requests:
+      - { request: { method: POST, path: /admin/app/content/settings, body: {} }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - { request: { method: GET, path: /admin/app/ }, expect: { status: 404, body: { error: Endpoint not found } } }
+      - request: { method: GET, path: /admin/app/content/settings }
+        expect:
+          status: 200
+          body:
+            version: { $type: integer }
+            values: { title: { $type: string }, content: { $type: string } }
+            fields:
+              - { name: title, label: Title, type: text, maxLength: 120 }
+              - { name: content, label: Description, type: textarea, maxLength: 2000 }
+
+  - name: save, read back and reject a stale version
+    tags: [ concurrency ]
+    requests:
+      - request: { method: GET, path: /admin/app/content/settings }
+        expect: { status: 200 }
+      - request: { method: PUT, path: /admin/app/content/settings, body: { version: { $ref: "0.body.version" }, values: { title: "  API home ", content: "Served by every backend　" } } }
+        expect: { status: 200, body: { $partial: { version: { $type: integer }, values: { title: API home, content: "Served by every backend" } } } }
+      - request: { method: GET, path: / }
+        expect: { status: 200, body: { title: API home, content: "Served by every backend" } }
+      - request: { method: PUT, path: /admin/app/content/settings, body: { version: { $ref: "0.body.version" }, values: { title: Stale, content: Stale } } }
+        expect: { status: 409, body: { error: "Conflict: refresh and try again" } }
+      - request: { method: PUT, path: /admin/app/content/settings, body: { version: { $ref: "1.body.version" }, values: { title: Second, content: Edit } } }
+        expect: { status: 200, body: { $partial: { values: { title: Second, content: Edit } } } }
+      - request: { method: GET, path: /admin/app/content/settings }
+        expect: { status: 200, body: { $partial: { version: { $ref: "4.body.version" }, values: { title: Second, content: Edit } } } }
+
+  - name: edits are validated
+    tags: [ edge, validation ]
+    requests:
+      - request: { method: GET, path: /admin/app/content/settings }
+        expect: { status: 200 }
+      - { request: { method: PUT, path: /admin/app/content/settings, body: {} }, expect: { status: 400, body: { error: Version is required } } }
+      - { request: { method: PUT, path: /admin/app/content/settings }, expect: { status: 400, body: { error: Version is required } } }
+      - { request: { method: PUT, path: /admin/app/content/settings, body: { version: "1", values: { title: T, content: C } } }, expect: { status: 400, body: { error: Version is required } } }
+      - { request: { method: PUT, path: /admin/app/content/settings, body: { version: 1.5, values: { title: T, content: C } } }, expect: { status: 400, body: { error: Version is required } } }
+      - { request: { method: PUT, path: /admin/app/content/settings, body: { version: 1000000, values: { title: "", content: "" } } }, expect: { status: 409, body: { error: "Conflict: refresh and try again" } } }
+      - { request: { method: PUT, path: /admin/app/content/settings, body: { version: { $ref: "0.body.version" }, values: { title: " ", content: C } } }, expect: { status: 400, body: { error: "Invalid field: title" } } }
+      - { request: { method: PUT, path: /admin/app/content/settings, body: { version: { $ref: "0.body.version" } } }, expect: { status: 400, body: { error: "Invalid field: title" } } }
+      - { request: { method: PUT, path: /admin/app/content/settings, body: { version: { $ref: "0.body.version" }, values: { title: { $text: { repeat: "😀", count: 61 } }, content: C } } }, expect: { status: 400, body: { error: "Invalid field: title" } } }
+      - { request: { method: PUT, path: /admin/app/content/settings, body: { version: { $ref: "0.body.version" }, values: { title: T, content: { $text: { repeat: c, count: 2001 } } } } }, expect: { status: 400, body: { error: "Invalid field: content" } } }
+      - { request: { method: PUT, path: /admin/app/content/settings, headers: { content-type: application/json }, raw: "[1]" }, expect: { status: 400, body: { error: Invalid JSON } } }
+      - request: { method: GET, path: /admin/app/content/settings }
+        expect: { status: 200, body: { $partial: { version: { $ref: "0.body.version" } } } }
