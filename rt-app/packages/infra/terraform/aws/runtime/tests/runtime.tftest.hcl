@@ -94,3 +94,29 @@ run "zone_requires_domain" {
   }
   expect_failures = [var.zone_id]
 }
+run "extra_environment_reaches_the_api_and_core_values_win" {
+  command = plan
+  variables {
+    extra_environment = {
+      RT_AGENT_ADMIN_URL            = "https://agent.example.test"
+      RT_AGENT_ADMIN_KEY_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:app/agent/admin-key"
+      TABLE_NAME                    = "not-the-table"
+    }
+    extra_secret_arns = ["arn:aws:secretsmanager:us-east-1:123456789012:secret:app/agent/admin-key"]
+  }
+  assert {
+    condition     = aws_lambda_function.api.environment[0].variables["RT_AGENT_ADMIN_URL"] == "https://agent.example.test"
+    error_message = "The app's own variables reach the API."
+  }
+  assert {
+    condition     = aws_lambda_function.api.environment[0].variables["TABLE_NAME"] == "rt-app-test-stage-application"
+    error_message = "The core's variables win on a clash."
+  }
+}
+run "a_secret_is_never_an_extra_variable" {
+  command = plan
+  variables {
+    extra_environment = { RT_AGENT_ADMIN_KEY = "plain" }
+  }
+  expect_failures = [var.extra_environment]
+}

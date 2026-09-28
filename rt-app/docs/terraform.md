@@ -97,6 +97,14 @@ protected` and nothing is deleted. After a destroy, deploying again creates a fr
 (new Cognito pool, empty table, new CloudFront and Amplify URLs unless custom domains are set).
 GitLab has no destroy job: run the two commands above with the environment's role.
 
+## The app's own variables for the API (optional)
+
+The `runtime` module passes `extra_environment` (a map) to the API Lambda, and lets it read the
+Secrets Manager ARNs in `extra_secret_arns`: an app module that calls a service of its own gets its
+URL and its key that way. A secret never goes in `extra_environment` (a name ending in `KEY`,
+`SECRET`, `PASSWORD` or `TOKEN` is refused): pass `<NAME>_SECRET_ARN` and list the ARN. The core's
+own variables win on a clash. Both default to empty.
+
 ## Custom domains (optional)
 
 Unset, every role keeps its AWS URL. Each variable is optional and can live in

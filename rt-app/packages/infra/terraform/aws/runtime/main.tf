@@ -20,6 +20,20 @@ variable "stripe_enabled" {
 }
 variable "app" { type = string }
 variable "environment" { type = string }
+variable "extra_environment" {
+  description = "The app's own environment variables for the API (the URL of a service it calls). Never a secret: put its ARN here and the ARN in extra_secret_arns. The core's own variables win on a clash."
+  type        = map(string)
+  default     = {}
+  validation {
+    condition     = alltrue([for k in keys(var.extra_environment) : !can(regex("(KEY|SECRET|PASSWORD|TOKEN)$", k))])
+    error_message = "Secrets never go in extra_environment: pass the secret's ARN (a name ending in _ARN) and list it in extra_secret_arns."
+  }
+}
+variable "extra_secret_arns" {
+  description = "Secrets Manager ARNs the API may read (the app's own secrets, named in extra_environment)."
+  type        = list(string)
+  default     = []
+}
 variable "mail_from" { type = string }
 variable "revision" { type = string }
 variable "lambda_bundle_path" { type = string }
@@ -121,7 +135,7 @@ resource "aws_iam_role_policy" "lambda" {
         Effect = "Allow", Action = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:TransactWriteItems"], Resource = var.table_arns
       },
       {
-        Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = concat([aws_secretsmanager_secret.jwt.arn, aws_secretsmanager_secret.admin_password.arn], aws_secretsmanager_secret.stripe[*].arn)
+        Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = concat([aws_secretsmanager_secret.jwt.arn, aws_secretsmanager_secret.admin_password.arn], aws_secretsmanager_secret.stripe[*].arn, var.extra_secret_arns)
       },
       {
         Effect = "Allow", Action = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"], Resource = aws_secretsmanager_secret.infra.arn
@@ -149,7 +163,7 @@ resource "aws_lambda_function" "api" {
   reserved_concurrent_executions = 5
   publish                        = true
   environment {
-    variables = {
+    variables = merge(var.extra_environment, {
       TABLE_NAME                 = var.application_table_name
       SUBSCRIPTIONS_PROVIDER     = var.stripe_enabled ? "stripe" : "none"
       STRIPE_SECRET_ARN          = var.stripe_enabled ? aws_secretsmanager_secret.stripe[0].arn : ""
@@ -167,7 +181,7 @@ resource "aws_lambda_function" "api" {
       COGNITO_USER_POOL_ID       = var.cognito_user_pool_id
       COGNITO_CLIENT_ID          = var.cognito_client_id
       RT_APP_REVISION            = var.revision
-    }
+    })
   }
   depends_on = [aws_iam_role_policy.lambda, aws_cloudwatch_log_group.api]
 }
