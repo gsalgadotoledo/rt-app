@@ -11,6 +11,7 @@ import {adminFor} from './admins.mjs';
 import {projectInsights,projectRecords} from './insights.mjs';
 import {detectApps,appTask,repository} from './apps.mjs';
 import {TerraformRunner,findStacks} from './terraform.mjs';
+import {WizardRunner} from './wizard.mjs';
 import {ContractRunner,findConfigs,describe as describeContracts} from './contracts.mjs';
 import {createHash as hashOf} from 'node:crypto';
 import {spawn as spawnProcess} from 'node:child_process';
@@ -42,7 +43,7 @@ async function apply(root,config){
 }
 /** Main-process coordinator. Each project retains its own native daemon; common services have one per user. */
 export class ServiceHub {
- constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine,terraform,contracts,spawn=spawnProcess}={}){this.home=home;this.spawn=spawn;this.installs=new Map();this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();this.terraform=terraform??new TerraformRunner({home});this.contracts=contracts??new ContractRunner({home});}
+ constructor({home=join(homedir(),'.rt-app','service-manager'),binary,noBuild=false,noMail=false,agents,machine,terraform,contracts,spawn=spawnProcess}={}){this.home=home;this.spawn=spawn;this.installs=new Map();this.options={binary,noBuild,noMail};this.root=null;this.queue=Promise.resolve();this.agents=agents??new LaunchAgents({managerHome:home});this.machine=machine??new MachineProcesses();this.terraform=terraform??new TerraformRunner({home});this.contracts=contracts??new ContractRunner({home});this.wizard=new WizardRunner({spawn});}
  exclusive(fn){const job=this.queue.then(fn);this.queue=job.catch(()=>{});return job;}
  async initialize(){await mkdir(this.home,{recursive:true,mode:0o700});this.registry=await read(join(this.home,'projects.json'),[]);this.global=await read(join(this.home,'settings.json'),{version:1,ports:{smtp:1025,mail:8025},extra:[]});validatePorts(this.global.ports);}
  async select(root){return this.exclusive(async()=>{
@@ -308,6 +309,14 @@ export class ServiceHub {
   if(admin.kind==='start'){await request(this.home,'start',admin.tool);for(let i=0;i<50;i++){const pg=(await request(this.home,'status')).services.find(s=>s.id===admin.tool);if(pg?.state==='running'&&pg.url)return pg.url;await delay(200);}throw new Error(admin.name+' did not start; see its logs in Shared services');}
   throw new Error(admin.kind==='install'?`Install ${admin.name} from Add tools & services first`:admin.description);
  }
+
+ // -- Deploy setup wizard (the project's deploy.wizard.json) ----------------------
+
+ wizardRoot(){if(!this.root)throw new Error('Select a project first');return this.root;}
+ wizardState(){return this.root?this.wizard.state(this.root):{wizard:null};}
+ wizardSave(values){return this.wizard.save(this.wizardRoot(),values);}
+ wizardRun(step,action){return this.wizard.run(this.wizardRoot(),step,action);}
+ wizardGetRun(id){return this.wizard.getRun(id);}
 
  // -- Terraform ----------------------------------------------------------------
 

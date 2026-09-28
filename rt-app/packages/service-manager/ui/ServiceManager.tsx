@@ -14,6 +14,7 @@ import {CreateProjectWizard} from './CreateProjectWizard.js';
 import {ServiceControls,type ServiceAdmin} from './ServiceControls.js';
 import {MachineProcesses,type MachineClient} from './MachineProcesses.js';
 import {TerraformPanel,type TerraformClient} from './TerraformPanel.js';
+import {DeployWizard,type WizardClient} from './DeployWizard.js';
 import {ContractsPanel,type ContractsClient} from './ContractsPanel.js';
 export interface Service {runtime?:string|null;id:string;label:string;kind:string;enabled:boolean;state:string;pid:number|null;url:string|null;error:string|null;exitCode:number|null;cpu:number;cpuTimeMs?:number;threads?:number|null;memoryMb:number;uptimeSeconds:number|null;dependencies:string[];scope?:'global'|'project';project?:string;ports?:number[];background?:boolean;admin?:ServiceAdmin}
 export interface Output {sequence:number;time:number;stream:string;text:string}
@@ -22,7 +23,7 @@ export interface Candidate {id:string;label:string;cwd:string;command:string[];s
 export interface Snapshot {project:string;services:Service[];projects?:{name:string;path:string;kind?:string;runtimes?:string[];running?:number}[];projectKind?:string;projectRuntimes?:string[];globalPorts?:Record<string,number>;projectPorts?:Record<string,number>;catalog?:Tool[]}
 export interface ProjectSetup {backends:{id:string;name:string;description:string}[];templates:{id:string;name:string;description:string;prompt?:string}[];initializer?:string;requirements:{id:string;name:string;required:boolean;ready:boolean;installedVersion:string;description:string}[];workspace:string;job:{state:string;log:string[];error?:string;result?:{path?:string}}}
 export interface CommandGroup {id:string;label:string;cwd:string;commands:{id:string;name:string;description:string;command:string[];serviceId?:string}[]}
-export interface ManagerClient extends DeployClient, MachineClient, TerraformClient, ContractsClient, InstallClient, InsightsClient, LauncherClient {reloadProject?():Promise<Snapshot>;background?(id:string,enabled:boolean):Promise<Snapshot>;openAdmin?(id:string):Promise<void>;deleteProject?(path:string):Promise<Snapshot>;commands?():Promise<CommandGroup[]>;runCommand?(id:string):Promise<{id:string}>;dropFolder?(file:File):Promise<{kind:string;snapshot?:Snapshot}>;copyText?(text:string):Promise<void>;projectStatus?(id:string,backendId?:string):Promise<ProjectSetup>;chooseWorkspace?():Promise<string>;installTools?(ids:string[]):Promise<unknown>;createProject?(spec:{name:string;templateId:string;backendId:string}):Promise<unknown>;snapshot():Promise<Snapshot>;action(action:'start'|'stop'|'restart',id:string):Promise<unknown>;logs(id:string):Promise<Output[]>;openUrl?(id:string):Promise<void>;selectProject?(path?:string):Promise<Snapshot>;catalogAction?(action:'add'|'remove',id:string):Promise<unknown>;discover?():Promise<Candidate[]>;addDiscovered?(id:string):Promise<Snapshot>;setPorts?(scope:'global'|'project',ports:Record<string,number>):Promise<Snapshot>}
+export interface ManagerClient extends DeployClient, MachineClient, TerraformClient, Omit<WizardClient,'terraform'>, ContractsClient, InstallClient, InsightsClient, LauncherClient {reloadProject?():Promise<Snapshot>;background?(id:string,enabled:boolean):Promise<Snapshot>;openAdmin?(id:string):Promise<void>;deleteProject?(path:string):Promise<Snapshot>;commands?():Promise<CommandGroup[]>;runCommand?(id:string):Promise<{id:string}>;dropFolder?(file:File):Promise<{kind:string;snapshot?:Snapshot}>;copyText?(text:string):Promise<void>;projectStatus?(id:string,backendId?:string):Promise<ProjectSetup>;chooseWorkspace?():Promise<string>;installTools?(ids:string[]):Promise<unknown>;createProject?(spec:{name:string;templateId:string;backendId:string}):Promise<unknown>;snapshot():Promise<Snapshot>;action(action:'start'|'stop'|'restart',id:string):Promise<unknown>;logs(id:string):Promise<Output[]>;openUrl?(id:string):Promise<void>;selectProject?(path?:string):Promise<Snapshot>;catalogAction?(action:'add'|'remove',id:string):Promise<unknown>;discover?():Promise<Candidate[]>;addDiscovered?(id:string):Promise<Snapshot>;setPorts?(scope:'global'|'project',ports:Record<string,number>):Promise<Snapshot>}
 function ProjectIcon({kind}:{kind:'folder'|'vscode'|'cursor'}) {
  const paths={folder:'M3 7h6l2 2h10v11H3z M3 7V4h6l2 3h10v2',vscode:'M16 3l5 2v14l-5 2-9-8-3 3-2-2 4-4-4-4 2-2 3 3 9-8v18 M7 10l9 7V7l-9 6',cursor:'M5 3l14 9-6 1-3 7-5-17z'};
  return <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" aria-hidden="true"><path d={paths[kind]}/></svg>;
@@ -56,7 +57,7 @@ export function ServiceManager({client}:{client:ManagerClient}) {
  useEffect(()=>{try{localStorage.setItem('rt-app.services.theme',theme);}catch{}},[theme]);
  const [themesOpen,setThemesOpen]=useState(false);
  const [missingDeps,setMissingDeps]=useState<{path:string;error:string}>();
- const [projectTab,setProjectTab]=useState<'overview'|'modules'|'data'|'infra'>('overview');const [tabFocus,setTabFocus]=useState<string>();
+ const [projectTab,setProjectTab]=useState<'overview'|'modules'|'data'|'infra'|'deploy'>('overview');const [tabFocus,setTabFocus]=useState<string>();
  const [pinned,setPinned]=useState<string[]>(()=>{try{const saved=JSON.parse(localStorage.getItem('rt-app.services.pinned')??'[]');return Array.isArray(saved)?saved.filter(p=>typeof p==='string'):[];}catch{return [];}});
  useEffect(()=>{try{localStorage.setItem('rt-app.services.pinned',JSON.stringify(pinned));}catch{}},[pinned]);
  const togglePin=(path:string)=>setPinned(list=>list.includes(path)?list.filter(p=>p!==path):[...list,path]);
@@ -161,12 +162,13 @@ export function ServiceManager({client}:{client:ManagerClient}) {
   </>}
   {!detail&&scope==='project'&&snapshot.project&&(client.insights||client.terraform)&&<>
    {client.insights&&<div className="rt-project-tabs" role="tablist" aria-label="Project sections">
-    {([['overview','Overview'],['modules','Modules'],['data','Data'],...(client.terraform?[['infra','Infrastructure']]:[])] as [typeof projectTab,string][]).map(([id,label])=><button key={id} role="tab" aria-selected={projectTab===id} onClick={()=>{setProjectTab(id);setTabFocus(undefined);}}>{label}</button>)}
+    {([['overview','Overview'],['modules','Modules'],['data','Data'],...(client.terraform?[['infra','Infrastructure']]:[]),...(client.wizard?[['deploy','Deploy setup']]:[])] as [typeof projectTab,string][]).map(([id,label])=><button key={id} role="tab" aria-selected={projectTab===id} onClick={()=>{setProjectTab(id);setTabFocus(undefined);}}>{label}</button>)}
    </div>}
    {client.insights&&projectTab==='overview'&&<ProjectOverview key={snapshot.project} client={client} project={snapshot.project} onOpen={(tab,id)=>{setProjectTab(tab);setTabFocus(id);}}/>}
    {client.insights&&projectTab==='modules'&&<ProjectModules key={snapshot.project} client={client} project={snapshot.project} focus={tabFocus}/>}
    {client.insights&&projectTab==='data'&&<ProjectData key={snapshot.project} client={client} project={snapshot.project} focus={tabFocus}/>}
    {client.terraform&&(projectTab==='infra'||!client.insights)&&<TerraformPanel key={snapshot.project} client={client} project={snapshot.project}/>}
+   {client.wizard&&projectTab==='deploy'&&<DeployWizard key={snapshot.project} client={client} project={snapshot.project}/>}
   </>}
   {detail&&<section className="rt-service-page">
    <nav aria-label="Breadcrumb" className="rt-service-breadcrumb"><button onClick={()=>setDetail(false)}>{scope==='project'?(snapshot.projects?.find(p=>p.path===snapshot.project)?.name??'Project'):'Global services'}</button><span aria-hidden="true">/</span><button onClick={()=>setDetail(false)}>Services</button><span aria-hidden="true">/</span><span aria-current="page">{current?.label??'Service'}</span></nav>

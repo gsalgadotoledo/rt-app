@@ -48,6 +48,12 @@ contextBridge.exposeInMainWorld('rtAppServices',{
   remove:id=>ipcRenderer.invoke('contracts:remove',id),
   openFile:(id,file)=>ipcRenderer.invoke('contracts:open-file',id,file),
  },
+ wizard:{
+  state:()=>ipcRenderer.invoke('wizard:state'),
+  save:values=>ipcRenderer.invoke('wizard:save',values),
+  run:(step,action)=>ipcRenderer.invoke('wizard:run',step,action),
+  getRun:id=>ipcRenderer.invoke('wizard:get-run',id),
+ },
  terraform:{
   stacks:()=>ipcRenderer.invoke('terraform:stacks'),
   resources:id=>ipcRenderer.invoke('terraform:resources',id),

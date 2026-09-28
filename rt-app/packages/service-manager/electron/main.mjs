@@ -77,6 +77,10 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
    ipcMain.handle('machine:stop',(event,pid)=>{trusted(event);return hub.stopProcess(pid);});
    ipcMain.handle('machine:detach',(event,label)=>{trusted(event);if(typeof label!=='string')throw new Error('Invalid label');return hub.detachAgent(label);});
    ipcMain.handle('machine:open-port',async(event,port)=>{trusted(event);if(!Number.isInteger(port)||port<1||port>65535)throw new Error('Invalid port');await openLocal(`http://localhost:${port}`);});
+   ipcMain.handle('wizard:state',event=>{trusted(event);return hub.wizardState();});
+   ipcMain.handle('wizard:save',(event,values)=>{trusted(event);if(!values||typeof values!=='object'||Object.values(values).some(v=>typeof v!=='string'))throw new Error('Invalid values');return hub.wizardSave(values);});
+   ipcMain.handle('wizard:run',(event,step,action)=>{trusted(event);if(typeof step!=='string'||typeof action!=='string')throw new Error('Invalid action');return hub.wizardRun(step,action);});
+   ipcMain.handle('wizard:get-run',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid run');return hub.wizardGetRun(id);});
    ipcMain.handle('terraform:stacks',event=>{trusted(event);return hub.terraformStacks();});
    ipcMain.handle('terraform:resources',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid stack');return hub.terraformResources(id);});
    ipcMain.handle('terraform:variables',(event,id)=>{trusted(event);if(typeof id!=='string')throw new Error('Invalid stack');return hub.terraformVariables(id);});

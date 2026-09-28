@@ -300,3 +300,39 @@ ol.rt-wizard-steps li button:disabled{cursor:default}
 .rt-power-folder code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:10.5px}
 .rt-services .rt-power-folder button{display:inline-flex;align-items:center;justify-content:center;width:26px;height:24px;padding:0}
 .rt-services .rt-power-folder button.on{color:var(--accent);border-color:var(--accent)}
+
+/* Deploy setup wizard (DeployWizard.tsx): the steps on top, the data left, where to find it right. */
+.rt-wizard{display:flex;flex-direction:column;gap:14px;padding:18px 20px;color:var(--text)}
+.rt-wizard-head h2{margin:0 0 2px;font-size:18px}
+.rt-wizard-head small,.rt-wizard-field small,.rt-wizard-actions small{color:var(--muted)}
+.rt-wizard-steps{display:flex;flex-wrap:wrap;gap:6px;list-style:none;margin:0;padding:0}
+.rt-wizard-steps button{display:flex;align-items:center;gap:7px;padding:6px 11px;border:1px solid var(--line);border-radius:999px;background:var(--surface);color:var(--text);cursor:pointer}
+.rt-wizard-steps button i{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--hover);font-style:normal;font-size:11px}
+.rt-wizard-steps button.done i{background:var(--accent);color:var(--on-accent)}
+.rt-wizard-steps button.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.rt-wizard-body{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:18px;align-items:start}
+@media (max-width:820px){.rt-wizard-body{grid-template-columns:1fr}}
+.rt-wizard-data,.rt-wizard-help{border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:16px}
+.rt-wizard-data h3{margin:0 0 6px}
+.rt-wizard-note{color:var(--muted);font-size:12px}
+.rt-wizard-field{display:flex;flex-direction:column;gap:5px;margin:12px 0}
+.rt-wizard-field>span{display:flex;align-items:center;gap:8px;font-weight:600}
+.rt-wizard-field code{font-weight:400;color:var(--muted);font-size:11px}
+.rt-wizard-field em{font-style:normal;font-weight:500;color:var(--accent);font-size:12px}
+.rt-wizard-field input,.rt-wizard-field select{padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text);font:inherit}
+.rt-wizard-field.invalid input{border-color:var(--danger)}
+.rt-wizard-actions{display:flex;flex-direction:column;gap:10px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.rt-wizard-actions>div{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.rt-wizard-actions code{color:var(--muted);font-size:11px}
+.rt-wizard-actions small{flex-basis:100%}
+.rt-wizard-run{margin-top:12px;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.rt-wizard-run>div{display:flex;justify-content:space-between;padding:6px 10px;background:var(--hover);font-size:12px}
+.rt-wizard-run.state-failed>div span{color:var(--danger)}
+.rt-wizard-run pre{margin:0;max-height:320px;overflow:auto;padding:10px;background:var(--bg);font-size:11.5px;white-space:pre-wrap;word-break:break-word}
+.rt-wizard-platform{width:100%;padding:10px;border:1px solid var(--accent);border-radius:8px;background:transparent;color:var(--accent);font-weight:600;cursor:pointer}
+.rt-wizard-platform:hover{background:var(--hover)}
+.rt-wizard-help h4{margin:14px 0 6px}
+.rt-wizard-help ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:6px;line-height:1.45}
+.rt-wizard-links{list-style:none;margin:12px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
+.rt-wizard-foot{display:flex;align-items:center;gap:10px}
+.rt-wizard-foot span{margin-right:auto;margin-left:6px;color:var(--muted);font-size:12px}
