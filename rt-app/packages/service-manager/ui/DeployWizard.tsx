@@ -82,6 +82,15 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
   /** The output follows its end, unless the person scrolled up to read. */
   const stick = useRef(true);
   const [newDomain, setNewDomain] = useState<Record<string, boolean>>({});
+  /** The confirmation being asked (in the window: Electron has no prompt()). */
+  const [ask, setAsk] = useState<{ action: WizardAction; at: number; typed: string } | null>(null);
+  const [startedAt, setStartedAt] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (run?.state !== "running") return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [run?.state]);
   useLayoutEffect(() => {
     const el = out.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
@@ -143,20 +152,41 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
       else void load();
     }).catch((e) => setError((e as Error).message));
   };
-  const start = async (action: WizardAction) => {
-    for (const question of action.confirm) if (!window.confirm(question)) return;
-    if (action.typeToConfirm) {
-      const typed = window.prompt(`Type ${action.typeToConfirm} to confirm`);
-      if (typed?.trim() !== action.typeToConfirm) return;
-    }
+  /** Its confirmations first (each in turn, then the word typed), in the window. */
+  const start = (action: WizardAction) => {
+    if (action.confirm.length || action.typeToConfirm) setAsk({ action, at: 0, typed: "" });
+    else void launch(action);
+  };
+  const launch = async (action: WizardAction) => {
     stick.current = true;
     if (dirty && !(await save())) return;
+    // On screen at once: the command has started, its output follows.
+    setRun({ id: "", label: action.label, command: action.command.join(" "), state: "running", output: "" });
+    setStartedAt(Date.now());
+    setNow(Date.now());
     try {
       const { id } = await api.run(step.id, action.id);
       follow(id);
     } catch (e) {
+      setRun(undefined);
       setError((e as Error).message);
     }
+  };
+  const questions = ask ? ask.action.confirm.length : 0;
+  const typing = Boolean(ask && ask.at >= questions && ask.action.typeToConfirm);
+  const confirmNext = () => {
+    if (!ask) return;
+    if (ask.at < questions - 1 || (ask.at === questions - 1 && ask.action.typeToConfirm)) return setAsk({ ...ask, at: ask.at + 1 });
+    if (typing && ask.typed.trim() !== ask.action.typeToConfirm) return;
+    const action = ask.action;
+    setAsk(null);
+    void launch(action);
+  };
+  /** The command's steps (its «▶» lines): all but the last are done while it runs. */
+  const steps = (run?.output ?? "").split("\n").filter((l) => l.startsWith("▶ ")).map((l) => l.slice(2).trim());
+  const elapsed = (ms: number) => {
+    const sec = Math.max(0, Math.round(ms / 1000));
+    return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, "0")}s`;
   };
   const running = run?.state === "running";
 
@@ -261,8 +291,23 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
             </div>
           )}
           {run && (
-            <div className={`rt-wizard-run state-${run.state}`}>
-              <div><strong>{run.label}</strong> <span>{run.state === "running" ? "running…" : run.state === "succeeded" ? "✓ done" : `failed (exit ${run.exitCode})`}</span></div>
+            <div className={`rt-wizard-run state-${run.state}`} aria-live="polite">
+              <div>
+                <strong>{run.label}</strong>
+                <span>
+                  {run.state === "running" ? <><i className="rt-wizard-spin" aria-hidden="true" /> running…</> : run.state === "succeeded" ? "✓ done" : `✗ failed (exit ${run.exitCode})`}
+                  {startedAt > 0 && <> · {elapsed(now - startedAt)}</>}
+                </span>
+              </div>
+              {steps.length > 0 && (
+                <ol className="rt-wizard-progress">
+                  {steps.map((st, i) => {
+                    const last = i === steps.length - 1;
+                    const mark = !last || run.state === "succeeded" ? "done" : run.state === "running" ? "now" : "failed";
+                    return <li key={i} className={mark}><i aria-hidden="true">{mark === "done" ? "✓" : mark === "now" ? "" : "✗"}</i>{st}</li>;
+                  })}
+                </ol>
+              )}
               <pre
                 ref={out}
                 onScroll={(e) => {
@@ -270,7 +315,7 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
                   stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
                 }}
               >
-                {run.output || "…"}
+                {run.output || "Starting…"}
               </pre>
             </div>
           )}
@@ -295,6 +340,37 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
           )}
         </aside>
       </div>
+      {ask && (
+        <div className="rt-wizard-ask" role="dialog" aria-modal="true" aria-label={ask.action.label}>
+          <div>
+            <h3>{ask.action.label}</h3>
+            {typing ? (
+              <>
+                <p>Type <code>{ask.action.typeToConfirm}</code> to confirm.</p>
+                <input
+                  autoFocus
+                  value={ask.typed}
+                  onChange={(e) => setAsk({ ...ask, typed: e.target.value })}
+                  onKeyDown={(e) => { if (e.key === "Enter") confirmNext(); if (e.key === "Escape") setAsk(null); }}
+                />
+              </>
+            ) : (
+              <p>{ask.action.confirm[ask.at]}</p>
+            )}
+            <small>{questions + (ask.action.typeToConfirm ? 1 : 0) > 1 ? `Confirmation ${ask.at + 1} of ${questions + (ask.action.typeToConfirm ? 1 : 0)}` : ""}</small>
+            <footer>
+              <button autoFocus={!typing} onClick={() => setAsk(null)}>Cancel</button>
+              <button
+                className={ask.action.danger ? "rt-wizard-confirm-danger" : "rt-primary"}
+                disabled={typing && ask.typed.trim() !== ask.action.typeToConfirm}
+                onClick={confirmNext}
+              >
+                {typing || ask.at === questions - 1 ? (ask.action.danger ? "Yes, destroy" : "Yes, go on") : "Continue"}
+              </button>
+            </footer>
+          </div>
+        </div>
+      )}
       <footer className="rt-wizard-foot">
         <button disabled={at === 0 || busy} onClick={() => setAt(at - 1)}>← Back</button>
         <span>{w.steps.filter((s) => s.done === true).length}/{w.steps.filter((s) => s.done !== null).length} filled in</span>

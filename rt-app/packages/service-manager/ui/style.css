@@ -346,3 +346,22 @@ ol.rt-wizard-steps li button:disabled{cursor:default}
 .rt-wizard-danger:disabled{cursor:default}
 .rt-wizard-group small{flex-basis:100%;color:var(--muted)}
 .rt-wizard-linkish{align-self:flex-start;border:0;background:none;padding:0;color:var(--accent);font-size:12px;cursor:pointer}
+.rt-wizard-ask{position:fixed;inset:0;z-index:50;display:grid;place-items:center;background:rgba(0,0,0,.45)}
+.rt-wizard-ask>div{width:min(440px,calc(100vw - 32px));padding:18px 20px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--text);box-shadow:0 18px 50px rgba(0,0,0,.35)}
+.rt-wizard-ask h3{margin:0 0 8px}
+.rt-wizard-ask p{margin:0 0 10px;line-height:1.45}
+.rt-wizard-ask input{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text);font:inherit}
+.rt-wizard-ask small{display:block;min-height:14px;margin-top:6px;color:var(--muted)}
+.rt-wizard-ask footer{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
+.rt-wizard-confirm-danger{border:1px solid var(--danger);border-radius:7px;padding:6px 12px;background:var(--danger);color:#fff;cursor:pointer}
+.rt-wizard-confirm-danger:disabled{opacity:.45;cursor:default}
+.rt-wizard-progress{list-style:none;margin:0;padding:8px 10px;display:flex;flex-direction:column;gap:4px;border-bottom:1px solid var(--line);font-size:12px}
+.rt-wizard-progress li{display:flex;align-items:center;gap:8px}
+.rt-wizard-progress li i{display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;font-style:normal;font-size:10px}
+.rt-wizard-progress li.done i{background:var(--accent);color:var(--on-accent)}
+.rt-wizard-progress li.failed i{background:var(--danger);color:#fff}
+.rt-wizard-progress li.now i,.rt-wizard-spin{border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:rt-wizard-spin .8s linear infinite}
+.rt-wizard-spin{display:inline-block;width:10px;height:10px;vertical-align:-1px;margin-right:4px}
+.rt-wizard-progress li.now{font-weight:600}
+@keyframes rt-wizard-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.rt-wizard-progress li.now i,.rt-wizard-spin{animation:none}}
