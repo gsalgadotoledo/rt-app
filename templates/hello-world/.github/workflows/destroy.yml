@@ -1,0 +1,82 @@
+name: Destroy environment
+# Deletes every AWS resource of one environment, data included. Run it from the environment's
+# branch (the deploy roles trust only that branch), confirming with the environment's name:
+#   gh workflow run destroy.yml --ref develop -f confirm=<RT_APP_NAME>-develop
+#   gh workflow run destroy.yml --ref stage   -f confirm=<RT_APP_NAME>-stage
+#   gh workflow run destroy.yml --ref main    -f confirm=<RT_APP_NAME>          (production)
+# Protected environments are first applied with protect = false (lifting DynamoDB and Cognito
+# deletion protection, the site buckets' retention and the secrets' recovery window), then
+# destroyed. Recreate the environment with: gh workflow run deploy.yml --ref <branch>
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type the environment name: RT_APP_NAME for prod (main), RT_APP_NAME-develop or RT_APP_NAME-stage'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  # Shares the deploy group, so a destroy never runs next to a deployment of the same branch.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  destroy:
+    if: github.ref_name == 'main' || (vars.RT_APP_MULTI_ENVIRONMENT == 'true' && (github.ref_name == 'develop' || github.ref_name == 'stage'))
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TF_IN_AUTOMATION: '1'
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_app: ${{ vars.RT_APP_NAME }}
+      TF_VAR_mail_from: ${{ vars.MAIL_FROM }}
+      TF_VAR_environment: ${{ github.ref_name == 'main' && 'prod' || github.ref_name }}
+      TF_VAR_revision: ${{ github.sha }}
+      TF_VAR_protect: 'false'
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      CONFIRM: ${{ inputs.confirm }}
+    steps:
+      - name: Check confirmation
+        run: |
+          test -n "$AWS_REGION" && test -n "$TF_VAR_app" && test -n "$TF_VAR_mail_from" && test -n "$TF_STATE_BUCKET"
+          expected="$TF_VAR_app"
+          if [ "$TF_VAR_environment" != prod ]; then expected="$TF_VAR_app-$TF_VAR_environment"; fi
+          if [ "$CONFIRM" != "$expected" ]; then
+            echo "Confirmation does not match: type $expected to destroy $TF_VAR_environment." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.ref_name == 'main' && vars.AWS_ROLE_PROD || (github.ref_name == 'develop' && vars.AWS_ROLE_DEVELOP || vars.AWS_ROLE_STAGE) }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: rt-app-destroy-${{ github.run_id }}
+      - run: npm ci
+      - run: npm run build
+      # Terraform reads the Lambda bundle while planning, destroy included.
+      - run: npm run lambda:build
+      - name: Lift protection
+        run: |
+          terraform -chdir=infra/aws init -input=false             -backend-config="bucket=$TF_STATE_BUCKET"             -backend-config="key=$TF_VAR_environment/terraform.tfstate"             -backend-config="region=$AWS_REGION"             -backend-config="encrypt=true"             -backend-config="use_lockfile=true"
+          if [ -z "$(terraform -chdir=infra/aws state list)" ]; then
+            echo "Nothing to destroy: $TF_VAR_environment has no resources."
+            echo "EMPTY=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          terraform -chdir=infra/aws apply -input=false -auto-approve
+      - name: Destroy
+        if: env.EMPTY != '1'
+        run: terraform -chdir=infra/aws destroy -input=false -auto-approve

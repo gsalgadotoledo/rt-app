@@ -166,7 +166,12 @@
         "amplify:DeleteBranch",
         "amplify:StartJob",
         "amplify:GetJob",
-        "amplify:ListJobs"
+        "amplify:ListJobs",
+        "amplify:CreateDomainAssociation",
+        "amplify:GetDomainAssociation",
+        "amplify:UpdateDomainAssociation",
+        "amplify:DeleteDomainAssociation",
+        "amplify:ListDomainAssociations"
       ],
       "Resource": "*"
     },
@@ -213,6 +218,30 @@
         "events:UntagResource"
       ],
       "Resource": "arn:aws:events:*:*:rule/rt-app-*-subscriptions"
+    },
+    {
+      "Sid": "CustomDomainCertificates",
+      "Effect": "Allow",
+      "Action": [
+        "acm:DescribeCertificate",
+        "acm:ListCertificates"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CustomDomainRecords",
+      "Effect": "Allow",
+      "Action": [
+        "route53:GetHostedZone",
+        "route53:ListResourceRecordSets",
+        "route53:ChangeResourceRecordSets",
+        "route53:ListTagsForResource",
+        "route53:GetChange"
+      ],
+      "Resource": [
+        "arn:aws:route53:::hostedzone/*",
+        "arn:aws:route53:::change/*"
+      ]
     }
   ]
 }

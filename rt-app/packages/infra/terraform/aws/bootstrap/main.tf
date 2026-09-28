@@ -31,6 +31,15 @@ variable "oidc_provider_arn" {
   type    = string
   default = ""
 }
+variable "route53_zone_ids" {
+  description = "Route53 hosted zones (ids such as Z0123456789ABC) where the deploy roles may write the DNS records of custom domains. Empty: no Route53 access; use external DNS."
+  type        = list(string)
+  default     = []
+  validation {
+    condition     = alltrue([for id in var.route53_zone_ids : can(regex("^Z[A-Z0-9]{1,31}$", id))])
+    error_message = "Use hosted zone ids such as Z0123456789ABC."
+  }
+}
 provider "aws" {
   region = var.region
 }
@@ -43,6 +52,11 @@ locals {
   arn          = "arn:${data.aws_partition.current.partition}"
   environments = toset(var.multi_environment ? ["develop", "stage", "prod"] : ["prod"])
   names        = { for env in local.environments : env => env == "prod" ? var.app : "${var.app}-${env}" }
+  # Empty without zones (a for expression keeps the statement object types).
+  route53_statements = [for statement in [
+    { Effect = "Allow", Action = ["route53:GetHostedZone", "route53:ListResourceRecordSets", "route53:ChangeResourceRecordSets", "route53:ListTagsForResource"], Resource = [for id in var.route53_zone_ids : "${local.arn}:route53:::hostedzone/${id}"] },
+    { Effect = "Allow", Action = ["route53:GetChange"], Resource = "${local.arn}:route53:::change/*" }
+  ] : statement if length(var.route53_zone_ids) > 0]
 }
 resource "aws_s3_bucket" "state" {
   bucket = "${var.app}-${local.account}-tfstate"
@@ -157,7 +171,7 @@ resource "aws_iam_role_policy" "deploy" {
   for_each = local.environments
   role     = aws_iam_role.deploy[each.key].id
   policy = jsonencode({
-    Version = "2012-10-17", Statement = [
+    Version = "2012-10-17", Statement = concat([
       { Effect = "Allow", Action = ["events:PutRule", "events:DescribeRule", "events:DeleteRule", "events:PutTargets", "events:RemoveTargets", "events:ListTargetsByRule", "events:ListTagsForResource", "events:TagResource", "events:UntagResource"], Resource = "${local.arn}:events:${var.region}:${local.account}:rule/${local.names[each.key]}-subscriptions" },
       { Effect = "Allow", Action = ["budgets:*"], Resource = "${local.arn}:budgets::${local.account}:budget/${local.names[each.key]}-guard-*" },
       { Effect = "Allow", Action = ["iam:CreateRole"], Resource = "${local.arn}:iam::${local.account}:role/${local.names[each.key]}-budget-*", Condition = { StringEquals = { "iam:PermissionsBoundary" = aws_iam_policy.runtime_boundary[each.key].arn } } },
@@ -219,8 +233,11 @@ resource "aws_iam_role_policy" "deploy" {
       },
       {
         Effect = "Allow", Action = ["iam:GetPolicy", "iam:GetPolicyVersion"], Resource = aws_iam_policy.runtime_boundary[each.key].arn
-      }
-    ]
+      },
+      # Optional custom domains: certificates are only read, never issued here.
+      { Effect = "Allow", Action = ["acm:DescribeCertificate", "acm:ListCertificates"], Resource = "*" },
+      { Effect = "Allow", Action = ["amplify:CreateDomainAssociation", "amplify:GetDomainAssociation", "amplify:UpdateDomainAssociation", "amplify:DeleteDomainAssociation", "amplify:ListDomainAssociations"], Resource = "${local.arn}:amplify:${var.region}:${local.account}:apps/*" }
+    ], local.route53_statements)
     }
   )
 }

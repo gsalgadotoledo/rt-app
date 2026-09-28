@@ -72,7 +72,8 @@ stage and prod. Rerunning with all three preserves production's state key. The h
 rejects shrinking an already expanded installation to avoid deleting deployment roles.
 If upgrading an older deployed `dev`/`prod` naming layout, plan a state/data migration;
 `moved.tf` changes addresses but cannot rename DynamoDB tables. Never remove state files
-to work around this check or Terraform's prevent-destroy protection.
+to work around this check or the environment's deletion protection (`protect`, see
+terraform.md → AWS environments: destroying on purpose is a separate, explicit workflow).
 
 The JSON adapter locks per file, checks transaction versions and atomically replaces
 the snapshot. It loads the entire file for every operation: use only for small local

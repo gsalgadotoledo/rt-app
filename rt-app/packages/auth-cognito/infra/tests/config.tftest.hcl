@@ -23,3 +23,28 @@ run "password_email_and_totp_no_sms" {
     error_message = "No SMS, browser client secret or unauthenticated self-registration."
   }
 }
+run "protected_by_default" {
+  command = plan
+  variables {
+    name      = "rt-app-test"
+    region    = "us-east-1"
+    mail_from = "mail@example.test"
+  }
+  assert {
+    condition     = aws_cognito_user_pool.application.deletion_protection == "ACTIVE"
+    error_message = "Pools must keep AWS deletion protection unless protect is false."
+  }
+}
+run "unprotected_pool_can_be_destroyed" {
+  command = plan
+  variables {
+    name      = "rt-app-test"
+    region    = "us-east-1"
+    mail_from = "mail@example.test"
+    protect   = false
+  }
+  assert {
+    condition     = aws_cognito_user_pool.application.deletion_protection == "INACTIVE"
+    error_message = "protect = false must turn Cognito deletion protection off."
+  }
+}

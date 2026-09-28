@@ -38,6 +38,53 @@ variable "mail_from" {
 variable "revision" {
   type = string
 }
+variable "protect" {
+  description = "Deletion protection for this environment: DynamoDB and Cognito deletion protection, site buckets kept on destroy, 30-day secret recovery, and a guard that stops terraform destroy before it deletes anything. Unset: environments/<environment>.json, else true. To destroy on purpose, apply with protect = false, then run terraform destroy with protect = false."
+  type        = bool
+  default     = null
+}
+# Optional custom domains. Empty values fall back to environments/<environment>.json, then to
+# the AWS-generated URLs.
+variable "public_domain" {
+  description = "Custom domain of the public SPA, for example example.com or www.example.com."
+  type        = string
+  default     = ""
+}
+variable "admin_domain" {
+  description = "Custom domain of the admin, for example admin.example.com."
+  type        = string
+  default     = ""
+}
+variable "certificate_arn" {
+  description = "ACM certificate in us-east-1 covering public_domain and admin_domain (CloudFront). Required when either is set."
+  type        = string
+  default     = ""
+}
+variable "api_domain" {
+  description = "Custom domain of the API, for example api.example.com."
+  type        = string
+  default     = ""
+}
+variable "api_certificate_arn" {
+  description = "ACM certificate in the deployment region covering api_domain (API Gateway). Required when api_domain is set."
+  type        = string
+  default     = ""
+}
+variable "ssr_domain" {
+  description = "Domain added to this environment's Amplify SSR app, for example example.com or stage.example.com. One Amplify app per domain."
+  type        = string
+  default     = ""
+}
+variable "ssr_domain_prefix" {
+  description = "Subdomain of ssr_domain that serves the SSR branch (\"\" = ssr_domain itself, \"app\" = app.<ssr_domain>)."
+  type        = string
+  default     = ""
+}
+variable "zone_id" {
+  description = "Route53 hosted zone (in this account) of the custom domains. When set, Terraform/Amplify write the DNS records; empty means you add them at your DNS provider."
+  type        = string
+  default     = ""
+}
 provider "aws" {
   region = var.region
   default_tags {
@@ -47,7 +94,26 @@ provider "aws" {
   }
 }
 data "aws_caller_identity" "current" {}
-locals { name = var.environment == "prod" ? var.app : "${var.app}-${var.environment}" }
+locals {
+  name = var.environment == "prod" ? var.app : "${var.app}-${var.environment}"
+  # Per-environment settings committed with the app, e.g. environments/prod.json:
+  # {"protect": true, "public_domain": "example.com", "certificate_arn": "arn:aws:acm:us-east-1:..."}
+  settings_file = "${path.module}/environments/${var.environment}.json"
+  settings      = fileexists(local.settings_file) ? jsondecode(file(local.settings_file)) : {}
+  setting_names = ["protect", "public_domain", "admin_domain", "certificate_arn", "api_domain", "api_certificate_arn", "ssr_domain", "ssr_domain_prefix", "zone_id"]
+  # A variable that is set (TF_VAR_*, -var) wins over the file.
+  protect = var.protect != null ? var.protect : try(tobool(local.settings.protect), true)
+  domains = {
+    public_domain       = var.public_domain != "" ? var.public_domain : try(tostring(local.settings.public_domain), "")
+    admin_domain        = var.admin_domain != "" ? var.admin_domain : try(tostring(local.settings.admin_domain), "")
+    certificate_arn     = var.certificate_arn != "" ? var.certificate_arn : try(tostring(local.settings.certificate_arn), "")
+    api_domain          = var.api_domain != "" ? var.api_domain : try(tostring(local.settings.api_domain), "")
+    api_certificate_arn = var.api_certificate_arn != "" ? var.api_certificate_arn : try(tostring(local.settings.api_certificate_arn), "")
+    ssr_domain          = var.ssr_domain != "" ? var.ssr_domain : try(tostring(local.settings.ssr_domain), "")
+    ssr_domain_prefix   = var.ssr_domain_prefix != "" ? var.ssr_domain_prefix : try(tostring(local.settings.ssr_domain_prefix), "")
+    zone_id             = var.zone_id != "" ? var.zone_id : try(tostring(local.settings.zone_id), "")
+  }
+}
 # Starter data: Users/Auth (including email challenges) and Home share one table.
 resource "aws_dynamodb_table" "application" {
   name         = "${local.name}-application"
@@ -72,27 +138,34 @@ resource "aws_dynamodb_table" "application" {
   server_side_encryption {
     enabled = true
   }
-  lifecycle {
-    prevent_destroy = true
-  }
+  deletion_protection_enabled = local.protect
 }
 module "authentication" {
   source    = "../../node_modules/@gsalgadotoledo/rt-app-auth-cognito/infra"
   name      = local.name
   region    = var.region
   mail_from = var.mail_from
+  protect   = local.protect
 }
 # Admin resources belong to the reusable core; only composition lives here.
 module "admin" {
-  source     = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/admin"
-  name       = local.name
-  account_id = data.aws_caller_identity.current.account_id
+  source          = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/admin"
+  name            = local.name
+  account_id      = data.aws_caller_identity.current.account_id
+  protect         = local.protect
+  domain          = local.domains.admin_domain
+  certificate_arn = local.domains.admin_domain == "" ? "" : local.domains.certificate_arn
+  zone_id         = local.domains.admin_domain == "" ? "" : local.domains.zone_id
 }
 module "public" {
-  source     = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/site"
-  name       = local.name
-  site       = "public"
-  account_id = data.aws_caller_identity.current.account_id
+  source          = "../../node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/site"
+  name            = local.name
+  site            = "public"
+  account_id      = data.aws_caller_identity.current.account_id
+  protect         = local.protect
+  domain          = local.domains.public_domain
+  certificate_arn = local.domains.public_domain == "" ? "" : local.domains.certificate_arn
+  zone_id         = local.domains.public_domain == "" ? "" : local.domains.zone_id
 }
 # One API serves both local server and Lambda entrypoints; no containers or ALB.
 module "ssr" {
@@ -104,6 +177,10 @@ module "ssr" {
   api_url     = module.api.deployment.ApiUrl
   admin_url   = module.admin.site.url
   spa_url     = module.public.site.url
+  # Amplify issues the SSR certificate itself.
+  domain        = local.domains.ssr_domain
+  domain_prefix = local.domains.ssr_domain_prefix
+  zone_id       = local.domains.ssr_domain == "" ? "" : local.domains.zone_id
 }
 module "api" {
   stripe_enabled         = var.stripe_enabled
@@ -120,7 +197,28 @@ module "api" {
   lambda_archive_path    = abspath("${path.module}/../../apps/lambda-ts/bundle.zip")
   application_table_name = aws_dynamodb_table.application.name
   table_arns             = [aws_dynamodb_table.application.arn]
-  allowed_origins        = [module.admin.site.url, module.public.site.url, module.ssr.url, "http://127.0.0.1:5174", "http://localhost:5174"]
+  allowed_origins        = distinct([module.admin.site.url, module.admin.site.cloudfront_url, module.public.site.url, module.public.site.cloudfront_url, module.ssr.url, module.ssr.default_url, "http://127.0.0.1:5174", "http://localhost:5174"])
+  protect                = local.protect
+  domain                 = local.domains.api_domain
+  certificate_arn        = local.domains.api_domain == "" ? "" : local.domains.api_certificate_arn
+  zone_id                = local.domains.api_domain == "" ? "" : local.domains.zone_id
+}
+# Destroy guard: it depends on every resource, so terraform destroy removes it first and a
+# protected environment fails here before anything is deleted. The AWS-level protections
+# (DynamoDB, Cognito, site buckets) remain the second line of defense.
+resource "terraform_data" "protect" {
+  input      = local.protect
+  depends_on = [aws_dynamodb_table.application, module.authentication, module.admin, module.public, module.ssr, module.api, module.spend_guards]
+  provisioner "local-exec" {
+    when    = destroy
+    command = self.input ? "echo 'This environment is protected. Apply with protect = false (TF_VAR_protect=false), then destroy.' >&2; exit 1" : "true"
+  }
+  lifecycle {
+    precondition {
+      condition     = alltrue([for key in keys(local.settings) : contains(local.setting_names, key)])
+      error_message = "Unknown setting in environments/${var.environment}.json. Allowed: ${join(", ", local.setting_names)}."
+    }
+  }
 }
 output "deployment" {
   value = merge(module.api.deployment, {
@@ -136,5 +234,6 @@ output "deployment" {
     PublicBucketName     = module.public.site.bucket
     AdminDistributionId  = module.admin.site.distribution_id
     PublicDistributionId = module.public.site.distribution_id
+    Protected            = local.protect
   })
 }

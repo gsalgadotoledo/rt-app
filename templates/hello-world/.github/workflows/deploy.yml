@@ -2,6 +2,8 @@ name: Deploy
 on:
   push:
     branches: [main, develop, stage]
+  # Recreate an environment on demand: gh workflow run deploy.yml --ref develop
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -34,8 +36,10 @@ jobs:
           terraform -chdir=infra/aws init -backend=false -input=false
           terraform -chdir=infra/aws validate
           terraform -chdir=infra/aws test
-          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/ssr init -backend=false -input=false
-          terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/ssr test
+          for module in ssr site admin runtime; do
+            terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/$module init -backend=false -input=false
+            terraform -chdir=node_modules/@gsalgadotoledo/rt-app-infra/terraform/aws/$module test
+          done
           terraform -chdir=node_modules/@gsalgadotoledo/rt-app-auth-cognito/infra init -backend=false -input=false
           terraform -chdir=node_modules/@gsalgadotoledo/rt-app-auth-cognito/infra test
   deploy:

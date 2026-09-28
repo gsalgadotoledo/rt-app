@@ -39,3 +39,62 @@ run "stage_has_an_independent_branch" {
     error_message = "Stage must not use production configuration."
   }
 }
+run "no_custom_domain_by_default" {
+  command = plan
+  assert {
+    condition     = length(aws_amplify_domain_association.ssr) == 0 && output.dns_records == null
+    error_message = "Without domain the SSR keeps its amplifyapp.com URL."
+  }
+}
+run "custom_domain_in_route53" {
+  command = plan
+  override_data {
+    target = data.aws_route53_zone.domain[0]
+    values = { name = "example.test" }
+  }
+  variables {
+    domain        = "example.test"
+    domain_prefix = "app"
+    zone_id       = "Z123"
+  }
+  assert {
+    condition     = aws_amplify_domain_association.ssr[0].domain_name == "example.test" && aws_amplify_domain_association.ssr[0].wait_for_verification
+    error_message = "A Route53 domain is associated and verified by Amplify."
+  }
+  assert {
+    condition     = one(aws_amplify_domain_association.ssr[0].sub_domain).prefix == "app" && one(aws_amplify_domain_association.ssr[0].sub_domain).branch_name == "main"
+    error_message = "The prefix must route to this environment's branch."
+  }
+  assert {
+    condition     = output.url == "https://app.example.test" && aws_amplify_branch.ssr.environment_variables.RT_APP_SSR_URL == "https://app.example.test"
+    error_message = "The SSR URL must use the custom domain."
+  }
+}
+run "custom_domain_with_external_dns" {
+  command = plan
+  variables {
+    environment = "stage"
+    domain      = "stage.example.test"
+  }
+  assert {
+    condition     = !aws_amplify_domain_association.ssr[0].wait_for_verification && one(aws_amplify_domain_association.ssr[0].sub_domain).prefix == "" && output.url == "https://stage.example.test"
+    error_message = "External DNS must not block apply; the domain itself serves the branch."
+  }
+}
+run "zone_must_contain_the_domain" {
+  command = plan
+  override_data {
+    target = data.aws_route53_zone.domain[0]
+    values = { name = "other.test." }
+  }
+  variables {
+    domain  = "example.test"
+    zone_id = "Z123"
+  }
+  expect_failures = [aws_amplify_domain_association.ssr]
+}
+run "prefix_requires_domain" {
+  command = plan
+  variables { domain_prefix = "app" }
+  expect_failures = [var.domain_prefix]
+}

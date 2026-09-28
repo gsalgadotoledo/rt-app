@@ -7,11 +7,45 @@ terraform {
 variable "name" { type = string }
 variable "site" { type = string }
 variable "account_id" { type = string }
+variable "protect" {
+  description = "Keep the site bucket when Terraform destroys it (true). false empties the bucket, all versions included, on destroy. Apply protect = false before terraform destroy."
+  type        = bool
+  default     = true
+}
+variable "domain" {
+  description = "Optional custom domain for the site, for example app.example.com. Empty keeps the CloudFront domain."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.domain == "" || can(regex("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$", var.domain))
+    error_message = "Use a lowercase host name such as app.example.com, without scheme or path."
+  }
+}
+variable "certificate_arn" {
+  description = "ACM certificate for domain, issued in us-east-1 (CloudFront only reads certificates from that region). Required when domain is set."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.domain == "" ? var.certificate_arn == "" : can(regex("^arn:aws[a-z-]*:acm:us-east-1:[0-9]{12}:certificate/", var.certificate_arn))
+    error_message = "certificate_arn is required with domain, must be an ACM certificate in us-east-1, and must be empty without domain."
+  }
+}
+variable "zone_id" {
+  description = "Optional Route53 hosted zone that serves domain. When set, A and AAAA alias records point domain at the distribution; empty means you create the DNS record yourself (CNAME to the CloudFront domain)."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.zone_id == "" || var.domain != ""
+    error_message = "zone_id requires domain."
+  }
+}
+locals {
+  custom_domain = var.domain != ""
+}
 resource "aws_s3_bucket" "site" {
   bucket = "${var.name}-${var.account_id}-${var.site}"
-  lifecycle {
-    prevent_destroy = true
-  }
+  # Protection is a flag in state: apply protect = false before destroying the bucket.
+  force_destroy = !var.protect
 }
 resource "aws_s3_bucket_public_access_block" "site" {
   bucket                  = aws_s3_bucket.site.id
@@ -44,6 +78,8 @@ resource "aws_cloudfront_distribution" "site" {
   enabled             = true
   default_root_object = "index.html"
   price_class         = "PriceClass_100"
+  aliases             = local.custom_domain ? [var.domain] : []
+  is_ipv6_enabled     = local.custom_domain
   origin {
     domain_name              = aws_s3_bucket.site.bucket_regional_domain_name
     origin_id                = var.site
@@ -74,7 +110,10 @@ resource "aws_cloudfront_distribution" "site" {
     }
   }
   viewer_certificate {
-    cloudfront_default_certificate = true
+    cloudfront_default_certificate = !local.custom_domain
+    acm_certificate_arn            = local.custom_domain ? var.certificate_arn : null
+    ssl_support_method             = local.custom_domain ? "sni-only" : null
+    minimum_protocol_version       = local.custom_domain ? "TLSv1.2_2021" : null
   }
   custom_error_response {
     error_code            = 403
@@ -107,9 +146,24 @@ resource "aws_s3_bucket_policy" "site" {
     }
   )
 }
+# DNS for the custom domain, only when its Route53 zone is managed here.
+resource "aws_route53_record" "site" {
+  for_each = var.zone_id == "" ? toset([]) : toset(["A", "AAAA"])
+  zone_id  = var.zone_id
+  name     = var.domain
+  type     = each.key
+  alias {
+    name                   = aws_cloudfront_distribution.site.domain_name
+    zone_id                = aws_cloudfront_distribution.site.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
 output "site" {
   value = {
-    url             = "https://${aws_cloudfront_distribution.site.domain_name}"
+    url             = local.custom_domain ? "https://${var.domain}" : "https://${aws_cloudfront_distribution.site.domain_name}"
+    cloudfront_url  = "https://${aws_cloudfront_distribution.site.domain_name}"
+    domain          = local.custom_domain ? var.domain : null
+    protected       = !aws_s3_bucket.site.force_destroy
     bucket          = aws_s3_bucket.site.id
     distribution_id = aws_cloudfront_distribution.site.id
     private         = aws_s3_bucket_public_access_block.site.block_public_policy && aws_s3_bucket_public_access_block.site.block_public_acls && aws_s3_bucket_public_access_block.site.ignore_public_acls && aws_s3_bucket_public_access_block.site.restrict_public_buckets

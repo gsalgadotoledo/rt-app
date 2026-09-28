@@ -32,7 +32,7 @@ export async function generateBackend(target,id,packageRoot){
  await writeFile(join(directory,'dev.mjs'),"import {watchCommand} from './watch.mjs';\n"+preparation+"\nawait watchCommand(command, {roots:['.'"+(['go','python'].includes(id)?",'../../packages/core-"+id+"'":'')+"]});\n");
  // Refuse to silently publish only the TS core while omitting the selected application API.
  if(['go','python'].includes(id))await cp(join(packageRoot,'languages','core-'+id),join(target,'packages','core-'+id),{recursive:true});
- for(const path of ['.github/workflows/deploy.yml','.gitlab-ci.yml'])await rm(join(target,path),{force:true});
+ for(const path of ['.github/workflows/deploy.yml','.github/workflows/destroy.yml','.gitlab-ci.yml'])await rm(join(target,path),{force:true});
  await writeFile(join(directory,'README.md'),backendReadme(selected));
 }
 

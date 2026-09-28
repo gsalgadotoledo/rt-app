@@ -27,9 +27,46 @@ variable "lambda_archive_path" { type = string }
 variable "application_table_name" { type = string }
 variable "table_arns" { type = list(string) }
 variable "allowed_origins" { type = list(string) }
+variable "protect" {
+  description = "Keep secrets recoverable for 30 days after deletion (true). false deletes them immediately on destroy, so the environment can be created again with the same names. Apply protect = false before terraform destroy."
+  type        = bool
+  default     = true
+}
+variable "domain" {
+  description = "Optional custom domain for the API, for example api.example.com. Empty keeps the execute-api URL."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.domain == "" || can(regex("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$", var.domain))
+    error_message = "Use a lowercase host name such as api.example.com, without scheme or path."
+  }
+}
+variable "certificate_arn" {
+  description = "Regional ACM certificate for domain, issued in the API's region (not us-east-1 unless the API runs there). Required when domain is set."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.domain == "" ? var.certificate_arn == "" : can(regex("^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/", var.certificate_arn))
+    error_message = "certificate_arn is required with domain and must be empty without it."
+  }
+}
+variable "zone_id" {
+  description = "Optional Route53 hosted zone for domain. When set, an A alias record points domain at API Gateway; empty means you create the DNS record yourself (CNAME to the regional target in the outputs)."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.zone_id == "" || var.domain != ""
+    error_message = "zone_id requires domain."
+  }
+}
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
-locals { name = var.environment == "prod" ? var.app : "${var.app}-${var.environment}" }
+locals {
+  name          = var.environment == "prod" ? var.app : "${var.app}-${var.environment}"
+  custom_domain = var.domain != ""
+  # Secrets Manager keeps deleted secrets (and reserves their names) for the recovery window.
+  secret_recovery_days = var.protect ? 30 : 0
+}
 data "archive_file" "lambda" {
   type        = "zip"
   source_dir  = var.lambda_bundle_path
@@ -37,17 +74,11 @@ data "archive_file" "lambda" {
 }
 resource "aws_secretsmanager_secret" "jwt" {
   name                    = "${local.name}/jwt"
-  recovery_window_in_days = 30
-  lifecycle {
-    prevent_destroy = true
-  }
+  recovery_window_in_days = local.secret_recovery_days
 }
 resource "aws_secretsmanager_secret" "infra" {
   name                    = "${local.name}/infra"
-  recovery_window_in_days = 30
-  lifecycle {
-    prevent_destroy = true
-  }
+  recovery_window_in_days = local.secret_recovery_days
 }
 resource "aws_cloudwatch_log_group" "api" {
   name              = "/aws/lambda/${local.name}"
@@ -189,25 +220,61 @@ output "deployment" {
     AdminPasswordSecretArn  = aws_secretsmanager_secret.admin_password.arn
     JwtSecretArn            = aws_secretsmanager_secret.jwt.arn
     AwsCredentialsSecretArn = aws_secretsmanager_secret.infra.arn
-    ApiUrl                  = aws_apigatewayv2_api.api.api_endpoint
+    ApiUrl                  = local.custom_domain ? "https://${var.domain}" : aws_apigatewayv2_api.api.api_endpoint
     LambdaVersion           = aws_lambda_function.api.version
   }
 }
 output "environment_variables" { value = aws_lambda_function.api.environment[0].variables }
+output "api" {
+  value = {
+    url         = local.custom_domain ? "https://${var.domain}" : aws_apigatewayv2_api.api.api_endpoint
+    execute_url = aws_apigatewayv2_api.api.api_endpoint
+    domain      = local.custom_domain ? var.domain : null
+    dns_target  = local.custom_domain ? aws_apigatewayv2_domain_name.api[0].domain_name_configuration[0].target_domain_name : null
+    dns_zone_id = local.custom_domain ? aws_apigatewayv2_domain_name.api[0].domain_name_configuration[0].hosted_zone_id : null
+    dns_managed = var.zone_id != ""
+  }
+}
+
+# Optional custom domain: the HTTP API keeps its execute-api URL and also answers on domain.
+resource "aws_apigatewayv2_domain_name" "api" {
+  count       = local.custom_domain ? 1 : 0
+  domain_name = var.domain
+  domain_name_configuration {
+    certificate_arn = var.certificate_arn
+    endpoint_type   = "REGIONAL"
+    security_policy = "TLS_1_2"
+  }
+}
+resource "aws_apigatewayv2_api_mapping" "api" {
+  count       = local.custom_domain ? 1 : 0
+  api_id      = aws_apigatewayv2_api.api.id
+  domain_name = aws_apigatewayv2_domain_name.api[0].id
+  stage       = aws_apigatewayv2_stage.live.id
+}
+resource "aws_route53_record" "api" {
+  count   = var.zone_id == "" ? 0 : 1
+  zone_id = var.zone_id
+  name    = var.domain
+  type    = "A"
+  alias {
+    name                   = aws_apigatewayv2_domain_name.api[0].domain_name_configuration[0].target_domain_name
+    zone_id                = aws_apigatewayv2_domain_name.api[0].domain_name_configuration[0].hosted_zone_id
+    evaluate_target_health = false
+  }
+}
 
 
 resource "aws_secretsmanager_secret" "admin_password" {
   name                    = "${local.name}/admin-password"
-  recovery_window_in_days = 30
-  lifecycle { prevent_destroy = true }
+  recovery_window_in_days = local.secret_recovery_days
 }
 
 # Values are provisioned separately, never written to Terraform state.
 resource "aws_secretsmanager_secret" "stripe" {
   count                   = var.stripe_enabled ? 1 : 0
   name                    = "${local.name}/stripe"
-  recovery_window_in_days = 30
-  lifecycle { prevent_destroy = true }
+  recovery_window_in_days = local.secret_recovery_days
 }
 resource "aws_cloudwatch_event_rule" "subscriptions" {
   name                = "${local.name}-subscriptions"

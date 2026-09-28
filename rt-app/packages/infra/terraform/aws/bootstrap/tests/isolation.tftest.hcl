@@ -84,3 +84,64 @@ run "operator_and_gitlab_scope" {
     error_message = "GitLab must reuse the provider and pin production to main."
   }
 }
+run "custom_domains_without_route53_by_default" {
+  command = plan
+  override_resource {
+    target          = aws_s3_bucket.state
+    values          = { arn = "arn:aws:s3:::rt-app-test-123456789012-tfstate" }
+    override_during = plan
+  }
+  override_resource {
+    target          = aws_iam_policy.runtime_boundary
+    values          = { arn = "arn:aws:iam::123456789012:policy/rt-app-test-runtime-boundary" }
+    override_during = plan
+  }
+  override_resource {
+    target          = aws_iam_policy.amplify_boundary
+    values          = { arn = "arn:aws:iam::123456789012:policy/rt-app-test-amplify-boundary" }
+    override_during = plan
+  }
+  variables {
+    region            = "us-east-1"
+    app               = "rt-app-test"
+    repository        = "example/project"
+    oidc_provider_arn = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+  }
+  assert {
+    condition     = length([for statement in jsondecode(aws_iam_role_policy.deploy["prod"].policy).Statement : statement if contains(statement.Action, "route53:ChangeResourceRecordSets")]) == 0
+    error_message = "Deploy roles get no Route53 access unless zones are listed."
+  }
+  assert {
+    condition     = length([for statement in jsondecode(aws_iam_role_policy.deploy["prod"].policy).Statement : statement if contains(statement.Action, "amplify:CreateDomainAssociation")]) == 1
+    error_message = "Deploy roles can associate SSR domains."
+  }
+}
+run "route53_access_is_scoped_to_listed_zones" {
+  command = plan
+  override_resource {
+    target          = aws_s3_bucket.state
+    values          = { arn = "arn:aws:s3:::rt-app-test-123456789012-tfstate" }
+    override_during = plan
+  }
+  override_resource {
+    target          = aws_iam_policy.runtime_boundary
+    values          = { arn = "arn:aws:iam::123456789012:policy/rt-app-test-runtime-boundary" }
+    override_during = plan
+  }
+  override_resource {
+    target          = aws_iam_policy.amplify_boundary
+    values          = { arn = "arn:aws:iam::123456789012:policy/rt-app-test-amplify-boundary" }
+    override_during = plan
+  }
+  variables {
+    region            = "us-east-1"
+    app               = "rt-app-test"
+    repository        = "example/project"
+    route53_zone_ids  = ["Z123ABC"]
+    oidc_provider_arn = "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+  }
+  assert {
+    condition     = one([for statement in jsondecode(aws_iam_role_policy.deploy["prod"].policy).Statement : statement.Resource if contains(statement.Action, "route53:ChangeResourceRecordSets")]) == ["arn:aws:route53:::hostedzone/Z123ABC"]
+    error_message = "Route53 writes must be limited to the listed zones."
+  }
+}

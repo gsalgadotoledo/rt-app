@@ -57,6 +57,13 @@ Upgrading the framework becomes `npm update`, with no merges of copied code. An 
 - Files role outside AWS: S3-compatible stores (Cloudflare R2, DigitalOcean Spaces) through the same adapter.
 - Public database URLs when the API and the database run on different providers (Railway Public Access).
 
+## 0.3.0: destroyable environments, custom domains, test users
+
+- **Environments on demand.** Every AWS module takes `protect` (default `true`) instead of `prevent_destroy`: DynamoDB and Cognito deletion protection, site buckets kept, 30-day secret recovery and a destroy guard. `destroy.yml` destroys one environment, prod included, after a typed confirmation (apply `protect = false`, then destroy); `deploy.yml` can be dispatched to recreate it. See terraform.md → AWS environments.
+- **Custom domains (optional).** CloudFront sites (`domain`, `certificate_arn` in us-east-1, `zone_id`), the API Gateway HTTP API (regional certificate) and Amplify SSR (`domain`, `domain_prefix`); per environment in `infra/aws/environments/<environment>.json`.
+- **Test users.** `data.testUser` on users, set by admins, `?testUser=` filter, admin badge and toggle, `testUserIds` for reports, in TypeScript, Python and Go (`docs/polyglot/users-test-flag.md`).
+- Still open: a live AWS run of destroy/recreate and of each custom domain path (Amplify's automatic Route53 records in particular); a GitLab destroy job; a Service Manager "Destroy" button; excluding test users inside the subscriptions economics/usage reports (today apps filter with `testUserIds`).
+
 ## Pending: refresh sessions (0.3.0)
 
 Sessions with refresh tokens ship in 0.3.0 in TypeScript, Python and Go (`docs/polyglot/auth-sessions.md`). Still open:

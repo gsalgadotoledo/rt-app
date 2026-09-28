@@ -55,7 +55,8 @@ Amplify gets no database credentials: SSR consumes the existing API.
 
 The generated `https://main.<app-id>.amplifyapp.com` URL works without buying a domain
 or creating Route 53 records. `develop` and `stage` use their own apps, branches and API
-URLs when multi-environment is enabled. A custom domain/Route 53 can be added later.
+URLs when multi-environment is enabled. Custom domains (`ssr_domain`, optional Route 53 zone)
+are described in terraform.md → Custom domains.
 
 AWS keys alone cannot authorize GitHub. For the first SSR publication:
 

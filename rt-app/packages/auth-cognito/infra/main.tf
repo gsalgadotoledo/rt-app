@@ -6,12 +6,17 @@ terraform {
 variable "name" { type = string }
 variable "region" { type = string }
 variable "mail_from" { type = string }
+variable "protect" {
+  description = "Cognito deletion protection (ACTIVE when true). Apply protect = false before terraform destroy; the pool and its users are then deleted."
+  type        = bool
+  default     = true
+}
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 resource "aws_cognito_user_pool" "application" {
   name                     = var.name
   user_pool_tier           = "ESSENTIALS"
-  deletion_protection      = "ACTIVE"
+  deletion_protection      = var.protect ? "ACTIVE" : "INACTIVE"
   alias_attributes         = ["email"]
   auto_verified_attributes = ["email"]
   username_configuration { case_sensitive = false }
@@ -38,7 +43,6 @@ resource "aws_cognito_user_pool" "application" {
     source_arn            = "arn:${data.aws_partition.current.partition}:ses:${var.region}:${data.aws_caller_identity.current.account_id}:identity/${var.mail_from}"
   }
   tags = { Application = var.name }
-  lifecycle { prevent_destroy = true }
 }
 resource "aws_cognito_user_pool_client" "application" {
   name                          = "${var.name}-application"
