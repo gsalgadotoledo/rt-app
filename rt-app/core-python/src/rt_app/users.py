@@ -46,7 +46,7 @@ ADMIN = {
     "resource": "users.list",
     "path": "/users",
     "component": "users",
-    "fields": ["id", "email", "name", "role", "active", "banned"],
+    "fields": ["id", "email", "name", "role", "active", "banned", "testUser"],
     "actions": ["list", "create", "edit", "delete", "permissions"],
     "group": "authentication",
 }
@@ -159,9 +159,52 @@ def active_ban(data: Mapping[str, Any] | None, now_ms: float) -> dict[str, Any] 
 
 
 def view_account(data: Mapping[str, Any], now_ms: float) -> dict[str, Any]:
-    """The admin view of an account (GET /users, GET /users/:id): view_user + banned + the ban in force."""
+    """The admin view of an account (GET /users, GET /users/:id, PATCH /users/:id): view_user +
+    banned + the ban in force + testUser."""
     ban = active_ban(data, now_ms)
-    return {**view_user(data), "banned": ban is not None, "ban": ban}
+    return {**view_user(data), "banned": ban is not None, "ban": ban, "testUser": is_test_user(data)}
+
+
+# Test users as stored on the USERS row ------------------------------------------------------------
+# ``data.testUser``: only the boolean True marks a test user. A label for reports and filters; it
+# never changes sign-in, bans, permissions or credits. See docs/polyglot/users-test-flag.md.
+
+TEST_USER_FIELD_MESSAGE = "Invalid field: testUser"
+
+
+def is_test_user(data: Mapping[str, Any] | None) -> bool:
+    """Whether a user row (its data) is marked as a test user (``testUser is True``)."""
+    return isinstance(data, Mapping) and data.get("testUser") is True
+
+
+def test_user_input(value: object) -> bool | None:
+    """None means "not given"; a bool is returned; anything else is 400 "Invalid field: testUser"."""
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise HttpError(400, TEST_USER_FIELD_MESSAGE)
+    return value
+
+
+def test_user_filter(value: object) -> None:
+    """``?testUser=`` must be absent, "", "true" or "false"; else 400 "Invalid testUser filter"."""
+    if value is not None and value not in ("", "true", "false"):
+        raise HttpError(400, "Invalid testUser filter")
+
+
+def test_user_ids(store: NoSQL) -> set[str]:
+    """Ids of every USERS row marked as a test user (deleted ones included), for reports that must
+    exclude them (revenue, usage, economics). Reads the partition page by page."""
+    ids: set[str] = set()
+    cursor = None
+    while True:
+        page = store.list("USERS", cursor)
+        for row in page["items"]:
+            if is_test_user(row["data"]) and isinstance(row["data"].get("id"), str):
+                ids.add(row["data"]["id"])
+        cursor = page.get("cursor")
+        if not cursor:
+            return ids
 
 
 class CredentialProvider(Protocol):
@@ -201,9 +244,13 @@ class Users:
         """Create the first account as owner; 409 once any user row exists (even a deleted one)."""
         if self.store.list("USERS")["items"]:
             raise HttpError(409, "The application already has users")
-        return self._insert(input, "owner", bootstrap=True)
+        # The first owner is never a test user: the flag is set by administrators only.
+        owner = {k: v for k, v in input.items() if k != "testUser"} if isinstance(input, Mapping) else input
+        return self._insert(owner, "owner", bootstrap=True)
 
     def create(self, input: Mapping[str, Any], role: Role | None = None, actor: str | None = None) -> Row:
+        """Create an account from ``{email, name, password, testUser?}``; testUser is stored only
+        when True. Callers are administrators (POST /users, seeds)."""
         return self._insert(input, role or "user", bootstrap=False, actor=actor)
 
     def _insert(self, input: Mapping[str, Any], role: str, *, bootstrap: bool, actor: str | None = None) -> Row:
@@ -211,6 +258,7 @@ class Users:
         email = email_address(input.get("email"))
         name = text(input.get("name"), "name")
         password = validate_password(input.get("password"))
+        test_user = test_user_input(input.get("testUser"))
         credentials = self.credentials
         # Reserve the local identity before calling a remote provider. A partial account is
         # inactive and can be retried by the administrator using the same email.
@@ -232,6 +280,7 @@ class Users:
             **({"credentialProvider": credentials.id, "provisioning": True} if credentials else {}),
             "role": role,
             "grants": [],
+            **({"testUser": True} if test_user else {}),
             "active": not credentials,
             "tokenVersion": 1,
             **audit_create(actor if actor is not None else id, self._at()),
@@ -262,6 +311,28 @@ class Users:
         self.store.transact([{"row": {**row, "version": row["version"] + 1, "data": data}, "expected": row["version"]}])
         return view_user(data)
 
+    def update(self, id: str, input: Mapping[str, Any], actor: str) -> dict[str, Any]:
+        """Administrator edit (PATCH /users/:id) of ``{name?, testUser?}``; returns the admin view.
+
+        404 first; other keys 400; name validated when not None or when testUser is None; then
+        testUser. tokenVersion and the ban are kept.
+        """
+        row = self.get(id)
+        if not row or row["data"].get("deletedAt"):
+            raise HttpError(404, "User not found")
+        body = input if isinstance(input, Mapping) else {}
+        if any(key not in ("name", "testUser") for key in body):
+            raise HttpError(400, "Only name and testUser can be edited; email requires verification")
+        patch: dict[str, Any] = {}
+        if body.get("name") is not None or body.get("testUser") is None:
+            patch["name"] = text(body.get("name"), "name")
+        test_user = test_user_input(body.get("testUser"))
+        if test_user is not None:
+            patch["testUser"] = test_user
+        data = {**row["data"], **patch, **audit_update(actor, self._at())}
+        self.store.transact([{"row": {**row, "version": row["version"] + 1, "data": data}, "expected": row["version"]}])
+        return self.view(data)
+
     # HTTP -------------------------------------------------------------------------------------
 
     def _existing(self, id: str) -> Row:
@@ -277,7 +348,7 @@ class Users:
         row = self.get(c.params["id"])
         if row and row["data"].get("role") == "owner" and c.actor["role"] != "owner":  # type: ignore[index]
             raise HttpError(403, "Owner role required")
-        return self.profile(c.params["id"], c.request.body, c.actor["id"])  # type: ignore[index]
+        return self.update(c.params["id"], c.request.body, c.actor["id"])  # type: ignore[index]
 
     def _restore(self, c: Context) -> dict[str, Any]:
         row = self.get(c.params["id"])
@@ -311,20 +382,22 @@ class Users:
 
     def feature(self) -> Feature:
         """``/users/me`` for every signed-in user; list/create/read/edit/restore/delete by permission."""
-        fields = ["id", "email", "name", "role", "active", "banned"]
+        fields = ["id", "email", "name", "role", "active", "banned", "testUser"]
+
+        def search(c: Context) -> Any:
+            test_user_filter(c.request.query.get("testUser"))
+            return search_page(self.store, "USERS", c.request.query, fields, lambda row: self.view(row["data"]))
+
         return Feature(
             id="users",
             admin=ADMIN,
             endpoints=[
                 Endpoint("GET", "/users/me", "users.me.read", "authenticated", lambda c: view_user(c.actor)),  # type: ignore[arg-type]
                 Endpoint("PATCH", "/users/me", "users.me.edit", "authenticated", lambda c: self.profile(c.actor["id"], c.request.body)),  # type: ignore[index]
-                Endpoint(
-                    "GET", "/users", "users.list", "permission",
-                    lambda c: search_page(self.store, "USERS", c.request.query, fields, lambda row: self.view(row["data"])),
-                ),
+                Endpoint("GET", "/users", "users.list", "permission", search),
                 Endpoint(
                     "POST", "/users", "users.create", "permission",
-                    lambda c: view_user(self.create(c.request.body, "user", c.actor["id"])["data"]),  # type: ignore[index]
+                    lambda c: self.view(self.create(c.request.body, "user", c.actor["id"])["data"]),  # type: ignore[index]
                 ),
                 Endpoint("GET", "/users/:id", "users.read", "permission", self._read),
                 Endpoint("PATCH", "/users/:id", "users.edit", "permission", self._edit),
@@ -340,6 +413,10 @@ __all__ = [
     "active_ban",
     "parse_instant",
     "view_account",
+    "is_test_user",
+    "test_user_input",
+    "test_user_filter",
+    "test_user_ids",
     "Users",
     "CredentialProvider",
     "Role",

@@ -2,8 +2,10 @@ import type { NoSQL as Store } from "@gsalgadotoledo/rt-app-nosql";
 import { migrations } from "./migrations.js";
 import { seeds, DEMO_USERS } from "./seeds.js";
 import { viewAccount } from "./suspension.js";
+import { testUserInput, testUserFilter } from "./test-users.js";
 export { DEMO_USERS };
 export * from "./suspension.js";
+export * from "./test-users.js";
 import admin from "./admin.json" with { type: "json" };
 import {
   randomUUID,
@@ -96,8 +98,16 @@ export class Users {
   async bootstrapOwner(input: Data) {
     if ((await this.store.list("USERS")).items.length)
       throw new HttpError(409, "The application already has users");
-    return this.insert(input, "owner", true);
+    // The first owner is never a test user: the flag is set by administrators only.
+    const { testUser: _ignored, ...owner } = input ?? {};
+    return this.insert(owner, "owner", true);
   }
+
+  /**
+   * Create an account. input {email, name, password, testUser?}; testUser (boolean, default
+   * false) marks a test account and is stored only when true. Callers are administrators
+   * (POST /users, seeds); public sign-up flows must not forward it.
+   */
   async create(input: Data, role: "owner" | "admin" | "user" = "user", actor: string | null = null) {
     return this.insert(input, role, false, actor);
   }
@@ -109,6 +119,7 @@ export class Users {
   ) {
     const email = emailAddress(input.email), name = text(input.name, "name");
     validatePassword(input.password);
+    const testUser = testUserInput(input.testUser);
     // Reserve the local identity before calling a remote provider. A partial account
     // is inactive and can be retried by the administrator using the same email.
     if (this.credentials) {
@@ -133,6 +144,7 @@ export class Users {
         ...(this.credentials ? {credentialProvider:this.credentials.id, provisioning:true} : {}),
         role,
         grants: [],
+        ...(testUser ? { testUser: true } : {}),
         active: !this.credentials,
         tokenVersion: 1,
         ...auditCreate(actor ?? id, this.at()),
@@ -183,6 +195,33 @@ export class Users {
     await this.store.transact([{ row: next, expected: row.version }]);
     return viewUser(next.data);
   }
+
+  /**
+   * Administrator edit of an account (PATCH /users/:id): input {name?, testUser?}, at least one.
+   * Returns the admin view. 404 "User not found" for a missing or deleted user (checked first);
+   * other keys are 400 "Only name and testUser can be edited; email requires verification";
+   * name follows the profile rule, testUser must be a boolean ("Invalid field: testUser").
+   * Bans, sessions (tokenVersion) and credits are untouched.
+   */
+  async update(id: string, input: Data, actor: string) {
+    const row = await this.get(id);
+    if (!row || row.data.deletedAt) throw new HttpError(404, "User not found");
+    const body = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+    if (Object.keys(body).some((k) => k !== "name" && k !== "testUser"))
+      throw new HttpError(400, "Only name and testUser can be edited; email requires verification");
+    const patch: Data = {};
+    if (body.name != null || body.testUser == null) patch.name = text(body.name, "name");
+    const testUser = testUserInput(body.testUser);
+    if (testUser !== undefined) patch.testUser = testUser;
+    const next = {
+      ...row,
+      version: row.version + 1,
+      data: { ...row.data, ...patch, ...auditUpdate(actor, this.at()) },
+    };
+    await this.store.transact([{ row: next, expected: row.version }]);
+    return this.view(next.data);
+  }
+
   feature(): Feature {
     return {
       id: "users",
@@ -210,11 +249,12 @@ export class Users {
           resource: "users.list",
           access: "permission",
           handle: async (c) => {
+            testUserFilter(c.request.query?.testUser);
             return searchPage(
               this.store,
               "USERS",
               c.request.query,
-              ["id", "email", "name", "role", "active", "banned"],
+              ["id", "email", "name", "role", "active", "banned", "testUser"],
               (row) => this.view(row.data),
             );
           },
@@ -225,7 +265,7 @@ export class Users {
           resource: "users.create",
           access: "permission",
           handle: async (c) =>
-            viewUser((await this.create(c.request.body, "user", c.actor!.id)).data),
+            this.view((await this.create(c.request.body, "user", c.actor!.id)).data),
         },
         {
           method: "GET",
@@ -247,7 +287,7 @@ export class Users {
             const row = await this.get(c.params.id);
             if (row?.data.role === "owner" && c.actor!.role !== "owner")
               throw new HttpError(403, "Owner role required");
-            return this.profile(c.params.id, c.request.body, c.actor!.id);
+            return this.update(c.params.id, c.request.body, c.actor!.id);
           },
         },
         {

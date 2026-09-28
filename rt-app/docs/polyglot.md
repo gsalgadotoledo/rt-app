@@ -125,10 +125,10 @@ No dependency-injection framework is needed:
 ## Status
 
 - **Contracts:** every file in `spec/contracts` (nosql on memory, PostgreSQL and DynamoDB, the
-  identity modules including refresh sessions, service keys and account bans, subscriptions,
+  identity modules including refresh sessions, service keys, account bans and test users, subscriptions,
   observer, cache, queue, tasks and the other modules, plus their `*-api` HTTP contracts). Run them
-  with `npm run contracts:stores`: node, python and go pass all 1216 cases; the Lambda targets pass
-  the 79 HTTP API cases (September 2026).
+  with `npm run contracts:stores`: node, python and go pass all 1226 cases; the Lambda targets pass
+  the 82 HTTP API cases (September 2026).
 - **Ports:** Python `rt_app` and Go `rt.local/core-go` implement every contracted module. Each has
   server, Lambda (plus a local bridge) and CLI modes, and can fall back to the Node core.
 - **Generator:** `npm create @gsalgadotoledo/rt-app` with the Python or Go backend produces a
@@ -208,6 +208,11 @@ Refresh sessions (rotating refresh tokens, `SESSIONS#<userId>` rows, `/auth/refr
 Account bans (an extension of users: `data.ban` on the user row, the sign-in gate, `USER_BANS#`
 history, `/users/:id/ban|unban|bans`): `docs/polyglot/users-bans.md` and
 `spec/contracts/users-bans*.contract.yaml`.
+
+Test users (`data.testUser` on the user row, set by administrators on create and
+`PATCH /users/:id`, the admin view field, the `?testUser=` filter and `testUserIds` for reports):
+`docs/polyglot/users-test-flag.md`, `spec/contracts/users.contract.yaml` (tag `test-users`) and
+`users-test-flag-api.contract.yaml`.
 
 Service keys (scoped backend credentials, `access: "service"` endpoints under `/service/`):
 `docs/polyglot/service-keys.md` and `spec/contracts/service-keys.contract.yaml`,

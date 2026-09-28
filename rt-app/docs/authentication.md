@@ -123,6 +123,33 @@ With Cognito, RT-App enforces the ban on its own sessions; the Cognito user itse
 (RT-App never issues a session to a banned account). Formats and algorithms:
 `docs/polyglot/users-bans.md`.
 
+## Test users
+
+Mark QA, demo and internal accounts as **test users** so reports can leave them out. The flag is a
+label only: sign-in, sessions, bans, permissions and credits work exactly as for any other account.
+
+- **Where:** `USERS/<id>.data.testUser`; only the boolean `true` marks a test user (a missing field
+  is a real customer). The admin user view (`GET /users`, `GET /users/:id`, `POST /users`,
+  `PATCH /users/:id`, ban and unban) returns `testUser: true|false`.
+- **Who sets it:** administrators only, with the existing permissions: `POST /users`
+  `{email, name, password, testUser?}` (`users.create`) and `PATCH /users/:id` `{name?, testUser?}`
+  (`users.edit`; an owner account still needs an owner). `PATCH /users/me` keeps accepting only
+  `name`, so a user cannot mark or unmark itself (400). The first owner (`bootstrapOwner`) is never
+  a test user. Invalid values are 400 `Invalid field: testUser`.
+- **Filter:** `GET /users?testUser=true|false` (other values: 400 `Invalid testUser filter`). Admin →
+  Users shows a **Test · Prueba** badge and a filter; the record's Edit tab has the *Test user*
+  toggle (also on Create user).
+- **Seeds:** the demo customers of `users:demo-identities` (`ana@example.test`, `leo@example.test`)
+  are test users; the demo owner is not. App seeds pass `testUser: true` to `users.create(...)`.
+- **Reports:** `testUserIds(store)` (TypeScript, from `@gsalgadotoledo/rt-app-users`; Python
+  `rt_app.users.test_user_ids`, Go `users.TestUserIDs`) returns the ids of every test user, deleted
+  ones included. Use it to exclude them from revenue, usage or economics, for example
+  `const skip = await testUserIds(store); economics.users.filter((u) => !skip.has(u.userId))`.
+  The subscriptions reports themselves (`/subscriptions/admin/economics`, usage) still include every
+  account: recompute totals from the filtered rows when test traffic matters.
+
+Formats and rules for every language: `docs/polyglot/users-test-flag.md`.
+
 ## Service keys (backend credentials)
 
 A backend that meters credits for users (an agent server) must not hold `ADMIN_PASSWORD`: the

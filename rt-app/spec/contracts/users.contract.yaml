@@ -37,6 +37,25 @@ description: |
   row(pk, sk) → raw stored row|null.
   profile view = {id, email, name, role, grants, active, createdAt, createdBy, updatedAt, updatedBy,
   deletedAt, deletedBy, restoredAt, restoredBy} (never passwordHash or tokenVersion).
+
+  Test users (docs/polyglot/users-test-flag.md): USERS/<id>.data.testUser; only the boolean true
+  marks a test user (missing, false or any other stored value is a real user).
+    create: input.testUser optional; undefined/null = not given; otherwise a boolean or 400
+      "Invalid field: testUser", checked after the password. Stored as testUser: true only when
+      true (nothing is stored for false). bootstrapOwner ignores input.testUser (never validated).
+    update(id, input, actor) (PATCH /users/:id, administrators): 404 "User not found" for a
+      missing or deleted user first; keys other than name/testUser → 400 "Only name and testUser
+      can be edited; email requires verification"; name (the create rule) is validated when it is
+      not null, or when testUser is null/missing (so {} → "Invalid field: name"); then testUser
+      (boolean or "Invalid field: testUser"; null = not given). Writes version + 1, the given
+      fields (testUser stored as true or false) and updatedAt/updatedBy; tokenVersion and ban are
+      kept. Returns the admin view.
+    profile (PATCH /users/me) still accepts only name: a user cannot set its own flag.
+  Admin view (view(id) = GET /users/:id, list(query) = GET /users, update, POST /users) = the
+  profile view + {banned, ban, testUser (boolean)}. list validates ?testUser first: "", "true",
+  "false" or 400 "Invalid testUser filter"; it filters on the view's testUser like the other
+  fields. isTestUser(data) → boolean; testUserIds() → the sorted ids of every USERS row marked as a
+  test user, deleted ones included.
 subject: users
 init: { rows: [], now: "2026-01-02T03:04:05.000Z" }
 cases:
@@ -290,3 +309,102 @@ cases:
       - { call: profile, args: [ missing, { name: A } ], expect: { error: { status: 404, message: User not found } } }
       - { call: profile, args: [ u-old, { name: A } ], expect: { error: { status: 404, message: User not found } } }
       - { call: profile, args: [ missing, { email: x } ], expect: { error: { status: 404, message: User not found } }, note: existence is checked first }
+
+  # --- test users ----------------------------------------------------------------------------
+  - name: create stores testUser only when true
+    tags: [test-users]
+    steps:
+      - call: create
+        args: [ { email: qa@example.test, name: QA, password: correct horse battery, testUser: true } ]
+        expect: { value: { $partial: { version: 1, data: { $partial: { role: user, testUser: true, active: true, tokenVersion: 1 } } } } }
+      - call: create
+        args: [ { email: real@example.test, name: Real, password: correct horse battery, testUser: false } ]
+        expect: { value: { $partial: { data: { $partial: { email: real@example.test, testUser: null } } } } }
+        note: false is not stored
+      - call: create
+        args: [ { email: none@example.test, name: None, password: correct horse battery, testUser: null } ]
+        expect: { value: { $partial: { data: { $partial: { testUser: null } } } } }
+      - { call: view, args: [ { $ref: "0.value.sk" } ], expect: { value: { $partial: { id: { $ref: "0.value.sk" }, testUser: true, banned: false, ban: null } } } }
+      - { call: view, args: [ { $ref: "1.value.sk" } ], expect: { value: { $partial: { testUser: false } } } }
+
+  - name: create validates testUser after the password and stores nothing
+    tags: [test-users, validation]
+    steps:
+      - { call: create, args: [ { email: qa@example.test, name: QA, password: correct horse battery, testUser: "true" } ], expect: { error: { status: 400, message: "Invalid field: testUser" } } }
+      - { call: create, args: [ { email: qa@example.test, name: QA, password: correct horse battery, testUser: 1 } ], expect: { error: { status: 400, message: "Invalid field: testUser" } } }
+      - { call: create, args: [ { email: qa@example.test, name: QA, password: correct horse battery, testUser: [] } ], expect: { error: { status: 400, message: "Invalid field: testUser" } } }
+      - { call: create, args: [ { email: qa@example.test, name: QA, password: short, testUser: "yes" } ], expect: { error: { status: 400, message: The password must contain 12 to 128 characters } } }
+      - { call: create, args: [ { email: bad, name: QA, password: correct horse battery, testUser: "yes" } ], expect: { error: { status: 400, message: Invalid email } } }
+      - { call: byEmail, args: [ qa@example.test ], expect: { value: null } }
+
+  - name: the first owner is never a test user
+    tags: [test-users]
+    steps:
+      - call: bootstrapOwner
+        args: [ { email: owner@example.test, name: Owner, password: correct horse battery, testUser: "not even checked" } ]
+        expect: { value: { $partial: { data: { $partial: { role: owner, testUser: null } } } } }
+
+  - name: update toggles testUser and keeps sessions and bans
+    tags: [test-users]
+    init: &testUsers
+      now: "2026-01-02T03:04:05.000Z"
+      rows:
+        - { pk: USERS, sk: u-alice, version: 1, data: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, tokenVersion: 3, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-01T00:00:00.000Z", updatedBy: u-alice, deletedAt: null, deletedBy: null, ban: { reason: Spam, category: null, until: null, at: "2026-01-01T00:00:00.000Z", by: rt-app-root } } }
+        - { pk: USERS, sk: u-bob, version: 1, data: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, tokenVersion: 1, testUser: true } }
+        - { pk: USERS, sk: u-carl, version: 1, data: { id: u-carl, email: carl@example.test, name: Carl, role: user, grants: [], active: true, tokenVersion: 1, testUser: "yes" } }
+        - { pk: USERS, sk: u-dora, version: 2, data: { id: u-dora, email: dora@example.test, name: Dora, role: user, grants: [], active: false, tokenVersion: 2, testUser: true, deletedAt: "2026-01-01T12:00:00.000Z", deletedBy: rt-app-root } }
+    steps:
+      - call: update
+        args: [ u-alice, { testUser: true }, admin-1 ]
+        expect:
+          value: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: admin-1, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null, banned: true, ban: { reason: Spam, category: null, until: null, at: "2026-01-01T00:00:00.000Z", by: rt-app-root }, testUser: true }
+      - call: row
+        args: [ USERS, u-alice ]
+        expect: { value: { $partial: { version: 2, data: { $partial: { name: Alice, testUser: true, tokenVersion: 3, ban: { $partial: { reason: Spam } } } } } } }
+      - { call: update, args: [ u-alice, { name: "  Ali " }, admin-1 ], expect: { value: { $partial: { name: Ali, testUser: true } } }, note: a name edit keeps the flag }
+      - { call: update, args: [ u-alice, { name: null, testUser: false }, admin-1 ], expect: { value: { $partial: { name: Ali, testUser: false } } }, note: a null name is not given }
+      - { call: row, args: [ USERS, u-alice ], expect: { value: { $partial: { version: 4, data: { $partial: { testUser: false, tokenVersion: 3 } } } } }, note: false is stored explicitly by update }
+      - { call: update, args: [ u-bob, { name: Robert, testUser: false }, admin-1 ], expect: { value: { $partial: { name: Robert, testUser: false, banned: false } } } }
+
+  - name: update validation, in order
+    tags: [test-users, validation]
+    init: *testUsers
+    steps:
+      - { call: update, args: [ missing, { email: x }, admin-1 ], expect: { error: { status: 404, message: User not found } } }
+      - { call: update, args: [ u-dora, { testUser: false }, admin-1 ], expect: { error: { status: 404, message: User not found } }, note: deleted }
+      - { call: update, args: [ u-bob, { email: x@example.test }, admin-1 ], expect: { error: { status: 400, message: "Only name and testUser can be edited; email requires verification" } } }
+      - { call: update, args: [ u-bob, { role: owner, testUser: true }, admin-1 ], expect: { error: { status: 400, message: "Only name and testUser can be edited; email requires verification" } } }
+      - { call: update, args: [ u-bob, {}, admin-1 ], expect: { error: { status: 400, message: "Invalid field: name" } } }
+      - { call: update, args: [ u-bob, { testUser: null }, admin-1 ], expect: { error: { status: 400, message: "Invalid field: name" } } }
+      - { call: update, args: [ u-bob, { name: "   ", testUser: "yes" }, admin-1 ], expect: { error: { status: 400, message: "Invalid field: name" } } }
+      - { call: update, args: [ u-bob, { testUser: "false" }, admin-1 ], expect: { error: { status: 400, message: "Invalid field: testUser" } } }
+      - { call: update, args: [ u-bob, { name: Bobby, testUser: 0 }, admin-1 ], expect: { error: { status: 400, message: "Invalid field: testUser" } } }
+      - { call: row, args: [ USERS, u-bob ], expect: { value: { $partial: { version: 1, data: { $partial: { name: Bob, testUser: true } } } } }, note: nothing changed }
+      - { call: profile, args: [ u-bob, { testUser: false } ], expect: { error: { status: 400, message: "Only name can be edited; email requires verification" } }, note: users cannot change their own flag }
+
+  - name: the admin views show testUser and the list filters on it
+    tags: [test-users]
+    init: *testUsers
+    steps:
+      - { call: view, args: [ u-bob ], expect: { value: { $partial: { id: u-bob, testUser: true, banned: false } } } }
+      - { call: view, args: [ u-carl ], expect: { value: { $partial: { id: u-carl, testUser: false } } }, note: only the boolean true marks a test user }
+      - { call: view, args: [ u-dora ], expect: { error: { status: 404, message: User not found } } }
+      - { call: list, args: [ {} ], expect: { value: { items: [ { $partial: { id: u-alice, testUser: false } }, { $partial: { id: u-bob, testUser: true } }, { $partial: { id: u-carl, testUser: false } } ] } } }
+      - { call: list, args: [ { testUser: "true" } ], expect: { value: { items: [ { $partial: { id: u-bob } } ] } } }
+      - { call: list, args: [ { testUser: "false" } ], expect: { value: { items: [ { $partial: { id: u-alice } }, { $partial: { id: u-carl } } ] } } }
+      - { call: list, args: [ { testUser: "" } ], expect: { value: { items: { $length: 3 } } } }
+      - { call: list, args: [ { testUser: "true", trash: "true" } ], expect: { value: { items: [ { $partial: { id: u-dora, testUser: true } } ] } } }
+      - { call: list, args: [ { testUser: "false", banned: "true" } ], expect: { value: { items: [ { $partial: { id: u-alice } } ] } } }
+      - { call: list, args: [ { testUser: "yes" } ], expect: { error: { status: 400, message: Invalid testUser filter } } }
+      - { call: list, args: [ { testUser: "TRUE" } ], expect: { error: { status: 400, message: Invalid testUser filter } } }
+      - { call: list, args: [ { testUser: "yes", nope: x } ], expect: { error: { status: 400, message: Invalid testUser filter } }, note: checked before the other filters }
+
+  - name: helpers to exclude test users from reports
+    tags: [test-users]
+    init: *testUsers
+    steps:
+      - { call: testUserIds, args: [], expect: { value: [ u-bob, u-dora ] }, note: deleted test users are included }
+      - { call: isTestUser, args: [ { testUser: true } ], expect: { value: true } }
+      - { call: isTestUser, args: [ { testUser: "true" } ], expect: { value: false } }
+      - { call: isTestUser, args: [ {} ], expect: { value: false } }
+      - { call: isTestUser, args: [ null ], expect: { value: false } }

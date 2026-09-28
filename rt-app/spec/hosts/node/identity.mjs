@@ -1,7 +1,7 @@
 // Subjects: jwt, users, acl, auth (identity modules). Each subject is a small facade so every
 // language exposes the same surface; helpers are documented in the contracts and docs/polyglot.md.
 import { JwtTokens } from "@gsalgadotoledo/rt-app-jwt";
-import { Users, validatePassword, hashPassword, verifyPassword } from "@gsalgadotoledo/rt-app-users";
+import { Users, validatePassword, hashPassword, verifyPassword, isTestUser, testUserIds } from "@gsalgadotoledo/rt-app-users";
 import { ACL } from "@gsalgadotoledo/rt-app-acl";
 import { Auth, LocalMailbox } from "@gsalgadotoledo/rt-app-auth";
 import { AuthVault, totpCode } from "@gsalgadotoledo/rt-app-auth/totp";
@@ -39,12 +39,20 @@ export const subjects = {
     const time = clock(init.now);
     const store = await memoryStore(init.rows);
     const users = new Users(store, undefined, { now: time.now });
+    const endpoints = users.feature().endpoints;
+    const endpoint = (method, path) => endpoints.find((e) => e.method === method && e.path === path);
     return {
       get: (id) => users.get(id),
       byEmail: (email) => users.byEmail(email),
       create: (input, role, actor) => users.create(input, opt(role), opt(actor) ?? null),
       bootstrapOwner: (input) => users.bootstrapOwner(input),
       profile: (id, input, actor) => users.profile(id, input, opt(actor)),
+      // Test users (docs/polyglot/users-test-flag.md): admin edit, admin views, filter, helpers.
+      update: (id, input, actor) => users.update(id, input ?? {}, actor),
+      view: (id) => endpoint("GET", "/users/:id").handle({ request: { query: {}, body: {} }, params: { id }, actor: undefined }),
+      list: (query) => endpoint("GET", "/users").handle({ request: { query: query ?? {}, body: {} }, params: {}, actor: undefined }),
+      isTestUser: (data) => isTestUser(opt(data)),
+      testUserIds: async () => [...(await testUserIds(store))].sort(),
       validatePassword: (password) => { validatePassword(password); return null; },
       hashPassword: (password) => hashPassword(password),
       verifyPassword: (password, stored) => verifyPassword(password, stored),

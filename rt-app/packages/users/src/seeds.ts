@@ -1,11 +1,14 @@
 import type { Seed } from "@gsalgadotoledo/rt-app-contracts";
 import type { Users } from "./index.js";
 
-/** Demo identities for local, develop and stage. Never declared for prod. */
+/**
+ * Demo identities for local, develop and stage. Never declared for prod. The demo customers are
+ * test users (`testUser: true`), so reports that exclude test users skip their activity.
+ */
 export const DEMO_USERS = [
-  { email: "owner@example.test", name: "Owner", role: "owner" as const },
-  { email: "ana@example.test", name: "Ana", role: "user" as const },
-  { email: "leo@example.test", name: "Leo", role: "user" as const },
+  { email: "owner@example.test", name: "Owner", role: "owner" as const, testUser: false },
+  { email: "ana@example.test", name: "Ana", role: "user" as const, testUser: true },
+  { email: "leo@example.test", name: "Leo", role: "user" as const, testUser: true },
 ];
 
 /**
@@ -16,7 +19,7 @@ export function seeds(users: Users): Seed[] {
   return [
     {
       id: "users:demo-identities",
-      description: "Demo owner and two users (DEMO_PASSWORD)",
+      description: "Demo owner and two test users (DEMO_PASSWORD)",
       environments: ["local", "develop", "stage"],
       run: async ({ secret, log }) => {
         for (const user of DEMO_USERS) {

@@ -77,10 +77,11 @@ func ActiveBan(data map[string]any, nowMs int64) map[string]any {
 	return map[string]any{"reason": ban["reason"], "category": ban["category"], "until": ban["until"], "at": ban["at"], "by": ban["by"]}
 }
 
-// ViewAccount is the admin view of an account (GET /users, GET /users/:id): ViewUser plus banned
-// and the ban in force (null when none).
+// ViewAccount is the admin view of an account (GET /users, GET /users/:id, PATCH /users/:id):
+// ViewUser plus banned, the ban in force (null when none) and testUser.
 func ViewAccount(data map[string]any, nowMs int64) map[string]any {
 	view := ViewUser(data)
+	view["testUser"] = IsTestUser(data)
 	view["banned"] = false
 	view["ban"] = nil
 	if ban := ActiveBan(data, nowMs); ban != nil {

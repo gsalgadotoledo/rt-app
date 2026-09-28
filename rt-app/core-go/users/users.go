@@ -77,10 +77,18 @@ func (u *Users) BootstrapOwner(ctx context.Context, input map[string]any) (*nosq
 	if len(page.Items) > 0 {
 		return nil, apperr.New(http.StatusConflict, "The application already has users")
 	}
-	return u.insert(ctx, input, RoleOwner, true, "")
+	// The first owner is never a test user: the flag is set by administrators only.
+	owner := make(map[string]any, len(input))
+	for k, v := range input {
+		if k != "testUser" {
+			owner[k] = v
+		}
+	}
+	return u.insert(ctx, owner, RoleOwner, true, "")
 }
 
-// Create validates input {email, name, password} and stores a new active account with role
+// Create validates input {email, name, password, testUser?} (testUser: a boolean, stored only when
+// true; callers are administrators) and stores a new active account with role
 // ("" means RoleUser). actor is recorded as creator; "" means the new user itself. A taken
 // email is 409 "Conflict: refresh and try again".
 func (u *Users) Create(ctx context.Context, input map[string]any, role, actor string) (*nosql.Row, error) {
@@ -103,12 +111,19 @@ func (u *Users) insert(ctx context.Context, input map[string]any, role string, b
 	if err != nil {
 		return nil, err
 	}
+	testUser, _, err := TestUserInput(input["testUser"])
+	if err != nil {
+		return nil, err
+	}
 	id := uuid.New()
 	if actor == "" {
 		actor = id
 	}
 	data := map[string]any{"id": id, "email": email, "name": name, "passwordHash": hash, "role": role,
 		"grants": []any{}, "active": true, "tokenVersion": 1}
+	if testUser {
+		data["testUser"] = true
+	}
 	for k, v := range AuditCreate(actor, u.now()) {
 		data[k] = v
 	}

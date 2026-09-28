@@ -1,4 +1,5 @@
 import { viewUser, type Data } from "@gsalgadotoledo/rt-app-contracts";
+import { isTestUser } from "./test-users.js";
 
 // Account suspension (bans) as stored on the USERS row. The users module owns the row format and
 // this reader, so every sign-in path (auth, in every language) enforces a ban even when the
@@ -78,10 +79,11 @@ export function activeBan(data: Data | undefined, nowMs: number): StoredBan | nu
 }
 
 /**
- * The admin view of an account (GET /users, GET /users/:id): viewUser plus the ban status.
- * `ban` is the ban in force (reason included: only administrators read this view) or null.
+ * The admin view of an account (GET /users, GET /users/:id, PATCH /users/:id): viewUser plus the
+ * ban status and the test-user flag. `ban` is the ban in force (reason included: only
+ * administrators read this view) or null; `testUser` is true only for accounts marked as tests.
  */
 export function viewAccount(data: Data, nowMs: number) {
   const ban = activeBan(data, nowMs);
-  return { ...viewUser(data), banned: ban !== null, ban };
+  return { ...viewUser(data), banned: ban !== null, ban, testUser: isTestUser(data) };
 }

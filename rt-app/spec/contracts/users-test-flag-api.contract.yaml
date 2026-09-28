@@ -1,0 +1,68 @@
+contract: 1
+kind: http
+module: users-test-flag-api
+title: Test users over HTTP (local mode)
+description: |
+  The test-user flag (USERS/<id>.data.testUser, rules in users.contract.yaml and
+  docs/polyglot/users-test-flag.md) as every backend language serves it. Local admin access:
+  /admin/app/* runs as the admin root "rt-app-root"; the plain paths need a signed-in user holding
+  the permission. Each case uses its own email.
+    POST  /users        permission users.create  {email, name, password, testUser?} → admin user view
+    PATCH /users/:id    permission users.edit    {name?, testUser?}               → admin user view
+    GET   /users        permission users.list    ?testUser=true|false (and the other filters)
+    PATCH /users/me     authenticated            {name} only: a user cannot set its own flag
+  The admin user view = the user view + {banned, ban, testUser}. The flag does not change sign-in.
+cases:
+  - name: administrators create and toggle test users; the list filters on the flag
+    tags: [ test-users ]
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: QA Tester, email: test-flag-1@example.test, password: correct horse battery, testUser: true } }
+        expect: { status: 200, body: { $partial: { email: test-flag-1@example.test, testUser: true, banned: false, ban: null, createdBy: rt-app-root } } }
+      - request: { method: GET, path: /admin/app/users, query: { email: test-flag-1@example.test, testUser: "true" } }
+        expect: { status: 200, body: { $partial: { items: [ { $partial: { id: { $ref: "0.body.id" }, testUser: true } } ] } } }
+      - request: { method: GET, path: /admin/app/users, query: { email: test-flag-1@example.test, testUser: "false" } }
+        expect: { status: 200, body: { $partial: { items: [] } } }
+      - request: { method: PATCH, path: "/admin/app/users/{{0.body.id}}", body: { testUser: false } }
+        expect: { status: 200, body: { $partial: { id: { $ref: "0.body.id" }, name: QA Tester, testUser: false, updatedBy: rt-app-root } } }
+      - request: { method: GET, path: "/admin/app/users/{{0.body.id}}" }
+        expect: { status: 200, body: { $partial: { testUser: false } } }
+      - request: { method: PATCH, path: "/admin/app/users/{{0.body.id}}", body: { name: QA Again, testUser: true } }
+        expect: { status: 200, body: { $partial: { name: QA Again, testUser: true } } }
+      - request: { method: POST, path: /auth/login, body: { email: test-flag-1@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { expiresIn: 900 } } }
+        note: test users sign in as usual
+
+  - name: users cannot set their own flag and need the permission for other accounts
+    tags: [ test-users, security ]
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: Plain User, email: test-flag-2@example.test, password: correct horse battery } }
+        expect: { status: 200, body: { $partial: { testUser: false } } }
+      - request: { method: POST, path: /auth/login, body: { email: test-flag-2@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: PATCH, path: /users/me, headers: { authorization: "Bearer {{1.body.token}}" }, body: { testUser: true } }
+        expect: { status: 400, body: { error: "Only name can be edited; email requires verification" } }
+      - request: { method: PATCH, path: "/users/{{0.body.id}}", headers: { authorization: "Bearer {{1.body.token}}" }, body: { testUser: true } }
+        expect: { status: 403, body: { error: You do not have permission to access this resource } }
+      - request: { method: PATCH, path: "/users/{{0.body.id}}", body: { testUser: true } }
+        expect: { status: 401, body: { error: Sign in } }
+      - request: { method: GET, path: "/admin/app/users/{{0.body.id}}" }
+        expect: { status: 200, body: { $partial: { testUser: false } } }
+
+  - name: validation
+    tags: [ test-users, validation ]
+    requests:
+      - request: { method: POST, path: /admin/app/users, body: { name: Bad Flag, email: test-flag-3@example.test, password: correct horse battery, testUser: "yes" } }
+        expect: { status: 400, body: { error: "Invalid field: testUser" } }
+      - request: { method: GET, path: /admin/app/users, query: { email: test-flag-3@example.test } }
+        expect: { status: 200, body: { $partial: { items: [] } } }
+        note: nothing was stored
+      - request: { method: GET, path: /admin/app/users, query: { testUser: maybe } }
+        expect: { status: 400, body: { error: Invalid testUser filter } }
+      - request: { method: POST, path: /admin/app/users, body: { name: Flag Three, email: test-flag-3@example.test, password: correct horse battery } }
+        expect: { status: 200 }
+      - request: { method: PATCH, path: "/admin/app/users/{{3.body.id}}", body: { testUser: 1 } }
+        expect: { status: 400, body: { error: "Invalid field: testUser" } }
+      - request: { method: PATCH, path: "/admin/app/users/{{3.body.id}}", body: { email: other@example.test } }
+        expect: { status: 400, body: { error: "Only name and testUser can be edited; email requires verification" } }
+      - request: { method: PATCH, path: /admin/app/users/nobody, body: { testUser: true } }
+        expect: { status: 404, body: { error: User not found } }

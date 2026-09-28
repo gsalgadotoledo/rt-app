@@ -10,7 +10,8 @@
     "name",
     "role",
     "active",
-    "banned"
+    "banned",
+    "testUser"
   ],
   "actions": [
     "list",

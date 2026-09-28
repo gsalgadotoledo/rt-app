@@ -13,6 +13,7 @@ from typing import Any
 from rt_app.acl import ACL
 from rt_app.auth import Auth, AuthVault, LocalMailbox, totp_code
 from rt_app.jwt import JwtTokens
+from rt_app import users as users_module
 from rt_app.users import Users, hash_password, validate_password, verify_password
 from rt_app.web import Context, Request
 from storage import memory_store, rows_of
@@ -83,9 +84,27 @@ class UsersFacade:
         self._clock = _Clock(init.get("now"))
         self._store = memory_store(rows_of(init))
         self._users = Users(self._store, now=self._clock.now)
+        endpoints = {(e.method, e.path): e for e in self._users.feature().endpoints}
+        self._view, self._list = endpoints[("GET", "/users/:id")], endpoints[("GET", "/users")]
 
     def get(self, id: Any) -> Any:
         return self._users.get(id)
+
+    # Test users (docs/polyglot/users-test-flag.md): admin edit, admin views, filter, helpers.
+    def update(self, id: Any, input: Any, actor: Any = None) -> Any:
+        return self._users.update(id, input or {}, actor)
+
+    def view(self, id: Any) -> Any:
+        return self._view.handle(Context(request=Request(method="GET", path="/users/x"), params={"id": id}, actor=None))
+
+    def list(self, query: Any = None) -> Any:
+        return self._list.handle(Context(request=Request(method="GET", path="/users", query=query or {}), params={}, actor=None))
+
+    def is_test_user(self, data: Any) -> bool:
+        return users_module.is_test_user(data)
+
+    def test_user_ids(self) -> list[str]:
+        return sorted(users_module.test_user_ids(self._store))
 
     def by_email(self, email: Any) -> Any:
         return self._users.by_email(email)

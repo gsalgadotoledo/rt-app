@@ -210,7 +210,7 @@ cases:
       - call: ban
         args: [ u-alice, { reason: "  Chargeback fraud  ", until: "2026-01-09T04:04:05+01:00", category: fraud }, *root ]
         expect:
-          value: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: rt-app-root, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null, banned: true, ban: { reason: Chargeback fraud, category: fraud, until: "2026-01-09T03:04:05.000Z", at: "2026-01-02T03:04:05.000Z", by: rt-app-root } }
+          value: { id: u-alice, email: alice@example.test, name: Alice, role: user, grants: [], active: true, createdAt: "2026-01-01T00:00:00.000Z", createdBy: u-alice, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: rt-app-root, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null, banned: true, ban: { reason: Chargeback fraud, category: fraud, until: "2026-01-09T03:04:05.000Z", at: "2026-01-02T03:04:05.000Z", by: rt-app-root }, testUser: false }
       - call: row
         args: [ USERS, u-alice ]
         expect:
@@ -345,7 +345,7 @@ cases:
       - { call: ban, args: [ u-bob, { reason: Spam, category: spam }, *root ], expect: { value: { $partial: { banned: true } } } }
       - call: view
         args: [ u-bob ]
-        expect: { value: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: rt-app-root, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null, banned: true, ban: { reason: Spam, category: spam, until: null, at: "2026-01-02T03:04:05.000Z", by: rt-app-root } } }
+        expect: { value: { id: u-bob, email: bob@example.test, name: Bob, role: user, grants: [], active: true, createdAt: null, createdBy: null, updatedAt: "2026-01-02T03:04:05.000Z", updatedBy: rt-app-root, deletedAt: null, deletedBy: null, restoredAt: null, restoredBy: null, banned: true, ban: { reason: Spam, category: spam, until: null, at: "2026-01-02T03:04:05.000Z", by: rt-app-root }, testUser: false } }
       - { call: view, args: [ u-alice ], expect: { value: { $partial: { id: u-alice, banned: false, ban: null } } } }
       - { call: view, args: [ u-dora ], expect: { error: { status: 404, message: User not found } } }
       - { call: list, args: [ { banned: "true" } ], expect: { value: { items: [ { $partial: { id: u-bob, banned: true } } ] } } }

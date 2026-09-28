@@ -145,3 +145,6 @@ body{background:var(--bg);color:var(--text)}
 .ban-panel .ban-status{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px;margin:12px 0}.ban-panel .ban-status dt{font-weight:600}.ban-panel .ban-status dd{margin:0;overflow-wrap:anywhere}
 .ban-dialog{max-width:520px;width:calc(100% - 32px);border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);padding:20px}.ban-dialog::backdrop{background:rgb(0 0 0 / .45)}.ban-dialog textarea{width:100%;min-height:96px}.ban-dialog .dialog-actions{display:flex;justify-content:flex-end;gap:8px}
 .layout .ban-panel button.danger{border-color:var(--danger);color:var(--danger)}
+
+/* Test users (rt-app-users data.testUser): the "Test · Prueba" badge on lists and records. */
+.badge.warning{color:var(--accent);border:1px solid currentColor;border-radius:999px;padding:1px 8px}

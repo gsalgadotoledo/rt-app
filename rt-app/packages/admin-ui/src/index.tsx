@@ -84,10 +84,13 @@ export function ResourcePanel({ api, manifest, user, recordTabs = [] }: PanelPro
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
       if (users) {
-        if (mode === "create") await api("/users", "POST", data);
+        // testUser is an administrator-only label (reports can exclude test accounts).
+        const testUser = data.testUser === "on";
+        if (mode === "create") await api("/users", "POST", { ...data, testUser });
         else
           await api(`/users/${encodeURIComponent(selected.id)}`, "PATCH", {
             name: data.name,
+            testUser,
           });
       }
       if (tasks) {
@@ -202,14 +205,28 @@ export function ResourcePanel({ api, manifest, user, recordTabs = [] }: PanelPro
             {manifest.fields.map((field: string) => (
               <label key={field}>
                 {field}
-                <input
-                  aria-label={`Search ${field}`}
-                  value={filters[field] ?? ""}
-                  onChange={(e) =>
-                    setFilters({ ...filters, [field]: e.target.value })
-                  }
-                  placeholder={`Filter ${field}`}
-                />
+                {users && field === "testUser" ? (
+                  <select
+                    aria-label={`Search ${field}`}
+                    value={filters[field] ?? ""}
+                    onChange={(e) =>
+                      setFilters({ ...filters, [field]: e.target.value })
+                    }
+                  >
+                    <option value="">All users</option>
+                    <option value="true">Test users only</option>
+                    <option value="false">Real users only</option>
+                  </select>
+                ) : (
+                  <input
+                    aria-label={`Search ${field}`}
+                    value={filters[field] ?? ""}
+                    onChange={(e) =>
+                      setFilters({ ...filters, [field]: e.target.value })
+                    }
+                    placeholder={`Filter ${field}`}
+                  />
+                )}
               </label>
             ))}
             <button className="primary" disabled={busy}>
@@ -236,6 +253,8 @@ export function ResourcePanel({ api, manifest, user, recordTabs = [] }: PanelPro
                       <td key={f}>
                         {(users || tasks) && ["id","name","title"].includes(f) ? (
                           <button className="record-link" disabled={busy} onClick={()=>void edit(item)}>{String(item[f] ?? "—")}</button>
+                        ) : users && f === "testUser" ? (
+                          item[f] ? <span className="badge warning" title="Test user · Usuario de prueba">Test · Prueba</span> : <span className="badge">no</span>
                         ) : f === "banned" ? (
                           <span className={`badge ${item[f] ? "danger" : ""}`} title={item.ban?.until ? `Until ${item.ban.until}` : undefined}>
                             {item[f] ? (item.ban?.until ? "temporary" : "banned") : "no"}
@@ -337,8 +356,21 @@ export function ResourcePanel({ api, manifest, user, recordTabs = [] }: PanelPro
                 ) : (
                   <p className="hint">
                     {selected?.email} · Changing an email address requires verification.
+                    {selected?.testUser && <> <span className="badge warning">Test · Prueba</span></>}
                   </p>
                 )}
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    name="testUser"
+                    defaultChecked={selected?.testUser === true}
+                    disabled={mode === "edit" && selected?.role === "owner" && user.role !== "owner"}
+                  />
+                  <span>
+                    <strong>Test user · Usuario de prueba</strong>
+                    <small>QA, demo or internal account. Reports can exclude its usage and revenue; sign-in, bans and credits work as usual.</small>
+                  </span>
+                </label>
               </>
             ) : (
               <>

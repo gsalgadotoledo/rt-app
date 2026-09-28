@@ -144,7 +144,40 @@ func usersSubject(ctx context.Context, init json.RawMessage) (conformance.Instan
 		return conformance.Instance{}, err
 	}
 	accounts := users.New(store, users.WithClock(now.Now))
+	handlers := map[string]web.Endpoint{}
+	for _, e := range accounts.Feature().Endpoints {
+		handlers[e.Method+" "+e.Path] = e
+	}
 	return conformance.Instance{Methods: map[string]conformance.Method{
+		// Test users (docs/polyglot/users-test-flag.md).
+		// update(id, input, actor) → admin view (PATCH /users/:id)
+		"update": func(ctx context.Context, args []json.RawMessage) (any, error) {
+			input, _ := argAny(args, 1).(map[string]any)
+			if input == nil {
+				input = map[string]any{}
+			}
+			return accounts.Update(ctx, argString(args, 0), input, argString(args, 2))
+		},
+		// view(id) → admin view (GET /users/:id); list(query) → page (GET /users)
+		"view": func(ctx context.Context, args []json.RawMessage) (any, error) {
+			return handlers["GET /users/:id"].Handle(&web.Context{Ctx: ctx, Params: map[string]string{"id": argString(args, 0)}})
+		},
+		"list": func(ctx context.Context, args []json.RawMessage) (any, error) {
+			query := map[string]string{}
+			raw, _ := argAny(args, 0).(map[string]any)
+			for k, v := range raw {
+				query[k], _ = v.(string)
+			}
+			return handlers["GET /users"].Handle(&web.Context{Ctx: ctx, Request: web.Request{Query: query}})
+		},
+		// isTestUser(data) → bool; testUserIds() → sorted ids
+		"isTestUser": func(_ context.Context, args []json.RawMessage) (any, error) {
+			data, _ := argAny(args, 0).(map[string]any)
+			return users.IsTestUser(data), nil
+		},
+		"testUserIds": func(ctx context.Context, _ []json.RawMessage) (any, error) {
+			return users.TestUserIDs(ctx, store)
+		},
 		// get(id) → row | null
 		"get": func(ctx context.Context, args []json.RawMessage) (any, error) {
 			return accounts.Get(ctx, argString(args, 0))

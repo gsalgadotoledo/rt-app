@@ -17,10 +17,10 @@ import (
 //
 //	GET    /users/me             authenticated  users.me.read   the caller's view
 //	PATCH  /users/me             authenticated  users.me.edit   {name}
-//	GET    /users                permission     users.list      ?id&email&name&role&active&banned&trash&cursor
-//	POST   /users                permission     users.create    {email, name, password}
-//	GET    /users/:id            permission     users.read      the admin view (ViewAccount: banned, ban)
-//	PATCH  /users/:id            permission     users.edit      {name}; owners only for an owner
+//	GET    /users                permission     users.list      ?id&email&name&role&active&banned&testUser&trash&cursor
+//	POST   /users                permission     users.create    {email, name, password, testUser?} → admin view
+//	GET    /users/:id            permission     users.read      the admin view (ViewAccount: banned, ban, testUser)
+//	PATCH  /users/:id            permission     users.edit      {name?, testUser?} → admin view; owners only for an owner
 //	POST   /users/:id/restore    permission     users.restore
 //	DELETE /users/:id            permission     users.delete    soft delete; revokes sessions
 func (u *Users) Feature() web.Feature {
@@ -32,7 +32,10 @@ func (u *Users) Feature() web.Feature {
 			return u.Profile(c.Ctx, c.Actor.ID, c.Request.Body, "")
 		}},
 		{Method: "GET", Path: "/users", Resource: "users.list", Access: web.Permission, Handle: func(c *web.Context) (any, error) {
-			return SearchPage(c.Ctx, u.store, "USERS", c.Request.Query, []string{"id", "email", "name", "role", "active", "banned"},
+			if err := TestUserFilter(c.Request.Query); err != nil {
+				return nil, err
+			}
+			return SearchPage(c.Ctx, u.store, "USERS", c.Request.Query, []string{"id", "email", "name", "role", "active", "banned", "testUser"},
 				func(row nosql.Row) map[string]any { return u.View(row.Data) })
 		}},
 		{Method: "POST", Path: "/users", Resource: "users.create", Access: web.Permission, Handle: func(c *web.Context) (any, error) {
@@ -40,7 +43,7 @@ func (u *Users) Feature() web.Feature {
 			if err != nil {
 				return nil, err
 			}
-			return ViewUser(row.Data), nil
+			return u.View(row.Data), nil
 		}},
 		{Method: "GET", Path: "/users/:id", Resource: "users.read", Access: web.Permission, Handle: func(c *web.Context) (any, error) {
 			row, err := u.live(c.Ctx, c.Params["id"])
@@ -57,7 +60,7 @@ func (u *Users) Feature() web.Feature {
 			if row != nil && row.Data["role"] == RoleOwner && c.Actor.Role != RoleOwner {
 				return nil, apperr.New(http.StatusForbidden, "Owner role required")
 			}
-			return u.Profile(c.Ctx, c.Params["id"], c.Request.Body, c.Actor.ID)
+			return u.Update(c.Ctx, c.Params["id"], c.Request.Body, c.Actor.ID)
 		}},
 		{Method: "POST", Path: "/users/:id/restore", Resource: "users.restore", Access: web.Permission, Handle: func(c *web.Context) (any, error) {
 			row, err := u.Get(c.Ctx, c.Params["id"])
