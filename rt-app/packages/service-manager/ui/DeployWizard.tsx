@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 export interface WizardField {
   key: string;
@@ -9,7 +9,8 @@ export interface WizardField {
   help?: string;
   placeholder?: string;
   pattern?: string;
-  options?: "aws-profiles";
+  options?: "aws-profiles" | "route53-zones";
+  profileFrom?: string;
   choices?: string[];
   present: boolean;
   /** Only for a value that is not a secret. */
@@ -24,9 +25,22 @@ export interface WizardStep {
   links: { label: string; url: string }[];
   fields: WizardField[];
   oneOf: string[];
-  actions: { id: string; label: string; command: string[]; confirm?: string; help?: string }[];
+  actions: WizardAction[];
   /** null: a step of commands alone (nothing to check). */
   done: boolean | null;
+}
+export interface WizardAction {
+  id: string;
+  label: string;
+  command: string[];
+  /** Asked in turn before it runs; with typeToConfirm, that word typed last. */
+  confirm: string[];
+  typeToConfirm?: string;
+  /** Actions of one group (an environment) share a row. */
+  group?: string;
+  /** Destructive: drawn quietly, never next to the main buttons. */
+  danger: boolean;
+  help?: string;
 }
 export interface WizardState {
   wizard: { title: string; files: { config: string; secrets: string }; steps: WizardStep[] } | null;
@@ -64,6 +78,14 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
   const [busy, setBusy] = useState(false);
   const [run, setRun] = useState<WizardRun>();
   const poll = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const out = useRef<HTMLPreElement>(null);
+  /** The output follows its end, unless the person scrolled up to read. */
+  const stick = useRef(true);
+  const [newDomain, setNewDomain] = useState<Record<string, boolean>>({});
+  useLayoutEffect(() => {
+    const el = out.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [run?.output]);
 
   const load = useCallback(async (jump = false) => {
     try {
@@ -121,8 +143,13 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
       else void load();
     }).catch((e) => setError((e as Error).message));
   };
-  const start = async (action: WizardStep["actions"][number]) => {
-    if (action.confirm && !window.confirm(action.confirm)) return;
+  const start = async (action: WizardAction) => {
+    for (const question of action.confirm) if (!window.confirm(question)) return;
+    if (action.typeToConfirm) {
+      const typed = window.prompt(`Type ${action.typeToConfirm} to confirm`);
+      if (typed?.trim() !== action.typeToConfirm) return;
+    }
+    stick.current = true;
     if (dirty && !(await save())) return;
     try {
       const { id } = await api.run(step.id, action.id);
@@ -167,7 +194,21 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
                   <code>{f.key}</code>
                   {f.present && draft === undefined && <em>✓ saved</em>}
                 </span>
-                {f.options === "aws-profiles" && (f.choices?.length ?? 0) > 0 ? (
+                {f.options === "route53-zones" && (f.choices?.length ?? 0) > 0 && !newDomain[f.key] && (!value || f.choices!.includes(value)) ? (
+                  <select
+                    value={value}
+                    onChange={(e) => {
+                      if (e.target.value === "__new__") {
+                        setNewDomain((n) => ({ ...n, [f.key]: true }));
+                        set("");
+                      } else set(e.target.value);
+                    }}
+                  >
+                    <option value="">— choose a domain of your AWS account —</option>
+                    {f.choices!.map((c) => <option key={c} value={c}>{c}</option>)}
+                    <option value="__new__">+ A new domain…</option>
+                  </select>
+                ) : f.options === "aws-profiles" && (f.choices?.length ?? 0) > 0 ? (
                   <select value={value} onChange={(e) => set(e.target.value)}>
                     <option value="">— choose a profile —</option>
                     {f.choices!.map((c) => <option key={c} value={c}>{c}</option>)}
@@ -183,6 +224,11 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
                     onChange={(e) => set(e.target.value)}
                   />
                 )}
+                {f.options === "route53-zones" && (newDomain[f.key] || (value && f.choices && !f.choices.includes(value))) && (f.choices?.length ?? 0) > 0 && (
+                  <button type="button" className="rt-wizard-linkish" onClick={() => { setNewDomain((n) => ({ ...n, [f.key]: false })); set(""); }}>
+                    ← Choose one of your AWS account ({f.choices!.length})
+                  </button>
+                )}
                 {f.help && <small>{f.help}</small>}
                 {invalid && <small className="rt-error">This does not look right.</small>}
               </label>
@@ -190,19 +236,42 @@ export function DeployWizard({ client, project }: { client: WizardClient; projec
           })}
           {step.actions.length > 0 && (
             <div className="rt-wizard-actions">
-              {step.actions.map((a) => (
-                <div key={a.id}>
-                  <button className="rt-primary" disabled={busy || running} title={a.command.join(" ")} onClick={() => void start(a)}>{a.label}</button>
-                  <code>{a.command.join(" ")}</code>
-                  {a.help && <small>{a.help}</small>}
-                </div>
-              ))}
+              {[...new Set(step.actions.map((a) => a.group ?? ""))].map((group) => {
+                const actions = step.actions.filter((a) => (a.group ?? "") === group);
+                const button = (a: WizardAction) => (
+                  <button
+                    key={a.id}
+                    className={a.danger ? "rt-wizard-danger" : "rt-primary"}
+                    disabled={busy || running}
+                    title={a.command.join(" ")}
+                    onClick={() => void start(a)}
+                  >
+                    {a.label}
+                  </button>
+                );
+                return (
+                  <div key={group || "_"} className={`rt-wizard-group${group ? " named" : ""}`}>
+                    {group && <strong>{group}</strong>}
+                    <span className="rt-wizard-main">{actions.filter((a) => !a.danger).map(button)}</span>
+                    <span className="rt-wizard-quiet">{actions.filter((a) => a.danger).map(button)}</span>
+                    {!group && actions.some((a) => a.help) && actions.filter((a) => a.help).map((a) => <small key={a.id}>{a.help}</small>)}
+                  </div>
+                );
+              })}
             </div>
           )}
           {run && (
             <div className={`rt-wizard-run state-${run.state}`}>
               <div><strong>{run.label}</strong> <span>{run.state === "running" ? "running…" : run.state === "succeeded" ? "✓ done" : `failed (exit ${run.exitCode})`}</span></div>
-              <pre>{run.output || "…"}</pre>
+              <pre
+                ref={out}
+                onScroll={(e) => {
+                  const el = e.currentTarget;
+                  stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+                }}
+              >
+                {run.output || "…"}
+              </pre>
             </div>
           )}
           {error && <p className="rt-error">{error}</p>}

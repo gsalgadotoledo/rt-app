@@ -101,3 +101,30 @@ test('actions: only the manifest\'s, config values filled in, secrets redacted, 
 test('aws profiles: none on a machine without the AWS CLI',async t=>{
  assert.deepEqual(await awsProfiles(await project(t,null)),[]);
 });
+
+test('route53 zones: the profile\'s public zones as choices, asked once a minute, none on failure',async t=>{
+ const manifest={steps:[
+  {id:'aws',title:'AWS',fields:[{key:'AWS_ADMIN_PROFILE',label:'Perfil'}]},
+  {id:'domain',title:'Dominio',fields:[{key:'DOMAIN',label:'Dominio',options:'route53-zones',profileFrom:'AWS_ADMIN_PROFILE'}]},
+ ]};
+ await assert.rejects(readWizard(await project(t,{steps:[{id:'d',title:'D',fields:[{key:'DOMAIN',options:'route53-zones'}]}]})),/profileFrom/);
+ await assert.rejects(readWizard(await project(t,{steps:[{id:'d',title:'D',fields:[{key:'DOMAIN',options:'nope'}]}]})),/options is/);
+ const root=await project(t,manifest,{'.deploy/config.env':'AWS_ADMIN_PROFILE=admin\n'});
+ const calls=[];
+ const spawn=(cmd,args)=>{
+  calls.push([cmd,...args]);
+  const child=new EventEmitter();child.stdout=new PassThrough();child.stderr=new PassThrough();
+  setImmediate(()=>{child.stdout.end(JSON.stringify({HostedZones:[{Name:'rtapp.io.',Config:{PrivateZone:false}},{Name:'internal.test.',Config:{PrivateZone:true}},{Name:'otro.com.',Config:{PrivateZone:false}}]}));child.emit('close',0);});
+  return child;
+ };
+ const r=new WizardRunner({spawn});
+ const domain=async()=>(await r.state(root)).wizard.steps[1].fields[0];
+ assert.deepEqual((await domain()).choices,['otro.com','rtapp.io'],'public zones only');
+ await domain();
+ assert.equal(calls.length,1,'kept a minute');
+ assert.deepEqual(calls[0],['aws','route53','list-hosted-zones','--output','json','--profile','admin']);
+ const failing=new WizardRunner({spawn:()=>{const c=new EventEmitter();c.stdout=new PassThrough();setImmediate(()=>c.emit('close',255));return c;}});
+ assert.deepEqual((await failing.state(root)).wizard.steps[1].fields[0].choices,[]);
+ const noProfile=await project(t,manifest);
+ assert.deepEqual((await r.state(noProfile)).wizard.steps[1].fields[0].choices,[],'no profile yet: no zones asked');
+});

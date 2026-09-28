@@ -35,15 +35,20 @@ export async function readWizard(root){
    const file=f.file??(f.secret?'secrets':'config');
    if(!FILES.includes(file))throw new Error(`${WIZARD_FILE}: ${f.key}: file must be config or secrets`);
    if(f.pattern!==undefined)new RegExp(f.pattern);
+   if(f.options!==undefined&&!['aws-profiles','route53-zones'].includes(f.options))throw new Error(`${WIZARD_FILE}: ${f.key}: options is aws-profiles or route53-zones`);
+   if(f.options==='route53-zones'&&!KEY.test(f.profileFrom??''))throw new Error(`${WIZARD_FILE}: ${f.key}: route53-zones needs profileFrom (the field with the AWS profile)`);
    return {key:f.key,file,label:text(f.label??f.key,`${f.key}.label`),secret:f.secret===true||file==='secrets',optional:f.optional===true,
-    ...(f.help&&{help:String(f.help)}),...(f.placeholder&&{placeholder:String(f.placeholder)}),...(f.pattern&&{pattern:f.pattern}),...(f.options==='aws-profiles'&&{options:'aws-profiles'})};
+    ...(f.help&&{help:String(f.help)}),...(f.placeholder&&{placeholder:String(f.placeholder)}),...(f.pattern&&{pattern:f.pattern}),...(f.options&&{options:f.options}),...(f.profileFrom&&{profileFrom:f.profileFrom})};
   });
   const oneOf=list(s.oneOf,`${id}.oneOf`);
   for(const k of oneOf)if(!fields.some(f=>f.key===k))throw new Error(`${WIZARD_FILE}: ${id}.oneOf names ${k}, not a field of the step`);
   const actions=list(s.actions,`${id}.actions`).map(a=>{
    const command=list(a.command,`${id}.${a.id}.command`);
    if(!command.length||command.some(c=>typeof c!=='string'))throw new Error(`${WIZARD_FILE}: ${id}.${a.id}: command is a list of words`);
-   return {id:text(a.id,`${id}.actions[].id`),label:text(a.label,`${a.id}.label`),command,...(a.confirm&&{confirm:String(a.confirm)}),...(a.help&&{help:String(a.help)})};
+   // confirm: one question or several, asked in turn; typeToConfirm: a word the person types last.
+   const confirm=a.confirm===undefined?[]:(Array.isArray(a.confirm)?a.confirm:[a.confirm]).map(String);
+   return {id:text(a.id,`${id}.actions[].id`),label:text(a.label,`${a.id}.label`),command,confirm,
+    ...(a.typeToConfirm&&{typeToConfirm:String(a.typeToConfirm)}),...(a.group&&{group:String(a.group)}),danger:a.danger===true,...(a.help&&{help:String(a.help)})};
   });
   return {id,title:text(s.title,`${id}.title`),...(s.summary&&{summary:String(s.summary)}),
    ...(s.platform&&{platform:{name:text(s.platform.name,`${id}.platform.name`),url:https(s.platform.url,`${id}.platform.url`)}}),
@@ -87,8 +92,30 @@ export async function awsProfiles(home=homedir()){
  return [...names].sort();
 }
 
+/** Output of a short command (the AWS CLI): stdout, or null when it fails or takes too long. */
+function capture(spawn,cmd,args,{timeoutMs=15000}={}){
+ return new Promise(resolveOut=>{
+  let out='',done=false;const end=v=>{if(!done){done=true;clearTimeout(timer);resolveOut(v);}};
+  let child;try{child=spawn(cmd,args,{env:process.env,stdio:['ignore','pipe','pipe']});}catch{return end(null);}
+  const timer=setTimeout(()=>{try{child.kill?.();}catch{}end(null);},timeoutMs);
+  child.stdout?.on('data',c=>{out+=String(c);});
+  child.once('error',()=>end(null));child.once('close',code=>end(code===0?out:null));
+ });
+}
+
 export class WizardRunner {
- constructor({spawn=spawnProcess,home=homedir(),now=()=>new Date()}={}){this.spawn=spawn;this.home=home;this.now=now;this.jobs=new Map();}
+ constructor({spawn=spawnProcess,home=homedir(),now=()=>new Date()}={}){this.spawn=spawn;this.home=home;this.now=now;this.jobs=new Map();this.zoneCache=new Map();}
+
+ /** The public hosted zones the profile sees (names without the final dot); kept a minute. */
+ async zones(profile){
+  if(!profile)return [];
+  const kept=this.zoneCache.get(profile);if(kept&&this.now()-kept.at<60_000)return kept.zones;
+  const out=await capture(this.spawn,'aws',['route53','list-hosted-zones','--output','json','--profile',profile]);
+  let zones=[];
+  try{zones=(JSON.parse(out??'{}').HostedZones??[]).filter(z=>!z.Config?.PrivateZone).map(z=>String(z.Name).replace(/\.$/,'')).sort();}catch{zones=[];}
+  if(out!==null)this.zoneCache.set(profile,{at:this.now(),zones});
+  return zones;
+ }
 
  async values(root,w){
   const out={};
@@ -101,8 +128,11 @@ export class WizardRunner {
   const w=await readWizard(root);if(!w)return {wizard:null};
   const values=await this.values(root,w);
   const profiles=w.steps.some(s=>s.fields.some(f=>f.options==='aws-profiles'))?await awsProfiles(this.home):[];
+  const valueOf=key=>values.config[key]??values.secrets[key]??'';
+  const zoneFields=w.steps.flatMap(s=>s.fields).filter(f=>f.options==='route53-zones');
+  const zones=Object.fromEntries(await Promise.all(zoneFields.map(async f=>[f.key,await this.zones(valueOf(f.profileFrom))])));
   const steps=w.steps.map(s=>{
-   const fields=s.fields.map(f=>{const v=values[f.file][f.key]??'';return {...f,present:v!=='',...(!f.secret&&{value:v}),...(f.options==='aws-profiles'&&{choices:profiles})};});
+   const fields=s.fields.map(f=>{const v=values[f.file][f.key]??'';return {...f,present:v!=='',...(!f.secret&&{value:v}),...(f.options==='aws-profiles'&&{choices:profiles}),...(f.options==='route53-zones'&&{choices:zones[f.key]})};});
    const required=fields.filter(f=>!f.optional&&!s.oneOf.includes(f.key));
    // A step of commands alone has nothing to check here: null, neither done nor pending.
    const done=!fields.length?null:required.every(f=>f.present)&&(!s.oneOf.length||fields.some(f=>s.oneOf.includes(f.key)&&f.present));
